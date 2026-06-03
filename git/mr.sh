@@ -32,26 +32,28 @@ slug="$(devctl_get_branch_meta slug)"
 
 devctl_push_current_branch
 
-title="${title:-${branch#feat/}}"
+# 去除分支前缀作为默认标题
+raw_title="$branch"
+raw_title="${raw_title#feature/}"
+raw_title="${raw_title#fix/}"
+raw_title="${raw_title#feat/}"
+title="${title:-$raw_title}"
 title="${title//-/ }"
 [[ -n "$issue" ]] && title="[#${issue}] ${title}"
 
 if [[ -z "$body" ]]; then
-  body="## Summary\n"
-  [[ -n "$issue" ]] && body+="- Closes #${issue}\n"
-  body+="\n## Test plan\n- [ ] 本地验证"
+  body="## Summary
+"
+  [[ -n "$issue" ]] && body+="- Closes #${issue}
+"
+  body+="
+## Test plan
+- [ ] 本地验证"
   body="$(printf '%b' "$body")"
 fi
 
-payload="$(jq -n \
-  --arg title "$title" \
-  --arg head "$branch" \
-  --arg base "$base" \
-  --arg body "$body" \
-  '{title: $title, head: $head, base: $base, body: $body}')"
-
 devctl_info "创建 Pull Request: ${branch} → ${base}"
-resp="$(devctl_gitee_api_json POST "$(devctl_gitee_repo_path /pulls)" "$payload")"
+resp="$(provider_pr_create "$title" "$body" "$branch" "$base")"
 
 pr_url="$(devctl_json_field "$resp" '.html_url // empty')"
 pr_number="$(devctl_json_field "$resp" '.number // empty')"

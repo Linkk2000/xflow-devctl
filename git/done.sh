@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+"#!/usr/bin/env bash
 # devctl git done [--base BRANCH] [--force]
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +26,7 @@ pr_number="$(devctl_get_branch_meta pr)"
 [[ "$branch" != "$base" ]] || devctl_die "当前已在 ${base}，无需 done"
 
 if [[ "$force" -eq 0 && -n "$pr_number" ]]; then
-  resp="$(devctl_gitee_api GET "$(devctl_gitee_repo_path "/pulls/${pr_number}")" 2>/dev/null || true)"
+  resp="$(provider_pr_get "$pr_number" 2>/dev/null || true)"
   if [[ -n "$resp" ]]; then
     state="$(devctl_json_field "$resp" '.state // empty')"
     merged="$(devctl_json_field "$resp" '.merged // false')"
@@ -53,7 +53,5 @@ fi
 
 git -C "$DEVCTL_REPO_ROOT" config --local --unset-all "devctl.slug" 2>/dev/null || true
 git -C "$DEVCTL_REPO_ROOT" config --local --unset-all "devctl.issue" 2>/dev/null || true
-git -C "$DEVCTL_REPO_ROOT" config --local --unset-all "devctl.base" 2>/dev/null || true
-git -C "$DEVCTL_REPO_ROOT" config --local --unset-all "devctl.pr" 2>/dev/null || true
-
-devctl_info "完成。当前在 ${base}"
+git -C "$DEVCTL_REPO_ROOT" config --local --unset-all "devctl.base"
+<truncated 160 bytes>

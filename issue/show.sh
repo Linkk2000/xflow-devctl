@@ -10,6 +10,10 @@ number="${1:-}"
 
 devctl_need_cmd jq
 
-resp="$(devctl_gitee_api GET "$(devctl_gitee_repo_path "/issues/${number}")")"
+resp="$(provider_issue_show "$number")"
 
-devctl_json_field "$resp" '"#\(.number) [\(.state)] \(.title)\n\n\(.body // "")\n\n\(.html_url)"'
+devctl_json_field "$resp" '"#(.number) [(.state)] (.title)
+
+(.body // "")
+
+(.html_url)"'

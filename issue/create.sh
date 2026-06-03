@@ -26,16 +26,7 @@ done
 
 devctl_need_cmd jq
 
-payload="$(jq -n \
-  --arg title "$title" \
-  --arg body "$body" \
-  --arg labels "$labels" \
-  '{
-    title: $title,
-    body: $body
-  } + (if $labels != "" then {labels: $labels} else {} end)')"
-
-resp="$(devctl_gitee_api_json POST "$(devctl_gitee_repo_path /issues)" "$payload")"
+resp="$(provider_issue_create "$title" "$body" "$labels")"
 number="$(devctl_json_field "$resp" '.number // empty')"
 url="$(devctl_json_field "$resp" '.html_url // empty')"
 

@@ -28,84 +28,51 @@ devctl_need_cmd() {
   done
 }
 
-# ── gitee credentials ───────────────────────────────────────────────────────
+# ── platform provider helper ──────────────────────────────────────────────────
 
-devctl_load_gitee_env() {
-  local f="${GITEE_ENV_FILE:-$HOME/gitee.env.local}"
-  if [[ -f "$f" ]]; then
-    # shellcheck disable=SC1090
-    set -a
-    # shellcheck source=/dev/null
-    source "$f"
-    set +a
-  fi
-  GITEE_TOKEN="${GITEE_TOKEN:-${GITEE_ACCESS_TOKEN:-${access_token:-${GITEE_PRIVATE_TOKEN:-}}}}"
-  [[ -n "$GITEE_TOKEN" ]] || devctl_die "未找到 Gitee Token。请设置 GITEE_TOKEN 或写入 ${GITEE_ENV_FILE:-$HOME/gitee.env.local}"
-}
-
-devctl_gitee_owner_repo() {
+devctl_parse_owner_repo() {
   local url
-  url="$(git -C "$DEVCTL_REPO_ROOT" remote get-url origin 2>/dev/null)" || devctl_die "无法读取 origin 远程地址"
-  if [[ "$url" =~ gitee\.com[:/]([^/]+)/([^/.]+)(\.git)?$ ]]; then
-    GITEE_OWNER="${BASH_REMATCH[1]}"
-    GITEE_REPO="${BASH_REMATCH[2]%.git}"
+  url="$(git -C "$DEVCTL_REPO_ROOT" remote get-url origin 2>/dev/null || true)"
+  if [[ -z "$url" ]]; then
+    DEVCTL_OWNER="${DEVCTL_OWNER:-}"
+    DEVCTL_REPO="${DEVCTL_REPO:-}"
+    return 0
+  fi
+  if [[ "$url" =~ [:/]([^/]+)/([^/.]+)(\.git)?$ ]]; then
+    DEVCTL_OWNER="${BASH_REMATCH[1]}"
+    DEVCTL_REPO="${BASH_REMATCH[2]%.git}"
   elif [[ "$url" =~ ^git@([^:]+):([^/]+)/([^/.]+)(\.git)?$ ]]; then
-    GITEE_OWNER="${BASH_REMATCH[2]}"
-    GITEE_REPO="${BASH_REMATCH[3]%.git}"
+    DEVCTL_OWNER="${BASH_REMATCH[2]}"
+    DEVCTL_REPO="${BASH_REMATCH[3]%.git}"
   else
-    devctl_die "无法从 origin 解析 Gitee owner/repo: $url"
+    devctl_die "无法从 origin 解析 owner/repo: $url"
   fi
-  export GITEE_OWNER GITEE_REPO
+  export DEVCTL_OWNER DEVCTL_REPO
 }
 
-# 参数为 /issues、/pulls 等仓库内路径后缀
-devctl_gitee_repo_path() {
-  devctl_gitee_owner_repo
-  local suffix="$1"
-  [[ "$suffix" == /* ]] || suffix="/${suffix}"
-  echo "/repos/${GITEE_OWNER}/${GITEE_REPO}${suffix}"
-}
-
-devctl_gitee_api() {
-  local method="$1" path="$2"
-  shift 2
-  devctl_load_gitee_env
-  devctl_need_cmd curl
-  local url="${GITEE_API_BASE}${path}"
-  local tmp
-  tmp="$(mktemp)"
-  local http_code
-  http_code="$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" \
-    -H 'Content-Type: application/json' \
-    -G --data-urlencode "access_token=${GITEE_TOKEN}" \
-    "$url" "$@")" || devctl_die "Gitee API 请求失败: $method $path"
-  if [[ "$http_code" -ge 400 ]]; then
-    devctl_error "Gitee API ${http_code}: $(cat "$tmp")"
-    rm -f "$tmp"
-    return 1
+devctl_load_provider() {
+  local platform="${XFLOW_PLATFORM:-}"
+  if [[ -z "$platform" ]]; then
+    local url
+    url="$(git -C "$DEVCTL_REPO_ROOT" remote get-url origin 2>/dev/null || true)"
+    if [[ "$url" =~ github\.com ]]; then
+      platform="github"
+    elif [[ "$url" =~ gitee\.com ]]; then
+      platform="gitee"
+    else
+      platform="github"
+    fi
   fi
-  cat "$tmp"
-  rm -f "$tmp"
-}
 
-devctl_gitee_api_json() {
-  local method="$1" path="$2" body="$3"
-  devctl_load_gitee_env
-  devctl_need_cmd curl
-  local url="${GITEE_API_BASE}${path}?access_token=${GITEE_TOKEN}"
-  local tmp http_code
-  tmp="$(mktemp)"
-  http_code="$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" \
-    -H 'Content-Type: application/json' \
-    -d "$body" \
-    "$url")" || devctl_die "Gitee API 请求失败: $method $path"
-  if [[ "$http_code" -ge 400 ]]; then
-    devctl_error "Gitee API ${http_code}: $(cat "$tmp")"
-    rm -f "$tmp"
-    return 1
+  local provider_script="$DEVCTL_OPS_ROOT/lib/providers/${platform}.sh"
+  if [[ -f "$provider_script" ]]; then
+    # shellcheck disable=SC1090
+    source "$provider_script"
+    devctl_parse_owner_repo
+    provider_init
+  else
+    devctl_die "不支持的平台提供者: $platform (未找到 $provider_script)"
   fi
-  cat "$tmp"
-  rm -f "$tmp"
 }
 
 # ── git helpers ───────────────────────────────────────────────────────────────
@@ -117,11 +84,11 @@ devctl_default_base_branch() {
     return
   fi
   if git -C "$DEVCTL_REPO_ROOT" show-ref --verify --quiet refs/heads/master; then
-    echo master
+    echo maste
   elif git -C "$DEVCTL_REPO_ROOT" show-ref --verify --quiet refs/heads/main; then
     echo main
   else
-    git -C "$DEVCTL_REPO_ROOT" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || echo master
+    git -C "$DEVCTL_REPO_ROOT" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || echo maste
   fi
 }
 
@@ -237,3 +204,5 @@ devctl_json_field() {
     devctl_die "需要 jq 解析 Gitee API 响应（请安装 jq）"
   fi
 }
+
+devctl_load_provider
