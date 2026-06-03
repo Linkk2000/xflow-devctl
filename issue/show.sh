@@ -12,8 +12,4 @@ devctl_need_cmd jq
 
 resp="$(provider_issue_show "$number")"
 
-devctl_json_field "$resp" '"#(.number) [(.state)] (.title)
-
-(.body // "")
-
-(.html_url)"'
+devctl_json_field "$resp" '"#\(.number) [\(.state)] \(.title)\n\n\(.body // "")\n\n\(.html_url)"'

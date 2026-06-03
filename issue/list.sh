@@ -29,7 +29,7 @@ resp="$(provider_issue_list "$filter_state" "$limit")"
 
 # 针对 github 的响应做空容错，如果是字符串（如出错），jq 会抛异常，所以先验证
 if echo "$resp" | jq -e 'type == "array"' >/dev/null 2>&1; then
-  echo "$resp" | jq -r '.[] | select(.pull_request == null or .pull_request == {}) | "#(.number)	[(.state)]	(.title)"'
+  echo "$resp" | jq -r '.[] | select(.pull_request == null or .pull_request == {}) | "#\(.number)\t[\(.state)]\t\(.title)"'
 else
   # 如果返回错误对象，打印它的 message，或者直接报错
   message="$(echo "$resp" | jq -r '.message // empty')"
