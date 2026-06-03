@@ -1,0 +1,41 @@
+XFlow devctl — 本地开发 / Gitee 工作流
+
+用法:
+  devctl <command> [subcommand] [options]
+
+Git 工作流:
+  devctl git start <slug> [--issue N] [--base BRANCH]
+      在干净工作区从 base 切出功能分支 feat/<slug> 或 feat/<issue>-<slug>
+      并记录 devctl.issue / devctl.slug 到 git config
+
+  devctl git commit-msg [-a] [-c] [-m "message"]
+      根据 diff 生成 conventional commit 摘要；-a 暂存全部；-c 直接提交
+
+  devctl git mr [--title T] [--body B] [--base BRANCH] [--issue N]
+      推送当前分支并在 Gitee 创建 Pull Request
+
+  devctl git done [--base BRANCH] [--force]
+      MR 合并后：切回 base、pull、删除本地功能分支
+      默认检查远端 PR 已 merged；--force 跳过检查
+
+  devctl git status
+      显示当前分支、关联 issue、未推送提交
+
+Issue (Gitee):
+  devctl issue create <title> [--body B] [--labels a,b]
+  devctl issue list [--state open|closed|all] [--limit N]
+  devctl issue show <number>
+
+开发环境 (仅前端仓库):
+  devctl run [--backend PATH]
+      启动后端 + 前端，并打开浏览器
+      环境变量: XFLOW_BACKEND_ROOT (默认 ../xflow-server)
+
+配置:
+  GITEE_ENV_FILE     Token 文件路径 (默认 ~/gitee.env.local)
+  GITEE_TOKEN        私人令牌 (也可写在 env 文件中)
+  DEVCTL_BASE_BRANCH 默认主干 (默认自动检测 master/main)
+  DEVCTL_BRANCH_PREFIX 分支前缀 (默认 feat)
+
+Token 文件示例 (~/gitee.env.local):
+  GITEE_TOKEN=your_personal_access_token

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# devctl issue show <number>
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+number="${1:-}"
+[[ -n "$number" ]] || devctl_die "用法: devctl issue show <number>"
+
+devctl_need_cmd jq
+
+resp="$(devctl_gitee_api GET "$(devctl_gitee_repo_path "/issues/${number}")")"
+
+devctl_json_field "$resp" '"#\(.number) [\(.state)] \(.title)\n\n\(.body // "")\n\n\(.html_url)"'
