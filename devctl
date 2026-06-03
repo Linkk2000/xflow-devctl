@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# XFlow devctl — thin entrypoint; implementation lives in _ops/
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OPS="$ROOT"
+export DEVCTL_REPO_ROOT="$(cd "$ROOT/.." && pwd)"
+export DEVCTL_OPS_ROOT="$OPS"
+
+# shellcheck source=lib/common.sh
+source "$OPS/lib/common.sh"
+
+usage() {
+  cat "$OPS/help.txt"
+}
+
+run_script() {
+  local script="$1"
+  shift
+  [[ -x "$script" || -f "$script" ]] || devctl_die "缺少脚本: $script"
+  exec bash "$script" "$@"
+}
+
+main() {
+  if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+  fi
+
+  case "$1" in
+    -h|--help|help)
+      usage
+      ;;
+    git)
+      shift
+      [[ $# -ge 1 ]] || { usage; exit 1; }
+      case "$1" in
+        start)      shift; run_script "$OPS/git/start.sh" "$@" ;;
+        commit-msg) shift; run_script "$OPS/git/commit-msg.sh" "$@" ;;
+        mr)         shift; run_script "$OPS/git/mr.sh" "$@" ;;
+        done)       shift; run_script "$OPS/git/done.sh" "$@" ;;
+        status)     shift; run_script "$OPS/git/status.sh" "$@" ;;
+        *) devctl_die "未知 git 子命令: $1（devctl help）" ;;
+      esac
+      ;;
+    issue)
+      shift
+      [[ $# -ge 1 ]] || { usage; exit 1; }
+      case "$1" in
+        create)  shift; run_script "$OPS/issue/create.sh" "$@" ;;
+        list)    shift; run_script "$OPS/issue/list.sh" "$@" ;;
+        show)    shift; run_script "$OPS/issue/show.sh" "$@" ;;
+        comment) shift; run_script "$OPS/issue/comment.sh" "$@" ;;
+        close)   shift; run_script "$OPS/issue/close.sh" "$@" ;;
+        *) devctl_die "未知 issue 子命令: $1（devctl help）" ;;
+      esac
+      ;;
+    run)
+      shift
+      run_script "$OPS/run.sh" "$@"
+      ;;
+    *)
+      devctl_die "未知命令: $1（devctl help）"
+      ;;
+  esac
+}
+
+main "$@"
