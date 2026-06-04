@@ -26,7 +26,7 @@ backend_root="${backend:-${XFLOW_BACKEND_ROOT:-$(cd "$frontend_root/../xflow-ser
 [[ -d "$backend_root" ]] || devctl_die "找不到后端目录。请设置 XFLOW_BACKEND_ROOT 或 --backend PATH"
 [[ -f "$backend_root/pom.xml" ]] || devctl_die "后端目录无效: $backend_root"
 
-pids_dir="$frontend_root/_ops/.run"
+pids_dir="$(devctl_project_local_dir)/run"
 mkdir -p "$pids_dir"
 backend_pid_file="$pids_dir/backend.pid"
 frontend_pid_file="$pids_dir/frontend.pid"
@@ -84,7 +84,7 @@ elif command -v sensible-browser >/dev/null 2>&1; then
   sensible-browser "$browser_url" >/dev/null 2>&1 || true
 fi
 
-devctl_info "已启动。日志: _ops/.run/backend.log / frontend.log"
+devctl_info "已启动。日志: $pids_dir/backend.log / frontend.log"
 devctl_info "按 Ctrl+C 停止"
 
 wait "$(cat "$frontend_pid_file")" 2>/dev/null || wait

@@ -28,6 +28,26 @@ devctl_need_cmd() {
   done
 }
 
+devctl_project_local_dir() {
+  local dir="$DEVCTL_REPO_ROOT/.xflow-local"
+  mkdir -p "$dir"
+  devctl_ensure_project_local_exclude
+  echo "$dir"
+}
+
+devctl_ensure_project_local_exclude() {
+  local git_dir exclude
+  git_dir="$(git -C "$DEVCTL_REPO_ROOT" rev-parse --git-dir 2>/dev/null || true)"
+  [[ -n "$git_dir" ]] || return 0
+  case "$git_dir" in
+    /*) exclude="$git_dir/info/exclude" ;;
+    *) exclude="$DEVCTL_REPO_ROOT/$git_dir/info/exclude" ;;
+  esac
+  mkdir -p "$(dirname "$exclude")"
+  touch "$exclude"
+  grep -qxF ".xflow-local/" "$exclude" || printf '\n.xflow-local/\n' >>"$exclude"
+}
+
 # ── platform provider helper ──────────────────────────────────────────────────
 
 devctl_parse_owner_repo() {
@@ -84,11 +104,11 @@ devctl_default_base_branch() {
     return
   fi
   if git -C "$DEVCTL_REPO_ROOT" show-ref --verify --quiet refs/heads/master; then
-    echo maste
+    echo master
   elif git -C "$DEVCTL_REPO_ROOT" show-ref --verify --quiet refs/heads/main; then
     echo main
   else
-    git -C "$DEVCTL_REPO_ROOT" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || echo maste
+    git -C "$DEVCTL_REPO_ROOT" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || echo master
   fi
 }
 

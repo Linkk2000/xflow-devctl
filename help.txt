@@ -5,6 +5,14 @@ Issue (GitHub/Gitee):
   devctl issue comment <number> [--body B] [--body-file F]
   devctl issue close <number>
 
+App:
+  devctl app start-frontend [--port PORT] [--foreground]
+      Start the frontend dev server with a WSL-safe Vite config.
+  devctl app stop-frontend
+      Stop the recorded frontend dev server process.
+  devctl app status
+      Show recorded process, HTTP health, and log location.
+
 开发环境 (仅前端仓库):
   devctl run [--backend PATH]
       启动后端 + 前端，并打开浏览器

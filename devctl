@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
-# XFlow devctl — thin entrypoint; implementation lives in _ops/
+# XFlow devctl - user-level entrypoint.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPS="$ROOT"
-export DEVCTL_REPO_ROOT="$(cd "$ROOT/.." && pwd)"
+if [[ -z "${DEVCTL_REPO_ROOT:-}" ]]; then
+  if repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    DEVCTL_REPO_ROOT="$repo_root"
+  else
+    DEVCTL_REPO_ROOT="$(pwd)"
+  fi
+fi
+export DEVCTL_TOOL_ROOT="$ROOT"
+export DEVCTL_REPO_ROOT
 export DEVCTL_OPS_ROOT="$OPS"
 
 # shellcheck source=lib/common.sh
@@ -53,6 +61,16 @@ main() {
         comment) shift; run_script "$OPS/issue/comment.sh" "$@" ;;
         close)   shift; run_script "$OPS/issue/close.sh" "$@" ;;
         *) devctl_die "未知 issue 子命令: $1（devctl help）" ;;
+      esac
+      ;;
+    app)
+      shift
+      [[ $# -ge 1 ]] || { usage; exit 1; }
+      case "$1" in
+        start-frontend) shift; run_script "$OPS/app/start-frontend.sh" "$@" ;;
+        stop-frontend)  shift; run_script "$OPS/app/stop-frontend.sh" "$@" ;;
+        status)         shift; run_script "$OPS/app/status.sh" "$@" ;;
+        *) devctl_die "unknown app subcommand: $1 (devctl help)" ;;
       esac
       ;;
     run)
