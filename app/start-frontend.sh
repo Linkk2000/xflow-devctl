@@ -58,10 +58,33 @@ import { resolve } from 'node:path'
 
 const projectRoot = process.env.DEVCTL_REPO_ROOT || process.cwd()
 const require = createRequire(resolve(projectRoot, 'package.json'))
+const viteConfigRequire = createRequire(resolve(projectRoot, 'internal/vite-config/package.json'))
 
 const { defineConfig, loadEnv } = await import(require.resolve('vite'))
 const vue = (await import(require.resolve('@vitejs/plugin-vue'))).default
 const vueJsx = (await import(require.resolve('@vitejs/plugin-vue-jsx'))).default
+const tailwindcss = (await import(viteConfigRequire.resolve('@tailwindcss/vite'))).default
+
+const TAILWIND_REFERENCE_LINE = '@reference "@vben/tailwind-config/theme";\n'
+
+function tailwindReferencePlugin() {
+  return {
+    enforce: 'pre',
+    name: 'devctl:tailwind-reference',
+    transform(code, id) {
+      if (!id.includes('.vue') || !id.includes('type=style')) {
+        return null
+      }
+      if (code.includes('@reference') || !code.includes('@apply')) {
+        return null
+      }
+      return {
+        code: TAILWIND_REFERENCE_LINE + code,
+        map: null,
+      }
+    },
+  }
+}
 
 export default defineConfig(({ mode }) => {
   const appRoot = resolve(projectRoot, process.env.XFLOW_FRONTEND_APP_ROOT || 'apps/xflow')
@@ -77,6 +100,8 @@ export default defineConfig(({ mode }) => {
         },
       }),
       vueJsx(),
+      tailwindReferencePlugin(),
+      tailwindcss(),
     ],
     define: {
       'import.meta.env.VITE_APP_VERSION': JSON.stringify(process.env.XFLOW_APP_VERSION || '0.1.0'),
