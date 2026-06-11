@@ -31,13 +31,8 @@ if [[ -n "$body_file" ]]; then
   body="$(cat "$body_file")"
 fi
 
-# 检测 Windows 终端环境下直接用字符串参数传递多行文本的截断风险
 if [[ -z "$body_file" && -n "$body" ]]; then
-  if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
-    if [[ "$body" == *$'\n'* || "$body" == *$'\r'* ]]; then
-      devctl_die "错误: 在 Windows 环境下直接通过命令行传递多行文本会导致数据截断。请先将内容写入文件，并使用 --body-file 参数。"
-    fi
-  fi
+  devctl_validate_inline_issue_body "$body"
 fi
 
 devctl_need_cmd jq

@@ -5,6 +5,9 @@ Issue (GitHub/Gitee):
   devctl issue comment <number> [--body B] [--body-file F]
   devctl issue close <number>
 
+Note:
+  Use --body-file for multi-line or shell-sensitive Markdown bodies. --body is for simple single-line text only.
+
 App:
   devctl app start-frontend [--port PORT] [--foreground]
       Start the frontend dev server with a WSL-safe Vite config.

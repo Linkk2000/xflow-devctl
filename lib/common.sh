@@ -28,6 +28,18 @@ devctl_need_cmd() {
   done
 }
 
+devctl_validate_inline_issue_body() {
+  local body="${1:-}"
+  [[ -n "$body" ]] || return 0
+
+  if [[ "$body" == *$'\n'* || "$body" == *$'\r'* || "$body" == *"\\n"* || "$body" == *"\\r"* ]]; then
+    devctl_die "error: multi-line issue bodies must be passed with --body-file to avoid shell quoting and command-substitution corruption."
+  fi
+  if [[ "$body" == *'`'* || "$body" == *'$('* ]]; then
+    devctl_die "error: shell-sensitive issue bodies must be passed with --body-file to avoid command-substitution corruption."
+  fi
+}
+
 devctl_project_local_dir() {
   local dir="$DEVCTL_REPO_ROOT/.xflow-local"
   mkdir -p "$dir"
@@ -225,4 +237,6 @@ devctl_json_field() {
   fi
 }
 
-devctl_load_provider
+if [[ "${DEVCTL_SKIP_PROVIDER_LOAD:-0}" != "1" ]]; then
+  devctl_load_provider
+fi
