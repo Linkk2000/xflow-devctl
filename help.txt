@@ -1,5 +1,5 @@
 Issue (GitHub/Gitee):
-  devctl issue create <title> [--body B] [--labels a,b]
+  devctl issue create <title> [--body B] [--body-file F] [--labels a,b]
   devctl issue list [--state open|closed|all] [--limit N]
   devctl issue show <number>
   devctl issue comment <number> [--body B] [--body-file F]

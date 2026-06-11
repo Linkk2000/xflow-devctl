@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# devctl issue create <title> [--body B] [--labels a,b]
+# devctl issue create <title> [--body B] [--body-file F] [--labels a,b]
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/common.sh
@@ -7,11 +7,13 @@ source "$SCRIPT_DIR/../lib/common.sh"
 
 title=""
 body=""
+body_file=""
 labels=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --body) body="$2"; shift 2 ;;
+    --body-file) body_file="$2"; shift 2 ;;
     --labels) labels="$2"; shift 2 ;;
     -*) devctl_die "未知选项: $1" ;;
     *)
@@ -22,7 +24,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -n "$title" ]] || devctl_die "用法: devctl issue create <title> [--body B] [--labels a,b]"
+[[ -n "$title" ]] || devctl_die "用法: devctl issue create <title> [--body B] [--body-file F] [--labels a,b]"
+
+if [[ -n "$body_file" ]]; then
+  [[ -f "$body_file" ]] || devctl_die "文件不存在: $body_file"
+  body="$(cat "$body_file")"
+fi
 
 devctl_need_cmd jq
 
