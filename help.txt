@@ -8,6 +8,10 @@ Issue (GitHub/Gitee):
 Note:
   Use --body-file for multi-line or shell-sensitive Markdown bodies. --body is for simple single-line text only.
 
+Preflight:
+  devctl preflight
+      Validate Python 3.10+ runtime, repo root, tool root, and product-line context.
+
 Academic checks:
   devctl check academic-issue --issue N [--file F]
   devctl check tdd-result --issue N [--file F]

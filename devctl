@@ -15,6 +15,33 @@ export DEVCTL_TOOL_ROOT="$ROOT"
 export DEVCTL_REPO_ROOT
 export DEVCTL_OPS_ROOT="$OPS"
 
+find_python() {
+  local candidate
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      "$candidate" - <<'PY' >/dev/null 2>&1 && { echo "$candidate"; return 0; }
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+    fi
+  done
+  return 1
+}
+
+run_python_core() {
+  local py
+  py="$(find_python)" || {
+    cat >&2 <<'EOF'
+[ERROR] Python 3.10+ is required for devctl Python core.
+No installation was performed.
+Recommended Windows command after human review:
+  winget install Python.Python.3.12
+EOF
+    exit 1
+  }
+  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" exec "$py" -m xflow "$@"
+}
+
 # shellcheck source=lib/common.sh
 source "$OPS/lib/common.sh"
 
@@ -38,6 +65,10 @@ main() {
   case "$1" in
     -h|--help|help)
       usage
+      ;;
+    preflight)
+      shift
+      run_python_core preflight "$@"
       ;;
     git)
       shift
