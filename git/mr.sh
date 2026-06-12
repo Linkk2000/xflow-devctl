@@ -30,6 +30,8 @@ slug="$(devctl_get_branch_meta slug)"
 
 [[ "$branch" != "$base" ]] || devctl_die "当前在 ${base} 分支，请先 devctl git start"
 
+devctl_academic_require_remote_approval "git-mr" "${DEVCTL_ACADEMIC_APPROVED_FILE:-}" "$issue"
+
 devctl_push_current_branch
 
 # 去除分支前缀作为默认标题

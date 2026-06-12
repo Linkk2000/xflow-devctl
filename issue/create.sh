@@ -35,6 +35,9 @@ if [[ -z "$body_file" && -n "$body" ]]; then
   devctl_validate_inline_issue_body "$body"
 fi
 
+approved_file="${body_file:-${DEVCTL_ACADEMIC_APPROVED_FILE:-}}"
+devctl_academic_require_remote_approval "issue-create" "$approved_file" "draft"
+
 devctl_need_cmd jq
 
 resp="$(provider_issue_create "$title" "$body" "$labels")"

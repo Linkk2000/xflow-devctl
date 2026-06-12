@@ -63,6 +63,18 @@ main() {
         *) devctl_die "未知 issue 子命令: $1（devctl help）" ;;
       esac
       ;;
+    check)
+      shift
+      [[ $# -ge 1 ]] || { usage; exit 1; }
+      case "$1" in
+        academic-issue) shift; run_script "$OPS/check/academic-issue.sh" "$@" ;;
+        academic-mr)    shift; run_script "$OPS/check/academic-mr.sh" "$@" ;;
+        claude-package) shift; run_script "$OPS/check/claude-package.sh" "$@" ;;
+        local-review)   shift; run_script "$OPS/check/local-review.sh" "$@" ;;
+        tdd-result)     shift; run_script "$OPS/check/tdd-result.sh" "$@" ;;
+        *) devctl_die "unknown check subcommand: $1 (devctl help)" ;;
+      esac
+      ;;
     app)
       shift
       [[ $# -ge 1 ]] || { usage; exit 1; }

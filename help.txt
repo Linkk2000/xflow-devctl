@@ -8,6 +8,16 @@ Issue (GitHub/Gitee):
 Note:
   Use --body-file for multi-line or shell-sensitive Markdown bodies. --body is for simple single-line text only.
 
+Academic checks:
+  devctl check academic-issue --issue N [--file F]
+  devctl check tdd-result --issue N [--file F]
+  devctl check claude-package --issue N [--file F]
+  devctl check academic-mr --issue N [--file F]
+  devctl check local-review --issue N --file F
+
+  These checks validate local Academic XFlow templates before remote writes.
+  local-review also compares Approved SHA256 with the current file hash.
+
 App:
   devctl app start-frontend [--port PORT] [--foreground]
       Start the frontend dev server with a WSL-safe Vite config.

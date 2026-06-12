@@ -35,6 +35,9 @@ if [[ -z "$body_file" && -n "$body" ]]; then
   devctl_validate_inline_issue_body "$body"
 fi
 
+approved_file="${body_file:-${DEVCTL_ACADEMIC_APPROVED_FILE:-}}"
+devctl_academic_require_remote_approval "issue-comment" "$approved_file" "$number"
+
 devctl_need_cmd jq
 
 devctl_info "在 Issue #${number} 发表评论..."

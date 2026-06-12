@@ -166,6 +166,77 @@ devctl_get_branch_meta() {
   git -C "$DEVCTL_REPO_ROOT" config --local --get "devctl.${key}" 2>/dev/null || true
 }
 
+devctl_academic_gate_enabled() {
+  if [[ "${DEVCTL_ACADEMIC_ENFORCE:-}" == "1" ]]; then
+    return 0
+  fi
+  if [[ "${DEVCTL_ACADEMIC_ENFORCE:-}" == "0" ]]; then
+    return 1
+  fi
+  if [[ "${DEVCTL_PRODUCT_LINE:-}" == "academic" || "${DEVCTL_BASE_BRANCH:-}" == "academic" ]]; then
+    return 0
+  fi
+
+  local branch base
+  branch="$(devctl_current_branch 2>/dev/null || true)"
+  [[ "$branch" == "academic" ]] && return 0
+
+  base="$(devctl_get_branch_meta base 2>/dev/null || true)"
+  [[ "$base" == "academic" ]]
+}
+
+devctl_academic_sha256() {
+  local file="$1"
+  [[ -f "$file" ]] || devctl_die "missing approved file: $file"
+  sha256sum "$file" | awk '{print $1}'
+}
+
+devctl_academic_default_approved_file() {
+  local action="$1" issue="${2:-}"
+  case "$action" in
+    issue-create) echo "$DEVCTL_REPO_ROOT/.xflow/issue-${issue:-draft}/issue-draft.md" ;;
+    issue-comment) echo "$DEVCTL_REPO_ROOT/.xflow/issue-${issue}/comment-draft.md" ;;
+    issue-close) echo "$DEVCTL_REPO_ROOT/.xflow/issue-${issue}/walkthrough.md" ;;
+    git-mr) echo "$DEVCTL_REPO_ROOT/.xflow/issue-${issue}/mr-draft.md" ;;
+    git-push) echo "$DEVCTL_REPO_ROOT/.xflow/issue-${issue}/tdd-result.md" ;;
+    *) echo "" ;;
+  esac
+}
+
+devctl_academic_default_approval_file() {
+  local issue="${1:-}"
+  echo "$DEVCTL_REPO_ROOT/.xflow/issue-${issue:-draft}/approvals/local-review.md"
+}
+
+devctl_academic_require_remote_approval() {
+  local action="$1" approved_file="${2:-}" issue="${3:-}"
+  devctl_academic_gate_enabled || return 0
+
+  if [[ -z "$approved_file" ]]; then
+    approved_file="${DEVCTL_ACADEMIC_APPROVED_FILE:-$(devctl_academic_default_approved_file "$action" "$issue")}"
+  fi
+
+  local approval_file="${DEVCTL_ACADEMIC_APPROVAL_FILE:-$(devctl_academic_default_approval_file "$issue")}"
+  [[ -f "$approval_file" ]] || devctl_die "academic local approval required before remote write: missing $approval_file"
+  [[ -f "$approved_file" ]] || devctl_die "academic approved artifact missing: $approved_file"
+
+  grep -Fq "# Local Review Approval" "$approval_file" || devctl_die "invalid academic approval: missing title"
+  grep -Fq "Approved: yes" "$approval_file" || devctl_die "invalid academic approval: not approved"
+  grep -Fq "Approved Action:" "$approval_file" || devctl_die "invalid academic approval: missing action"
+  grep -Fq "Approved SHA256:" "$approval_file" || devctl_die "invalid academic approval: missing hash"
+
+  local approved_action expected actual
+  approved_action="$(grep -E '^Approved Action:' "$approval_file" | head -1 | sed 's/^Approved Action:[[:space:]]*//')"
+  case "$approved_action" in
+    "$action"|"remote-write"|"remote write"|"all-remote-writes") ;;
+    *) devctl_die "academic approval action mismatch: expected $action, got $approved_action" ;;
+  esac
+
+  expected="$(grep -E '^Approved SHA256:' "$approval_file" | head -1 | sed 's/^Approved SHA256:[[:space:]]*//')"
+  actual="$(devctl_academic_sha256 "$approved_file")"
+  [[ "$expected" == "$actual" ]] || devctl_die "academic approval hash mismatch for $approved_file"
+}
+
 devctl_push_current_branch() {
   local branch upstream
   branch="$(devctl_current_branch)"
