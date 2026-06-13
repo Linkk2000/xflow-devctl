@@ -14,6 +14,7 @@ fi
 export DEVCTL_TOOL_ROOT="$ROOT"
 export DEVCTL_REPO_ROOT
 export DEVCTL_OPS_ROOT="$OPS"
+export PYTHONDONTWRITEBYTECODE=1
 
 find_python() {
   local candidate
@@ -39,13 +40,13 @@ Recommended Windows command after human review:
 EOF
     exit 1
   }
-  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" exec "$py" -m xflow "$@"
+  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" PYTHONDONTWRITEBYTECODE=1 exec "$py" -m xflow "$@"
 }
 
 try_python_core() {
   local py
   py="$(find_python)" || return 127
-  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" "$py" -m xflow "$@"
+  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" PYTHONDONTWRITEBYTECODE=1 "$py" -m xflow "$@"
 }
 
 # shellcheck source=lib/common.sh
@@ -136,6 +137,14 @@ main() {
         local-review)   shift; run_python_check_or_script local-review "$OPS/check/local-review.sh" "$@" ;;
         tdd-result)     shift; run_python_check_or_script tdd-result "$OPS/check/tdd-result.sh" "$@" ;;
         *) devctl_die "unknown check subcommand: $1 (devctl help)" ;;
+      esac
+      ;;
+    claude)
+      shift
+      [[ $# -ge 1 ]] || { usage; exit 1; }
+      case "$1" in
+        run) shift; run_python_core claude run "$@" ;;
+        *) devctl_die "unknown claude subcommand: $1 (devctl help)" ;;
       esac
       ;;
     app)

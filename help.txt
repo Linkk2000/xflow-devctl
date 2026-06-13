@@ -22,6 +22,14 @@ Academic checks:
   These checks validate local Academic XFlow templates before remote writes.
   local-review also compares Approved SHA256 with the current file hash.
 
+Claude:
+  devctl claude run --issue N [--file F] [--output F] [--dry-run]
+
+  Validate a Claude task package, call the local Claude CLI with the package
+  content, and write the result to the package Output File. Set
+  DEVCTL_CLAUDE_COMMAND to override the command prefix. The default command is
+  `claude -p <task-package-content>`.
+
 App:
   devctl app start-frontend [--port PORT] [--foreground]
       Start the frontend dev server with a WSL-safe Vite config.

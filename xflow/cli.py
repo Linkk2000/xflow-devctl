@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from .approval import check_local_review_file, require_remote_approval
+from .claude_runner import run_claude_task
 from .checks import (
     check_academic_issue,
     check_academic_mr,
@@ -46,6 +47,14 @@ def build_parser() -> argparse.ArgumentParser:
     issue_create.add_argument("--body")
     issue_create.add_argument("--body-file", type=Path)
     issue_create.add_argument("--labels")
+
+    claude = sub.add_parser("claude")
+    claude_sub = claude.add_subparsers(dest="claude_command")
+    claude_run = claude_sub.add_parser("run")
+    claude_run.add_argument("--issue", required=True)
+    claude_run.add_argument("--file", type=Path)
+    claude_run.add_argument("--output", type=Path)
+    claude_run.add_argument("--dry-run", action="store_true")
     return parser
 
 
@@ -116,6 +125,25 @@ def run_issue(args: argparse.Namespace) -> int:
     return 1
 
 
+def run_claude(args: argparse.Namespace) -> int:
+    context = RuntimeContext.from_env(Path(__file__).resolve().parents[1], os.environ)
+    try:
+        if args.claude_command != "run":
+            raise ValueError(f"unknown claude subcommand: {args.claude_command}")
+        task_file = args.file or resolve_check_file(context, args.issue, None, "claude-task.md")
+        result = run_claude_task(context, task_file, args.output, args.dry_run, os.environ)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+    if result.dry_run:
+        print(f"[INFO] claude task package ready: {result.task_file}")
+        print(f"[INFO] claude output target: {result.output_file}")
+    else:
+        print(f"[INFO] claude result written: {result.output_file}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -125,5 +153,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_check(args)
     if args.command == "issue":
         return run_issue(args)
+    if args.command == "claude":
+        return run_claude(args)
     parser.print_help()
     return 0

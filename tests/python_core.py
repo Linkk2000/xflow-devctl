@@ -1,7 +1,7 @@
 import os
 import sys
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -299,6 +299,80 @@ class CheckTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(main(["check", "academic-mr", "--file", str(path)]), 0)
+
+
+class ClaudeRunTests(unittest.TestCase):
+    def write_claude_task(self, repo, issue="1"):
+        path = Path(repo) / ".xflow" / f"issue-{issue}" / "claude-task.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            "# Claude Task Package\n\n"
+            f"Issue: {issue}\n"
+            "AcademicForge Skill: paper-polish-workflow-skill@unknown\n"
+            "Input Files:\n"
+            "- draft.md: sha256-placeholder\n"
+            f"Output File: .xflow/issue-{issue}/claude-result.md\n\n"
+            "## Objective\n"
+            "Polish the academic paragraph.\n\n"
+            "## Constraints\n"
+            "Do not change citations.\n\n"
+            "## Required Output Format\n"
+            "Return Markdown only.\n\n"
+            "## Human Review Requirement\n"
+            "Human review is required before using this output.\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_claude_run_dry_run_validates_task_without_writing_output(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.write_claude_task(repo)
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update({"DEVCTL_REPO_ROOT": str(repo), "DEVCTL_PRODUCT_LINE": "academic"})
+                out = StringIO()
+                with redirect_stdout(out):
+                    result = main(["claude", "run", "--issue", "1", "--dry-run"])
+                self.assertEqual(result, 0)
+                self.assertIn("claude task package ready", out.getvalue())
+                self.assertFalse((repo / ".xflow" / "issue-1" / "claude-result.md").exists())
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_claude_run_executes_configured_command_and_writes_output(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.write_claude_task(repo)
+            fake = repo / "fake_claude.py"
+            fake.write_text(
+                "import sys\n"
+                "prompt = sys.argv[sys.argv.index('-p') + 1]\n"
+                "print('CLAUDE_RESULT')\n"
+                "print('HAS_OBJECTIVE=' + str('## Objective' in prompt))\n",
+                encoding="utf-8",
+            )
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "DEVCTL_REPO_ROOT": str(repo),
+                        "DEVCTL_PRODUCT_LINE": "academic",
+                        "DEVCTL_CLAUDE_COMMAND": f"{sys.executable} {fake}",
+                    }
+                )
+                result = main(["claude", "run", "--issue", "1"])
+                self.assertEqual(result, 0)
+                output = repo / ".xflow" / "issue-1" / "claude-result.md"
+                self.assertTrue(output.exists())
+                self.assertIn("CLAUDE_RESULT", output.read_text(encoding="utf-8"))
+                self.assertIn("HAS_OBJECTIVE=True", output.read_text(encoding="utf-8"))
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
 
 
 class ApprovalTests(unittest.TestCase):
