@@ -24,9 +24,13 @@ Academic checks:
   devctl check claude-package --issue N [--file F]
   devctl check academic-mr --issue N [--file F]
   devctl check local-review --issue N --file F
+  devctl check submodule-hygiene
 
   These checks validate local Academic XFlow templates before remote writes.
   local-review also compares Approved SHA256 with the current file hash.
+  submodule-hygiene verifies that _ops/devctl and _ops/workflow are free of
+  tracked changes and common byproducts, and that .gitmodules uses
+  ignore = untracked for both tool submodules.
 
 Claude:
   devctl claude doctor

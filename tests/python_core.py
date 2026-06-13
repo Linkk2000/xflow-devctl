@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -14,6 +15,7 @@ from xflow.checks import (
     check_academic_issue,
     check_academic_mr,
     check_claude_package,
+    check_submodule_hygiene,
     check_tdd_result,
 )
 from xflow.cli import build_parser, main, resolve_check_file
@@ -299,6 +301,81 @@ class CheckTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(main(["check", "academic-mr", "--file", str(path)]), 0)
+
+
+class SubmoduleHygieneTests(unittest.TestCase):
+    def init_git_repo(self, path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(path), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(path), "config", "user.name", "Test User"], check=True)
+        (path / "README.md").write_text("clean\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(path), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(path), "commit", "-m", "init", "-q"], check=True)
+
+    def write_gitmodules(self, repo: Path, include_ignore: bool = True) -> None:
+        ignore_line = "\n\tignore = untracked" if include_ignore else ""
+        (repo / ".gitmodules").write_text(
+            "[submodule \"_ops/devctl\"]\n"
+            "\tpath = _ops/devctl\n"
+            "\turl = git@github.com:Linkk2000/xflow-devctl.git\n"
+            "\tbranch = academic"
+            f"{ignore_line}\n"
+            "[submodule \"_ops/workflow\"]\n"
+            "\tpath = _ops/workflow\n"
+            "\turl = git@github.com:Linkk2000/xflow-skills.git\n"
+            "\tbranch = academic"
+            f"{ignore_line}\n",
+            encoding="utf-8",
+        )
+
+    def prepare_parent_with_ops(self, tmp: str, include_ignore: bool = True) -> Path:
+        repo = Path(tmp)
+        self.write_gitmodules(repo, include_ignore=include_ignore)
+        self.init_git_repo(repo / "_ops" / "devctl")
+        self.init_git_repo(repo / "_ops" / "workflow")
+        return repo
+
+    def test_submodule_hygiene_accepts_clean_ops_repositories(self):
+        with TemporaryDirectory() as tmp:
+            repo = self.prepare_parent_with_ops(tmp)
+            check_submodule_hygiene(repo)
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "DEVCTL_REPO_ROOT": str(repo),
+                        "DEVCTL_PRODUCT_LINE": "academic",
+                        "PATH": original.get("PATH", ""),
+                    }
+                )
+                self.assertEqual(main(["check", "submodule-hygiene"]), 0)
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_submodule_hygiene_rejects_tracked_changes_inside_ops(self):
+        with TemporaryDirectory() as tmp:
+            repo = self.prepare_parent_with_ops(tmp)
+            (repo / "_ops" / "devctl" / "README.md").write_text("dirty\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "tracked changes in _ops/devctl"):
+                check_submodule_hygiene(repo)
+
+    def test_submodule_hygiene_rejects_byproducts_inside_ops(self):
+        with TemporaryDirectory() as tmp:
+            repo = self.prepare_parent_with_ops(tmp)
+            cache_dir = repo / "_ops" / "workflow" / "xflow" / "__pycache__"
+            cache_dir.mkdir(parents=True)
+            (cache_dir / "checks.cpython-312.pyc").write_bytes(b"cache")
+            with self.assertRaisesRegex(ValueError, "byproduct in _ops/workflow"):
+                check_submodule_hygiene(repo)
+
+    def test_submodule_hygiene_rejects_missing_ignore_untracked(self):
+        with TemporaryDirectory() as tmp:
+            repo = self.prepare_parent_with_ops(tmp, include_ignore=False)
+            with self.assertRaisesRegex(ValueError, "missing ignore = untracked"):
+                check_submodule_hygiene(repo)
 
 
 class ClaudeRunTests(unittest.TestCase):

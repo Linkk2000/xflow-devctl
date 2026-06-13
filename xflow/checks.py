@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 from .io import read_text_strict
@@ -54,6 +55,29 @@ ACADEMIC_MR_REQUIRED = [
     "## Remote Actions Requested",
 ]
 
+OPS_SUBMODULES = ("_ops/devctl", "_ops/workflow")
+
+BYPRODUCT_DIR_NAMES = {
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "htmlcov",
+}
+
+BYPRODUCT_FILE_NAMES = {
+    ".coverage",
+    "Thumbs.db",
+    ".DS_Store",
+}
+
+BYPRODUCT_SUFFIXES = {
+    ".pyc",
+    ".pyo",
+    ".tmp",
+    ".log",
+}
+
 
 def require_template(path: Path, required: list[str]) -> None:
     if not path.is_file():
@@ -78,3 +102,76 @@ def check_claude_package(path: Path) -> None:
 
 def check_academic_mr(path: Path) -> None:
     require_template(path, ACADEMIC_MR_REQUIRED)
+
+
+def _run_git_status(path: Path) -> list[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "status", "--porcelain"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise ValueError("git command is required for submodule hygiene checks") from exc
+    if result.returncode != 0:
+        raise ValueError(f"cannot inspect git status for {path}: {result.stderr.strip()}")
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def _is_tracked_status(line: str) -> bool:
+    return not line.startswith("??")
+
+
+def _find_byproducts(root: Path) -> list[Path]:
+    byproducts: list[Path] = []
+    for path in root.rglob("*"):
+        if ".git" in path.parts:
+            continue
+        if path.is_dir() and path.name in BYPRODUCT_DIR_NAMES:
+            byproducts.append(path)
+            continue
+        if path.is_file() and (path.name in BYPRODUCT_FILE_NAMES or path.suffix in BYPRODUCT_SUFFIXES):
+            byproducts.append(path)
+    return byproducts
+
+
+def _gitmodules_has_ignore_untracked(repo_root: Path, submodule_path: str) -> bool:
+    gitmodules = repo_root / ".gitmodules"
+    if not gitmodules.is_file():
+        return False
+
+    current_section = False
+    for raw_line in gitmodules.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line.startswith("[submodule "):
+            current_section = False
+            continue
+        if line == f"path = {submodule_path}":
+            current_section = True
+            continue
+        if current_section and line == "ignore = untracked":
+            return True
+    return False
+
+
+def check_submodule_hygiene(repo_root: Path) -> None:
+    repo_root = repo_root.resolve()
+    for submodule in OPS_SUBMODULES:
+        path = repo_root / submodule
+        if not path.exists():
+            continue
+
+        if not _gitmodules_has_ignore_untracked(repo_root, submodule):
+            raise ValueError(f"missing ignore = untracked for {submodule} in .gitmodules")
+
+        status_lines = _run_git_status(path)
+        tracked = [line for line in status_lines if _is_tracked_status(line)]
+        if tracked:
+            raise ValueError(f"tracked changes in {submodule}: {tracked[0]}")
+
+        byproducts = _find_byproducts(path)
+        if byproducts:
+            relative = byproducts[0].relative_to(path)
+            raise ValueError(f"byproduct in {submodule}: {relative}")

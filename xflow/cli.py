@@ -11,6 +11,7 @@ from .checks import (
     check_academic_issue,
     check_academic_mr,
     check_claude_package,
+    check_submodule_hygiene,
     check_tdd_result,
 )
 from .env import RuntimeContext, detect_python_runtime
@@ -39,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     local_review = check_sub.add_parser("local-review")
     local_review.add_argument("--issue")
     local_review.add_argument("--file", type=Path)
+    check_sub.add_parser("submodule-hygiene")
 
     issue = sub.add_parser("issue")
     issue_sub = issue.add_subparsers(dest="issue_command")
@@ -97,6 +99,9 @@ def run_check(args: argparse.Namespace) -> int:
             path = resolve_check_file(context, args.issue, args.file, "issue-draft.md")
             issue = args.issue or "draft"
             check_local_review_file(context.repo_root, issue, path)
+        elif args.check_command == "submodule-hygiene":
+            path = context.repo_root
+            check_submodule_hygiene(path)
         else:
             raise ValueError(f"unknown check subcommand: {args.check_command}")
     except ValueError as exc:
