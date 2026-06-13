@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -9,7 +10,9 @@ from .io import read_text_strict
 ACADEMIC_ISSUE_REQUIRED = [
     "# Academic Issue Draft",
     "Task Type:",
-    "Target Branch:",
+    "Workflow Product Line:",
+    "Paper Base Branch:",
+    "Task Branch:",
     "Target Artifacts:",
     "## Background",
     "## Goal",
@@ -47,7 +50,9 @@ CLAUDE_PACKAGE_REQUIRED = [
 ACADEMIC_MR_REQUIRED = [
     "# MR Draft",
     "Issue:",
-    "Target Branch:",
+    "Workflow Product Line:",
+    "Paper Base Branch:",
+    "Task Branch:",
     "## Summary",
     "## Evidence",
     "TDD Result:",
@@ -55,7 +60,7 @@ ACADEMIC_MR_REQUIRED = [
     "## Remote Actions Requested",
 ]
 
-OPS_SUBMODULES = ("_ops/devctl", "_ops/workflow")
+OPS_SUBMODULES = (".xflow/ops/devctl", ".xflow/ops/workflow")
 
 BYPRODUCT_DIR_NAMES = {
     "__pycache__",
@@ -88,7 +93,17 @@ def require_template(path: Path, required: list[str]) -> None:
             raise ValueError(f"missing required text '{needle}' in {path}")
 
 
+def reject_obsolete_academic_target_branch(path: Path) -> None:
+    text = read_text_strict(path)
+    if re.search(r"(?m)^\s*Target Branch:\s*academic\s*$", text):
+        raise ValueError(
+            "obsolete academic branch field in "
+            f"{path}: use Workflow Product Line, Paper Base Branch, and Task Branch"
+        )
+
+
 def check_academic_issue(path: Path) -> None:
+    reject_obsolete_academic_target_branch(path)
     require_template(path, ACADEMIC_ISSUE_REQUIRED)
 
 
@@ -101,6 +116,7 @@ def check_claude_package(path: Path) -> None:
 
 
 def check_academic_mr(path: Path) -> None:
+    reject_obsolete_academic_target_branch(path)
     require_template(path, ACADEMIC_MR_REQUIRED)
 
 

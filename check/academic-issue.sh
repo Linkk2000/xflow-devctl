@@ -9,10 +9,16 @@ source "$OPS_ROOT/check/academic-common.sh"
 academic_parse_issue_file_args "$@"
 file="${academic_file:-$(academic_default_file issue-draft.md)}"
 
+if grep -Eq '^[[:space:]]*Target Branch:[[:space:]]*academic[[:space:]]*$' "$file" 2>/dev/null; then
+  devctl_die "obsolete academic branch field in $file: use Workflow Product Line, Paper Base Branch, and Task Branch"
+fi
+
 academic_check_template "$file" \
   "# Academic Issue Draft" \
   "Task Type:" \
-  "Target Branch:" \
+  "Workflow Product Line:" \
+  "Paper Base Branch:" \
+  "Task Branch:" \
   "Target Artifacts:" \
   "## Background" \
   "## Goal" \

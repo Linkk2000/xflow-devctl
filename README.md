@@ -1,9 +1,9 @@
-# _ops — devctl 实现目录
+# devctl implementation directory
 
 `devctl` 是薄入口，本目录存放全部实现脚本。
 
 ```
-_ops/
+.xflow/ops/devctl/
   lib/common.sh       # 公共库：git / Gitee API / 提交信息启发式
   git/
     start.sh          # 干净工作区 → 功能分支

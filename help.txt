@@ -7,6 +7,8 @@ Issue (GitHub/Gitee):
 
 Note:
   Use --body-file for multi-line or shell-sensitive Markdown bodies. --body is for simple single-line text only.
+  In academic Python mode, issue create currently supports GitHub through
+  GITHUB_TOKEN after the local approval gate passes.
 
 MR:
   devctl git mr --title T [--body B | --body-file F] [--issue N]
@@ -28,7 +30,7 @@ Academic checks:
 
   These checks validate local Academic XFlow templates before remote writes.
   local-review also compares Approved SHA256 with the current file hash.
-  submodule-hygiene verifies that _ops/devctl and _ops/workflow are free of
+  submodule-hygiene verifies that .xflow/ops/devctl and .xflow/ops/workflow are free of
   tracked changes and common byproducts, and that .gitmodules uses
   ignore = untracked for both tool submodules.
 

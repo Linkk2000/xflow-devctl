@@ -8,11 +8,11 @@ artifacts before human approval and remote writes.
 ./devctl check tdd-result --issue 1
 ./devctl check claude-package --issue 1
 ./devctl check academic-mr --issue 1
-./devctl check local-review --issue 1 --file .xflow/issue-1/tdd-result.md
+./devctl check local-review --issue 1 --file .xflow/issues/issue-1/tdd-result.md
 ```
 
 `local-review` compares `Approved SHA256` in
-`.xflow/issue-<id>/approvals/local-review.md` with the current hash of the
+`.xflow/issues/issue-<id>/approvals/local-review.md` with the current hash of the
 reviewed file. If the reviewed file changes, the prior local approval becomes
 invalid.
 

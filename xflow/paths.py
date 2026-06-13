@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 def issue_dir(repo_root: Path, issue: str) -> Path:
-    return repo_root / ".xflow" / f"issue-{issue}"
+    return repo_root / ".xflow" / "issues" / f"issue-{issue}"
 
 
 def default_issue_file(repo_root: Path, issue: str, filename: str) -> Path:

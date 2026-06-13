@@ -16,6 +16,7 @@ from .checks import (
 )
 from .env import RuntimeContext, detect_python_runtime
 from .paths import default_issue_file
+from .providers import create_issue
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -119,6 +120,7 @@ def run_issue(args: argparse.Namespace) -> int:
         if args.body_file is None:
             raise ValueError("academic issue create requires --body-file")
         require_remote_approval(context.repo_root, "issue-create", args.body_file, "draft")
+        body = args.body_file.read_text(encoding="utf-8")
     except ValueError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
@@ -127,8 +129,17 @@ def run_issue(args: argparse.Namespace) -> int:
         print("[INFO] issue-create gate passed; provider skipped")
         return 0
 
-    print("[ERROR] provider not ported to Python yet", file=sys.stderr)
-    return 1
+    try:
+        result = create_issue(context.repo_root, args.title, body, args.labels, os.environ)
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+    print(f"[INFO] Issue #{result.number} created")
+    if result.html_url:
+        print(f"[INFO] {result.html_url}")
+    print(result.number)
+    return 0
 
 
 def run_claude(args: argparse.Namespace) -> int:

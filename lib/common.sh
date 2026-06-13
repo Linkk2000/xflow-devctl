@@ -41,7 +41,7 @@ devctl_validate_inline_issue_body() {
 }
 
 devctl_project_local_dir() {
-  local dir="$DEVCTL_REPO_ROOT/.xflow-local"
+  local dir="$DEVCTL_REPO_ROOT/.xflow/local"
   mkdir -p "$dir"
   devctl_ensure_project_local_exclude
   echo "$dir"
@@ -57,7 +57,7 @@ devctl_ensure_project_local_exclude() {
   esac
   mkdir -p "$(dirname "$exclude")"
   touch "$exclude"
-  grep -qxF ".xflow-local/" "$exclude" || printf '\n.xflow-local/\n' >>"$exclude"
+  grep -qxF ".xflow/local/" "$exclude" || printf '\n.xflow/local/\n' >>"$exclude"
 }
 
 # ── platform provider helper ──────────────────────────────────────────────────
@@ -194,18 +194,18 @@ devctl_academic_sha256() {
 devctl_academic_default_approved_file() {
   local action="$1" issue="${2:-}"
   case "$action" in
-    issue-create) echo "$DEVCTL_REPO_ROOT/.xflow/issue-${issue:-draft}/issue-draft.md" ;;
-    issue-comment) echo "$DEVCTL_REPO_ROOT/.xflow/issue-${issue}/comment-draft.md" ;;
-    issue-close) echo "$DEVCTL_REPO_ROOT/.xflow/issue-${issue}/walkthrough.md" ;;
-    git-mr) echo "$DEVCTL_REPO_ROOT/.xflow/issue-${issue}/mr-draft.md" ;;
-    git-push) echo "$DEVCTL_REPO_ROOT/.xflow/issue-${issue}/tdd-result.md" ;;
+    issue-create) echo "$DEVCTL_REPO_ROOT/.xflow/issues/issue-${issue:-draft}/issue-draft.md" ;;
+    issue-comment) echo "$DEVCTL_REPO_ROOT/.xflow/issues/issue-${issue}/comment-draft.md" ;;
+    issue-close) echo "$DEVCTL_REPO_ROOT/.xflow/issues/issue-${issue}/walkthrough.md" ;;
+    git-mr) echo "$DEVCTL_REPO_ROOT/.xflow/issues/issue-${issue}/mr-draft.md" ;;
+    git-push) echo "$DEVCTL_REPO_ROOT/.xflow/issues/issue-${issue}/tdd-result.md" ;;
     *) echo "" ;;
   esac
 }
 
 devctl_academic_default_approval_file() {
   local issue="${1:-}"
-  echo "$DEVCTL_REPO_ROOT/.xflow/issue-${issue:-draft}/approvals/local-review.md"
+  echo "$DEVCTL_REPO_ROOT/.xflow/issues/issue-${issue:-draft}/approvals/local-review.md"
 }
 
 devctl_academic_require_remote_approval() {
@@ -257,7 +257,7 @@ devctl_guess_commit_type() {
     case "$f" in
       *.md|docs/*|AGENTS.md|README*) echo docs; return ;;
       *_test.*|*test/*|tests/*) echo test; return ;;
-      _ops/*|devctl|scripts/*) echo chore; return ;;
+      .xflow/ops/*|devctl|scripts/*) echo chore; return ;;
       *.vue|*.tsx|*.jsx) echo feat; return ;;
       *.java) echo feat; return ;;
     esac
@@ -271,7 +271,7 @@ devctl_guess_commit_scope() {
   if echo "$paths" | grep -q 'warmflow-designer'; then echo warmflow-designer; return; fi
   if echo "$paths" | grep -q 'xflow-server\|xflow-app'; then echo server; return; fi
   if echo "$paths" | grep -q 'apps/xflow'; then echo xflow; return; fi
-  if echo "$paths" | grep -q '_ops/'; then echo devctl; return; fi
+  if echo "$paths" | grep -q '.xflow/ops/'; then echo devctl; return; fi
   scope="$(echo "$paths" | head -1 | cut -d/ -f1-2)"
   [[ -n "$scope" ]] && echo "$scope" || echo dev
 }

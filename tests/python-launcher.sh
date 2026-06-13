@@ -44,7 +44,7 @@ assert_preflight_fail_closed() {
 assert_academic_issue_create_gate_blocks() {
   local tmpdir body
   tmpdir="$(mktemp -d)"
-  body="$tmpdir/.xflow/issue-draft/issue-draft.md"
+  body="$tmpdir/.xflow/issues/issue-draft/issue-draft.md"
   mkdir -p "$(dirname "$body")"
   echo "# Academic Issue Draft" >"$body"
 
@@ -66,7 +66,7 @@ assert_academic_issue_create_gate_blocks() {
 assert_academic_issue_create_fail_closed() {
   local tmpdir body
   tmpdir="$(mktemp -d)"
-  body="$tmpdir/.xflow/issue-draft/issue-draft.md"
+  body="$tmpdir/.xflow/issues/issue-draft/issue-draft.md"
   mkdir -p "$(dirname "$body")"
   echo "# Academic Issue Draft" >"$body"
 

@@ -26,7 +26,7 @@ academic_parse_issue_file_args() {
 
 academic_issue_dir() {
   [[ -n "$academic_issue_id" ]] || devctl_die "--issue is required"
-  echo "$DEVCTL_REPO_ROOT/.xflow/issue-$academic_issue_id"
+  echo "$DEVCTL_REPO_ROOT/.xflow/issues/issue-$academic_issue_id"
 }
 
 academic_default_file() {

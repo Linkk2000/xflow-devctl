@@ -1,8 +1,11 @@
 import os
+import json
 import subprocess
 import sys
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -37,7 +40,7 @@ def write_local_review(
         import hashlib
 
         sha = hashlib.sha256(approved_file.read_bytes()).hexdigest()
-    review = Path(repo_root) / ".xflow" / f"issue-{issue}" / "approvals" / "local-review.md"
+    review = Path(repo_root) / ".xflow" / "issues" / f"issue-{issue}" / "approvals" / "local-review.md"
     review.parent.mkdir(parents=True)
     text = (
         f"Issue: {issue}\n"
@@ -95,24 +98,24 @@ class CheckTests(unittest.TestCase):
             context = RuntimeContext.from_env(ROOT, {"DEVCTL_REPO_ROOT": tmp})
             self.assertEqual(
                 resolve_check_file(context, "draft", None, "issue-draft.md"),
-                Path(tmp).resolve() / ".xflow" / "issue-draft" / "issue-draft.md",
+                Path(tmp).resolve() / ".xflow" / "issues" / "issue-draft" / "issue-draft.md",
             )
             self.assertEqual(
                 resolve_check_file(context, "1", None, "tdd-result.md"),
-                Path(tmp).resolve() / ".xflow" / "issue-1" / "tdd-result.md",
+                Path(tmp).resolve() / ".xflow" / "issues" / "issue-1" / "tdd-result.md",
             )
             self.assertEqual(
                 resolve_check_file(context, "1", None, "claude-task.md"),
-                Path(tmp).resolve() / ".xflow" / "issue-1" / "claude-task.md",
+                Path(tmp).resolve() / ".xflow" / "issues" / "issue-1" / "claude-task.md",
             )
             self.assertEqual(
                 resolve_check_file(context, "1", None, "mr-draft.md"),
-                Path(tmp).resolve() / ".xflow" / "issue-1" / "mr-draft.md",
+                Path(tmp).resolve() / ".xflow" / "issues" / "issue-1" / "mr-draft.md",
             )
 
     def test_academic_issue_rejects_missing_sections(self):
         with TemporaryDirectory() as tmp:
-            path = Path(tmp) / ".xflow" / "issue-draft" / "issue-draft.md"
+            path = Path(tmp) / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
             path.parent.mkdir(parents=True)
             path.write_text("# Academic Issue Draft\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "Task Type:"):
@@ -120,7 +123,28 @@ class CheckTests(unittest.TestCase):
 
     def test_academic_issue_accepts_valid_template(self):
         with TemporaryDirectory() as tmp:
-            path = Path(tmp) / ".xflow" / "issue-draft" / "issue-draft.md"
+            path = Path(tmp) / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "# Academic Issue Draft\n\n"
+                "Task Type: workflow-test\n"
+                "Workflow Product Line: academic\n"
+                "Paper Base Branch: main\n"
+                "Task Branch: feature/1-test\n"
+                "Target Artifacts:\n- README.md\n\n"
+                "## Background\nx\n\n"
+                "## Goal\nx\n\n"
+                "## Scope\nx\n\n"
+                "## Acceptance Criteria\nx\n\n"
+                "## Verification Plan\nx\n\n"
+                "## Human Review Gate\nx\n",
+                encoding="utf-8",
+            )
+            check_academic_issue(path)
+
+    def test_academic_issue_rejects_academic_as_target_branch(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
             path.parent.mkdir(parents=True)
             path.write_text(
                 "# Academic Issue Draft\n\n"
@@ -135,7 +159,8 @@ class CheckTests(unittest.TestCase):
                 "## Human Review Gate\nx\n",
                 encoding="utf-8",
             )
-            check_academic_issue(path)
+            with self.assertRaisesRegex(ValueError, "Workflow Product Line"):
+                check_academic_issue(path)
 
     def test_academic_issue_accepts_explicit_file_without_issue(self):
         with TemporaryDirectory() as tmp:
@@ -143,7 +168,9 @@ class CheckTests(unittest.TestCase):
             path.write_text(
                 "# Academic Issue Draft\n\n"
                 "Task Type: workflow-test\n"
-                "Target Branch: academic\n"
+                "Workflow Product Line: academic\n"
+                "Paper Base Branch: main\n"
+                "Task Branch: feature/1-test\n"
                 "Target Artifacts:\n- README.md\n\n"
                 "## Background\nx\n\n"
                 "## Goal\nx\n\n"
@@ -157,7 +184,7 @@ class CheckTests(unittest.TestCase):
 
     def test_tdd_result_rejects_missing_sections(self):
         with TemporaryDirectory() as tmp:
-            path = Path(tmp) / ".xflow" / "issue-1" / "tdd-result.md"
+            path = Path(tmp) / ".xflow" / "issues" / "issue-1" / "tdd-result.md"
             path.parent.mkdir(parents=True)
             path.write_text("# TDD Result\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "Issue:"):
@@ -165,7 +192,7 @@ class CheckTests(unittest.TestCase):
 
     def test_tdd_result_accepts_valid_template(self):
         with TemporaryDirectory() as tmp:
-            path = Path(tmp) / ".xflow" / "issue-1" / "tdd-result.md"
+            path = Path(tmp) / ".xflow" / "issues" / "issue-1" / "tdd-result.md"
             path.parent.mkdir(parents=True)
             path.write_text(
                 "# TDD Result\n\n"
@@ -184,7 +211,7 @@ class CheckTests(unittest.TestCase):
 
     def test_claude_package_rejects_missing_sections(self):
         with TemporaryDirectory() as tmp:
-            path = Path(tmp) / ".xflow" / "issue-1" / "claude-task.md"
+            path = Path(tmp) / ".xflow" / "issues" / "issue-1" / "claude-task.md"
             path.parent.mkdir(parents=True)
             path.write_text("# Claude Task Package\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "Issue:"):
@@ -192,7 +219,7 @@ class CheckTests(unittest.TestCase):
 
     def test_claude_package_accepts_valid_template(self):
         with TemporaryDirectory() as tmp:
-            path = Path(tmp) / ".xflow" / "issue-1" / "claude-task.md"
+            path = Path(tmp) / ".xflow" / "issues" / "issue-1" / "claude-task.md"
             path.parent.mkdir(parents=True)
             path.write_text(
                 "# Claude Task Package\n\n"
@@ -200,7 +227,7 @@ class CheckTests(unittest.TestCase):
                 "AcademicForge Skill: paper-polish-workflow-skill@unknown\n"
                 "Input Files:\n"
                 "- draft.md: sha256-placeholder\n"
-                "Output File: .xflow/issue-1/claude-result.md\n\n"
+                "Output File: .xflow/issues/issue-1/claude-result.md\n\n"
                 "## Objective\nx\n\n"
                 "## Constraints\nx\n\n"
                 "## Required Output Format\nx\n\n"
@@ -218,7 +245,7 @@ class CheckTests(unittest.TestCase):
                 "AcademicForge Skill: paper-polish-workflow-skill@unknown\n"
                 "Input Files:\n"
                 "- draft.md: sha256-placeholder\n"
-                "Output File: .xflow/issue-1/claude-result.md\n\n"
+                "Output File: .xflow/issues/issue-1/claude-result.md\n\n"
                 "## Objective\nx\n\n"
                 "## Constraints\nx\n\n"
                 "## Required Output Format\nx\n\n"
@@ -229,7 +256,7 @@ class CheckTests(unittest.TestCase):
 
     def test_academic_mr_rejects_missing_sections(self):
         with TemporaryDirectory() as tmp:
-            path = Path(tmp) / ".xflow" / "issue-1" / "mr-draft.md"
+            path = Path(tmp) / ".xflow" / "issues" / "issue-1" / "mr-draft.md"
             path.parent.mkdir(parents=True)
             path.write_text("# MR Draft\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "Issue:"):
@@ -237,24 +264,26 @@ class CheckTests(unittest.TestCase):
 
     def test_academic_mr_accepts_valid_template(self):
         with TemporaryDirectory() as tmp:
-            path = Path(tmp) / ".xflow" / "issue-1" / "mr-draft.md"
+            path = Path(tmp) / ".xflow" / "issues" / "issue-1" / "mr-draft.md"
             path.parent.mkdir(parents=True)
             path.write_text(
                 "# MR Draft\n\n"
                 "Issue: 1\n"
-                "Target Branch: academic\n\n"
+                "Workflow Product Line: academic\n"
+                "Paper Base Branch: main\n"
+                "Task Branch: feature/1-test\n\n"
                 "## Summary\nx\n\n"
                 "## Evidence\n"
-                "- TDD Result: .xflow/issue-1/tdd-result.md\n"
-                "- Local Review: .xflow/issue-1/approvals/local-review.md\n\n"
+                "- TDD Result: .xflow/issues/issue-1/tdd-result.md\n"
+                "- Local Review: .xflow/issues/issue-1/approvals/local-review.md\n\n"
                 "## Remote Actions Requested\nx\n",
                 encoding="utf-8",
             )
             check_academic_mr(path)
 
-    def test_academic_mr_rejects_missing_tdd_result_evidence(self):
+    def test_academic_mr_rejects_academic_as_target_branch(self):
         with TemporaryDirectory() as tmp:
-            path = Path(tmp) / ".xflow" / "issue-1" / "mr-draft.md"
+            path = Path(tmp) / ".xflow" / "issues" / "issue-1" / "mr-draft.md"
             path.parent.mkdir(parents=True)
             path.write_text(
                 "# MR Draft\n\n"
@@ -262,7 +291,27 @@ class CheckTests(unittest.TestCase):
                 "Target Branch: academic\n\n"
                 "## Summary\nx\n\n"
                 "## Evidence\n"
-                "- Local Review: .xflow/issue-1/approvals/local-review.md\n\n"
+                "- TDD Result: .xflow/issues/issue-1/tdd-result.md\n"
+                "- Local Review: .xflow/issues/issue-1/approvals/local-review.md\n\n"
+                "## Remote Actions Requested\nx\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "Workflow Product Line"):
+                check_academic_mr(path)
+
+    def test_academic_mr_rejects_missing_tdd_result_evidence(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".xflow" / "issues" / "issue-1" / "mr-draft.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "# MR Draft\n\n"
+                "Issue: 1\n"
+                "Workflow Product Line: academic\n"
+                "Paper Base Branch: main\n"
+                "Task Branch: feature/1-test\n\n"
+                "## Summary\nx\n\n"
+                "## Evidence\n"
+                "- Local Review: .xflow/issues/issue-1/approvals/local-review.md\n\n"
                 "## Remote Actions Requested\nx\n",
                 encoding="utf-8",
             )
@@ -271,15 +320,17 @@ class CheckTests(unittest.TestCase):
 
     def test_academic_mr_rejects_missing_local_review_evidence(self):
         with TemporaryDirectory() as tmp:
-            path = Path(tmp) / ".xflow" / "issue-1" / "mr-draft.md"
+            path = Path(tmp) / ".xflow" / "issues" / "issue-1" / "mr-draft.md"
             path.parent.mkdir(parents=True)
             path.write_text(
                 "# MR Draft\n\n"
                 "Issue: 1\n"
-                "Target Branch: academic\n\n"
+                "Workflow Product Line: academic\n"
+                "Paper Base Branch: main\n"
+                "Task Branch: feature/1-test\n\n"
                 "## Summary\nx\n\n"
                 "## Evidence\n"
-                "- TDD Result: .xflow/issue-1/tdd-result.md\n\n"
+                "- TDD Result: .xflow/issues/issue-1/tdd-result.md\n\n"
                 "## Remote Actions Requested\nx\n",
                 encoding="utf-8",
             )
@@ -292,11 +343,13 @@ class CheckTests(unittest.TestCase):
             path.write_text(
                 "# MR Draft\n\n"
                 "Issue: 1\n"
-                "Target Branch: academic\n\n"
+                "Workflow Product Line: academic\n"
+                "Paper Base Branch: main\n"
+                "Task Branch: feature/1-test\n\n"
                 "## Summary\nx\n\n"
                 "## Evidence\n"
-                "- TDD Result: .xflow/issue-1/tdd-result.md\n"
-                "- Local Review: .xflow/issue-1/approvals/local-review.md\n\n"
+                "- TDD Result: .xflow/issues/issue-1/tdd-result.md\n"
+                "- Local Review: .xflow/issues/issue-1/approvals/local-review.md\n\n"
                 "## Remote Actions Requested\nx\n",
                 encoding="utf-8",
             )
@@ -316,13 +369,13 @@ class SubmoduleHygieneTests(unittest.TestCase):
     def write_gitmodules(self, repo: Path, include_ignore: bool = True) -> None:
         ignore_line = "\n\tignore = untracked" if include_ignore else ""
         (repo / ".gitmodules").write_text(
-            "[submodule \"_ops/devctl\"]\n"
-            "\tpath = _ops/devctl\n"
+            "[submodule \".xflow/ops/devctl\"]\n"
+            "\tpath = .xflow/ops/devctl\n"
             "\turl = git@github.com:Linkk2000/xflow-devctl.git\n"
             "\tbranch = academic"
             f"{ignore_line}\n"
-            "[submodule \"_ops/workflow\"]\n"
-            "\tpath = _ops/workflow\n"
+            "[submodule \".xflow/ops/workflow\"]\n"
+            "\tpath = .xflow/ops/workflow\n"
             "\turl = git@github.com:Linkk2000/xflow-skills.git\n"
             "\tbranch = academic"
             f"{ignore_line}\n",
@@ -332,8 +385,8 @@ class SubmoduleHygieneTests(unittest.TestCase):
     def prepare_parent_with_ops(self, tmp: str, include_ignore: bool = True) -> Path:
         repo = Path(tmp)
         self.write_gitmodules(repo, include_ignore=include_ignore)
-        self.init_git_repo(repo / "_ops" / "devctl")
-        self.init_git_repo(repo / "_ops" / "workflow")
+        self.init_git_repo(repo / ".xflow" / "ops" / "devctl")
+        self.init_git_repo(repo / ".xflow" / "ops" / "workflow")
         return repo
 
     def test_submodule_hygiene_accepts_clean_ops_repositories(self):
@@ -358,17 +411,17 @@ class SubmoduleHygieneTests(unittest.TestCase):
     def test_submodule_hygiene_rejects_tracked_changes_inside_ops(self):
         with TemporaryDirectory() as tmp:
             repo = self.prepare_parent_with_ops(tmp)
-            (repo / "_ops" / "devctl" / "README.md").write_text("dirty\n", encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "tracked changes in _ops/devctl"):
+            (repo / ".xflow" / "ops" / "devctl" / "README.md").write_text("dirty\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "tracked changes in .xflow/ops/devctl"):
                 check_submodule_hygiene(repo)
 
     def test_submodule_hygiene_rejects_byproducts_inside_ops(self):
         with TemporaryDirectory() as tmp:
             repo = self.prepare_parent_with_ops(tmp)
-            cache_dir = repo / "_ops" / "workflow" / "xflow" / "__pycache__"
+            cache_dir = repo / ".xflow" / "ops" / "workflow" / "xflow" / "__pycache__"
             cache_dir.mkdir(parents=True)
             (cache_dir / "checks.cpython-312.pyc").write_bytes(b"cache")
-            with self.assertRaisesRegex(ValueError, "byproduct in _ops/workflow"):
+            with self.assertRaisesRegex(ValueError, "byproduct in .xflow/ops/workflow"):
                 check_submodule_hygiene(repo)
 
     def test_submodule_hygiene_rejects_missing_ignore_untracked(self):
@@ -380,7 +433,7 @@ class SubmoduleHygieneTests(unittest.TestCase):
 
 class ClaudeRunTests(unittest.TestCase):
     def write_claude_task(self, repo, issue="1"):
-        path = Path(repo) / ".xflow" / f"issue-{issue}" / "claude-task.md"
+        path = Path(repo) / ".xflow" / "issues" / f"issue-{issue}" / "claude-task.md"
         path.parent.mkdir(parents=True)
         path.write_text(
             "# Claude Task Package\n\n"
@@ -388,7 +441,7 @@ class ClaudeRunTests(unittest.TestCase):
             "AcademicForge Skill: paper-polish-workflow-skill@unknown\n"
             "Input Files:\n"
             "- draft.md: sha256-placeholder\n"
-            f"Output File: .xflow/issue-{issue}/claude-result.md\n\n"
+            f"Output File: .xflow/issues/issue-{issue}/claude-result.md\n\n"
             "## Objective\n"
             "Polish the academic paragraph.\n\n"
             "## Constraints\n"
@@ -414,7 +467,7 @@ class ClaudeRunTests(unittest.TestCase):
                     result = main(["claude", "run", "--issue", "1", "--dry-run"])
                 self.assertEqual(result, 0)
                 self.assertIn("claude task package ready", out.getvalue())
-                self.assertFalse((repo / ".xflow" / "issue-1" / "claude-result.md").exists())
+                self.assertFalse((repo / ".xflow" / "issues" / "issue-1" / "claude-result.md").exists())
             finally:
                 os.environ.clear()
                 os.environ.update(original)
@@ -443,7 +496,7 @@ class ClaudeRunTests(unittest.TestCase):
                 )
                 result = main(["claude", "run", "--issue", "1"])
                 self.assertEqual(result, 0)
-                output = repo / ".xflow" / "issue-1" / "claude-result.md"
+                output = repo / ".xflow" / "issues" / "issue-1" / "claude-result.md"
                 self.assertTrue(output.exists())
                 self.assertIn("CLAUDE_RESULT", output.read_text(encoding="utf-8"))
                 self.assertIn("HAS_OBJECTIVE=True", output.read_text(encoding="utf-8"))
@@ -516,7 +569,7 @@ class ApprovalTests(unittest.TestCase):
     def test_require_remote_approval_accepts_matching_local_review(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            artifact = repo / ".xflow" / "issue-draft" / "issue-draft.md"
+            artifact = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
             artifact.parent.mkdir(parents=True)
             artifact.write_bytes(b"academic draft\n")
             write_local_review(repo, "draft", "issue-create", artifact)
@@ -529,10 +582,10 @@ class ApprovalTests(unittest.TestCase):
             repo = root / "repo"
             outside = root / "outside"
             outside.mkdir(parents=True)
-            artifact = repo / ".xflow" / "issue-draft" / "issue-draft.md"
+            artifact = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
             artifact.parent.mkdir(parents=True)
             artifact.write_bytes(b"academic draft\n")
-            relative_artifact = Path(".xflow") / "issue-draft" / "issue-draft.md"
+            relative_artifact = Path(".xflow") / "issues" / "issue-draft" / "issue-draft.md"
             write_local_review(
                 repo,
                 "draft",
@@ -550,7 +603,7 @@ class ApprovalTests(unittest.TestCase):
     def test_require_remote_approval_accepts_absolute_approved_file(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            artifact = repo / ".xflow" / "issue-draft" / "issue-draft.md"
+            artifact = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
             artifact.parent.mkdir(parents=True)
             artifact.write_bytes(b"academic draft\n")
             write_local_review(repo, "draft", "issue-create", artifact, approved_file_text=str(artifact))
@@ -560,7 +613,7 @@ class ApprovalTests(unittest.TestCase):
     def test_require_remote_approval_rejects_approved_file_mismatch(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            artifact = repo / ".xflow" / "issue-draft" / "issue-draft.md"
+            artifact = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
             artifact.parent.mkdir(parents=True)
             artifact.write_bytes(b"academic draft\n")
             write_local_review(
@@ -568,7 +621,7 @@ class ApprovalTests(unittest.TestCase):
                 "draft",
                 "issue-create",
                 artifact,
-                approved_file_text=".xflow/issue-draft/other.md",
+                approved_file_text=".xflow/issues/issue-draft/other.md",
             )
 
             with self.assertRaisesRegex(ValueError, "approved file mismatch"):
@@ -577,7 +630,7 @@ class ApprovalTests(unittest.TestCase):
     def test_local_review_rejects_missing_title(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            artifact = repo / ".xflow" / "issue-draft" / "issue-draft.md"
+            artifact = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
             artifact.parent.mkdir(parents=True)
             artifact.write_bytes(b"academic draft\n")
             write_local_review(repo, "draft", "issue-create", artifact, include_title=False)
@@ -588,7 +641,7 @@ class ApprovalTests(unittest.TestCase):
     def test_require_remote_approval_rejects_missing_title(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            artifact = repo / ".xflow" / "issue-draft" / "issue-draft.md"
+            artifact = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
             artifact.parent.mkdir(parents=True)
             artifact.write_bytes(b"academic draft\n")
             write_local_review(repo, "draft", "issue-create", artifact, include_title=False)
@@ -599,7 +652,7 @@ class ApprovalTests(unittest.TestCase):
     def test_require_remote_approval_rejects_missing_approved_file(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            artifact = repo / ".xflow" / "issue-draft" / "issue-draft.md"
+            artifact = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
             artifact.parent.mkdir(parents=True)
             artifact.write_bytes(b"academic draft\n")
             write_local_review(repo, "draft", "issue-create", artifact, include_approved_file=False)
@@ -610,7 +663,7 @@ class ApprovalTests(unittest.TestCase):
     def test_require_remote_approval_missing_artifact_raises_value_error(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            artifact = repo / ".xflow" / "issue-draft" / "issue-draft.md"
+            artifact = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
             write_local_review(repo, "draft", "issue-create", artifact, sha="0" * 64)
 
             with self.assertRaisesRegex(ValueError, "missing approved artifact"):
@@ -619,7 +672,7 @@ class ApprovalTests(unittest.TestCase):
     def test_issue_create_missing_artifact_returns_controlled_error(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            artifact = repo / ".xflow" / "issue-draft" / "issue-draft.md"
+            artifact = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
             write_local_review(repo, "draft", "issue-create", artifact, sha="0" * 64)
             original = os.environ.copy()
             try:
@@ -643,7 +696,7 @@ class ApprovalTests(unittest.TestCase):
     def test_require_remote_approval_rejects_wrong_action(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            artifact = repo / ".xflow" / "issue-draft" / "issue-draft.md"
+            artifact = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
             artifact.parent.mkdir(parents=True)
             artifact.write_bytes(b"academic draft\n")
             write_local_review(repo, "draft", "wrong-action", artifact)
@@ -654,7 +707,7 @@ class ApprovalTests(unittest.TestCase):
     def test_require_remote_approval_requires_local_review_file(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            artifact = repo / ".xflow" / "issue-draft" / "issue-draft.md"
+            artifact = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
             artifact.parent.mkdir(parents=True)
             artifact.write_bytes(b"academic draft\n")
 
@@ -664,13 +717,125 @@ class ApprovalTests(unittest.TestCase):
     def test_require_remote_approval_rejects_hash_mismatch(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
-            artifact = repo / ".xflow" / "issue-draft" / "issue-draft.md"
+            artifact = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
             artifact.parent.mkdir(parents=True)
             artifact.write_bytes(b"academic draft\n")
             write_local_review(repo, "draft", "issue-create", artifact, sha="0" * 64)
 
             with self.assertRaisesRegex(ValueError, "hash mismatch"):
                 require_remote_approval(repo, "issue-create", artifact, "draft")
+
+
+class IssueProviderTests(unittest.TestCase):
+    def test_issue_create_requires_github_token_after_local_approval(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            artifact = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_text("# Academic Issue Draft\n\nBody text\n", encoding="utf-8")
+            write_local_review(repo, "draft", "issue-create", artifact)
+
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "DEVCTL_REPO_ROOT": str(repo),
+                        "DEVCTL_PRODUCT_LINE": "academic",
+                        "XFLOW_PLATFORM": "github",
+                        "DEVCTL_OWNER": "Linkk2000",
+                        "DEVCTL_REPO": "paper-demo",
+                    }
+                )
+                err = StringIO()
+                with redirect_stderr(err):
+                    result = main(["issue", "create", "Academic draft", "--body-file", str(artifact)])
+                self.assertEqual(result, 1)
+                self.assertIn("missing GitHub token", err.getvalue())
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_issue_create_posts_to_github_after_local_approval(self):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8")
+                requests.append(
+                    {
+                        "path": self.path,
+                        "authorization": self.headers.get("Authorization"),
+                        "accept": self.headers.get("Accept"),
+                        "body": json.loads(body),
+                    }
+                )
+                payload = json.dumps({"number": 7, "html_url": "https://github.example/issues/7"}).encode("utf-8")
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, _format, *args):
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                artifact = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
+                artifact.parent.mkdir(parents=True)
+                artifact.write_text("# Academic Issue Draft\n\nBody text\n", encoding="utf-8")
+                write_local_review(repo, "draft", "issue-create", artifact)
+
+                original = os.environ.copy()
+                try:
+                    os.environ.clear()
+                    os.environ.update(
+                        {
+                            "DEVCTL_REPO_ROOT": str(repo),
+                            "DEVCTL_PRODUCT_LINE": "academic",
+                            "XFLOW_PLATFORM": "github",
+                            "GITHUB_API_BASE": f"http://127.0.0.1:{server.server_port}",
+                            "GITHUB_TOKEN": "token-value",
+                            "DEVCTL_OWNER": "Linkk2000",
+                            "DEVCTL_REPO": "paper-demo",
+                        }
+                    )
+                    out = StringIO()
+                    with redirect_stdout(out):
+                        result = main(
+                            [
+                                "issue",
+                                "create",
+                                "Academic draft",
+                                "--body-file",
+                                str(artifact),
+                                "--labels",
+                                "academic,tdd",
+                            ]
+                        )
+                    self.assertEqual(result, 0)
+                    self.assertIn("Issue #7 created", out.getvalue())
+                    self.assertEqual(len(requests), 1)
+                    self.assertEqual(requests[0]["path"], "/repos/Linkk2000/paper-demo/issues")
+                    self.assertEqual(requests[0]["authorization"], "Bearer token-value")
+                    self.assertEqual(requests[0]["accept"], "application/vnd.github+json")
+                    self.assertEqual(
+                        requests[0]["body"],
+                        {"title": "Academic draft", "body": "# Academic Issue Draft\n\nBody text\n", "labels": ["academic", "tdd"]},
+                    )
+                finally:
+                    os.environ.clear()
+                    os.environ.update(original)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
 
 
 if __name__ == "__main__":
