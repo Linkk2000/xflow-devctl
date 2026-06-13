@@ -165,6 +165,29 @@ class CheckTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "internal draft heading"):
                 check_academic_issue(path)
 
+    def test_academic_issue_rejects_generic_internal_draft_heading(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "<!-- xflow: academic-issue-draft -->\n"
+                "# Issue Draft\n\n"
+                "<!-- task-type: workflow-test -->\n"
+                "<!-- workflow-product-line: academic -->\n"
+                "<!-- paper-base-branch: main -->\n"
+                "<!-- task-branch: feature/1-test -->\n\n"
+                "## Background\nx\n\n"
+                "## Goal\nx\n\n"
+                "## Scope\nx\n\n"
+                "## Target Artifacts\n- README.md\n\n"
+                "## Acceptance Criteria\nx\n\n"
+                "## Verification Plan\nx\n\n"
+                "## Human Review Gate\nx\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "internal draft heading"):
+                check_academic_issue(path)
+
     def test_academic_issue_rejects_academic_as_target_branch(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
@@ -314,6 +337,29 @@ class CheckTests(unittest.TestCase):
             path.write_text(
                 "<!-- xflow: academic-mr-draft -->\n"
                 "# MR Draft\n\n"
+                "<!-- issue: 1 -->\n"
+                "<!-- workflow-product-line: academic -->\n"
+                "<!-- paper-base-branch: main -->\n"
+                "<!-- task-branch: feature/1-test -->\n\n"
+                "## Summary\nx\n\n"
+                "## Evidence\n"
+                "- TDD Result: .xflow/issues/issue-1/tdd-result.md\n"
+                "- Local Review: .xflow/issues/issue-1/approvals/local-review.md\n\n"
+                "## Verification\nx\n\n"
+                "## Risks\nx\n\n"
+                "## Review Request\nx\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "internal draft heading"):
+                check_academic_mr(path)
+
+    def test_academic_mr_rejects_pr_draft_heading(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".xflow" / "issues" / "issue-1" / "mr-draft.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "<!-- xflow: academic-mr-draft -->\n"
+                "# PR Draft\n\n"
                 "<!-- issue: 1 -->\n"
                 "<!-- workflow-product-line: academic -->\n"
                 "<!-- paper-base-branch: main -->\n"

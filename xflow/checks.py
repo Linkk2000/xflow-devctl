@@ -113,7 +113,7 @@ def reject_internal_publish_heading(path: Path, headings: tuple[str, ...]) -> No
 
 def check_academic_issue(path: Path) -> None:
     reject_obsolete_academic_target_branch(path)
-    reject_internal_publish_heading(path, ("# Academic Issue Draft",))
+    reject_internal_publish_heading(path, ("# Academic Issue Draft", "# Issue Draft"))
     require_template(path, ACADEMIC_ISSUE_REQUIRED)
 
 
@@ -127,7 +127,7 @@ def check_claude_package(path: Path) -> None:
 
 def check_academic_mr(path: Path) -> None:
     reject_obsolete_academic_target_branch(path)
-    reject_internal_publish_heading(path, ("# MR Draft",))
+    reject_internal_publish_heading(path, ("# MR Draft", "# PR Draft", "# Merge Request Draft"))
     require_template(path, ACADEMIC_MR_REQUIRED)
 
 

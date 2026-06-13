@@ -13,8 +13,8 @@ if grep -Eq '^[[:space:]]*Target Branch:[[:space:]]*academic[[:space:]]*$' "$fil
   devctl_die "obsolete academic branch field in $file: use Workflow Product Line, Paper Base Branch, and Task Branch"
 fi
 
-if grep -Eq '^[[:space:]]*# Academic Issue Draft[[:space:]]*$' "$file" 2>/dev/null; then
-  devctl_die "internal draft heading is not allowed in remote body: # Academic Issue Draft"
+if grep -Eq '^[[:space:]]*# (Academic Issue Draft|Issue Draft)[[:space:]]*$' "$file" 2>/dev/null; then
+  devctl_die "internal draft heading is not allowed in remote body"
 fi
 
 academic_check_template "$file" \
