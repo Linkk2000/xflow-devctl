@@ -78,6 +78,10 @@ run_python_check_or_script() {
   fi
 }
 
+is_academic_mode() {
+  [[ "${DEVCTL_PRODUCT_LINE:-}" == "academic" || "${DEVCTL_ACADEMIC_ENFORCE:-}" == "1" ]]
+}
+
 main() {
   if [[ $# -eq 0 ]]; then
     usage
@@ -108,7 +112,13 @@ main() {
       shift
       [[ $# -ge 1 ]] || { usage; exit 1; }
       case "$1" in
-        create)  shift; run_script "$OPS/issue/create.sh" "$@" ;;
+        create)
+          shift
+          if is_academic_mode; then
+            run_python_core issue create "$@"
+          fi
+          run_script "$OPS/issue/create.sh" "$@"
+          ;;
         list)    shift; run_script "$OPS/issue/list.sh" "$@" ;;
         show)    shift; run_script "$OPS/issue/show.sh" "$@" ;;
         comment) shift; run_script "$OPS/issue/comment.sh" "$@" ;;
@@ -123,7 +133,7 @@ main() {
         academic-issue) shift; run_python_check_or_script academic-issue "$OPS/check/academic-issue.sh" "$@" ;;
         academic-mr)    shift; run_script "$OPS/check/academic-mr.sh" "$@" ;;
         claude-package) shift; run_script "$OPS/check/claude-package.sh" "$@" ;;
-        local-review)   shift; run_script "$OPS/check/local-review.sh" "$@" ;;
+        local-review)   shift; run_python_check_or_script local-review "$OPS/check/local-review.sh" "$@" ;;
         tdd-result)     shift; run_python_check_or_script tdd-result "$OPS/check/tdd-result.sh" "$@" ;;
         *) devctl_die "unknown check subcommand: $1 (devctl help)" ;;
       esac

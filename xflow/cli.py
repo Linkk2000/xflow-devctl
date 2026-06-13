@@ -5,6 +5,7 @@ import os
 import sys
 from pathlib import Path
 
+from .approval import check_local_review_file, require_remote_approval
 from .checks import check_academic_issue, check_tdd_result
 from .env import RuntimeContext, detect_python_runtime
 from .paths import default_issue_file
@@ -23,6 +24,17 @@ def build_parser() -> argparse.ArgumentParser:
     tdd_result = check_sub.add_parser("tdd-result")
     tdd_result.add_argument("--issue")
     tdd_result.add_argument("--file", type=Path)
+    local_review = check_sub.add_parser("local-review")
+    local_review.add_argument("--issue")
+    local_review.add_argument("--file", type=Path)
+
+    issue = sub.add_parser("issue")
+    issue_sub = issue.add_subparsers(dest="issue_command")
+    issue_create = issue_sub.add_parser("create")
+    issue_create.add_argument("title")
+    issue_create.add_argument("--body")
+    issue_create.add_argument("--body-file", type=Path)
+    issue_create.add_argument("--labels")
     return parser
 
 
@@ -54,6 +66,10 @@ def run_check(args: argparse.Namespace) -> int:
         elif args.check_command == "tdd-result":
             path = resolve_check_file(context, args.issue, args.file, "tdd-result.md")
             check_tdd_result(path)
+        elif args.check_command == "local-review":
+            path = resolve_check_file(context, args.issue, args.file, "issue-draft.md")
+            issue = args.issue or "draft"
+            check_local_review_file(context.repo_root, issue, path)
         else:
             raise ValueError(f"unknown check subcommand: {args.check_command}")
     except ValueError as exc:
@@ -63,6 +79,26 @@ def run_check(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_issue(args: argparse.Namespace) -> int:
+    context = RuntimeContext.from_env(Path(__file__).resolve().parents[1], os.environ)
+    try:
+        if args.issue_command != "create":
+            raise ValueError(f"unknown issue subcommand: {args.issue_command}")
+        if args.body_file is None:
+            raise ValueError("academic issue create requires --body-file")
+        require_remote_approval(context.repo_root, "issue-create", args.body_file, "draft")
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+    if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
+        print("[INFO] issue-create gate passed; provider skipped")
+        return 0
+
+    print("[ERROR] provider not ported to Python yet", file=sys.stderr)
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -70,5 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_preflight()
     if args.command == "check":
         return run_check(args)
+    if args.command == "issue":
+        return run_issue(args)
     parser.print_help()
     return 0
