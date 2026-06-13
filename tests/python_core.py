@@ -838,5 +838,146 @@ class IssueProviderTests(unittest.TestCase):
             server.server_close()
 
 
+class PullRequestProviderTests(unittest.TestCase):
+    def init_repo(self, path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "-C", str(path), "init", "-q", "-b", "main"], check=True)
+        subprocess.run(["git", "-C", str(path), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(path), "config", "user.name", "Test User"], check=True)
+        (path / "README.md").write_text("paper\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(path), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(path), "commit", "-m", "init", "-q"], check=True)
+        subprocess.run(
+            ["git", "-C", str(path), "switch", "-c", "feature/1-polish"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        subprocess.run(
+            ["git", "-C", str(path), "remote", "add", "origin", "git@github.com:Linkk2000/paper-demo.git"],
+            check=True,
+        )
+
+    def test_git_mr_posts_to_github_after_local_approval(self):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                body = self.rfile.read(length).decode("utf-8")
+                requests.append(
+                    {
+                        "path": self.path,
+                        "authorization": self.headers.get("Authorization"),
+                        "body": json.loads(body),
+                    }
+                )
+                payload = json.dumps({"number": 9, "html_url": "https://github.example/pull/9"}).encode("utf-8")
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, _format, *args):
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                self.init_repo(repo)
+                mr = repo / ".xflow" / "issues" / "issue-1" / "mr-draft.md"
+                mr.parent.mkdir(parents=True)
+                mr.write_text("# MR Draft\n\n## Summary\n- Ready\n", encoding="utf-8")
+                write_local_review(repo, "1", "git-mr", mr)
+
+                original = os.environ.copy()
+                try:
+                    os.environ.clear()
+                    os.environ.update(
+                        {
+                            "DEVCTL_REPO_ROOT": str(repo),
+                            "DEVCTL_PRODUCT_LINE": "academic",
+                            "DEVCTL_SKIP_PUSH": "1",
+                            "XFLOW_PLATFORM": "github",
+                            "GITHUB_API_BASE": f"http://127.0.0.1:{server.server_port}",
+                            "GITHUB_TOKEN": "token-value",
+                            "PATH": original.get("PATH", ""),
+                        }
+                    )
+                    out = StringIO()
+                    with redirect_stdout(out):
+                        result = main(
+                            [
+                                "git",
+                                "mr",
+                                "--title",
+                                "论文润色",
+                                "--body-file",
+                                str(mr),
+                                "--base",
+                                "main",
+                                "--issue",
+                                "1",
+                            ]
+                        )
+                    self.assertEqual(result, 0)
+                    self.assertIn("PR #9 created", out.getvalue())
+                    self.assertEqual(len(requests), 1)
+                    self.assertEqual(requests[0]["path"], "/repos/Linkk2000/paper-demo/pulls")
+                    self.assertEqual(requests[0]["authorization"], "Bearer token-value")
+                    self.assertEqual(
+                        requests[0]["body"],
+                        {
+                            "title": "论文润色",
+                            "body": "# MR Draft\n\n## Summary\n- Ready\n",
+                            "head": "feature/1-polish",
+                            "base": "main",
+                        },
+                    )
+                    stored = subprocess.run(
+                        ["git", "-C", str(repo), "config", "--local", "--get", "devctl.pr"],
+                        check=True,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                    ).stdout.strip()
+                    self.assertEqual(stored, "9")
+                finally:
+                    os.environ.clear()
+                    os.environ.update(original)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_git_mr_rejects_inline_body_in_academic_mode(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.init_repo(repo)
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "DEVCTL_REPO_ROOT": str(repo),
+                        "DEVCTL_PRODUCT_LINE": "academic",
+                        "XFLOW_PLATFORM": "github",
+                        "GITHUB_TOKEN": "token-value",
+                        "PATH": original.get("PATH", ""),
+                    }
+                )
+                err = StringIO()
+                with redirect_stderr(err):
+                    result = main(["git", "mr", "--title", "t", "--body", "inline", "--issue", "1"])
+                self.assertEqual(result, 1)
+                self.assertIn("academic git mr requires --body-file", err.getvalue())
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+
 if __name__ == "__main__":
     unittest.main()

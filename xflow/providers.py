@@ -16,6 +16,12 @@ class IssueCreateResult:
     html_url: str
 
 
+@dataclass(frozen=True)
+class PullRequestCreateResult:
+    number: str
+    html_url: str
+
+
 def split_labels(labels: str | None) -> list[str]:
     if not labels:
         return []
@@ -130,6 +136,34 @@ def create_github_issue(
     return IssueCreateResult(number=number, html_url=html_url)
 
 
+def create_github_pull_request(
+    repo_root: Path,
+    title: str,
+    body: str,
+    head: str,
+    base: str,
+    env: Mapping[str, str],
+) -> PullRequestCreateResult:
+    owner, repo = resolve_owner_repo(repo_root, env)
+    token = resolve_github_token(env)
+    url = f"{github_api_base(env)}/repos/{owner}/{repo}/pulls"
+    response = post_json(
+        url,
+        {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "xflow-devctl",
+        },
+        {"title": title, "body": body, "head": head, "base": base},
+    )
+    number = str(response.get("number", "")).strip()
+    html_url = str(response.get("html_url", "")).strip()
+    if not number:
+        raise ValueError("GitHub pull request create response missing number")
+    return PullRequestCreateResult(number=number, html_url=html_url)
+
+
 def create_issue(
     repo_root: Path,
     title: str,
@@ -141,3 +175,17 @@ def create_issue(
     if platform != "github":
         raise ValueError(f"Python issue provider is not available for platform: {platform}")
     return create_github_issue(repo_root, title, body, labels, env)
+
+
+def create_pull_request(
+    repo_root: Path,
+    title: str,
+    body: str,
+    head: str,
+    base: str,
+    env: Mapping[str, str],
+) -> PullRequestCreateResult:
+    platform = resolve_platform(repo_root, env)
+    if platform != "github":
+        raise ValueError(f"Python pull request provider is not available for platform: {platform}")
+    return create_github_pull_request(repo_root, title, body, head, base, env)

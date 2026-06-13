@@ -49,8 +49,16 @@ try_python_core() {
   PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" PYTHONDONTWRITEBYTECODE=1 "$py" -m xflow "$@"
 }
 
+DEVCTL_ORIGINAL_SKIP_PROVIDER_LOAD="${DEVCTL_SKIP_PROVIDER_LOAD-__xflow_unset__}"
+export DEVCTL_SKIP_PROVIDER_LOAD=1
 # shellcheck source=lib/common.sh
 source "$OPS/lib/common.sh"
+if [[ "$DEVCTL_ORIGINAL_SKIP_PROVIDER_LOAD" == "__xflow_unset__" ]]; then
+  unset DEVCTL_SKIP_PROVIDER_LOAD
+else
+  export DEVCTL_SKIP_PROVIDER_LOAD="$DEVCTL_ORIGINAL_SKIP_PROVIDER_LOAD"
+fi
+unset DEVCTL_ORIGINAL_SKIP_PROVIDER_LOAD
 
 usage() {
   cat "$OPS/help.txt"
@@ -103,7 +111,13 @@ main() {
       case "$1" in
         start)      shift; run_script "$OPS/git/start.sh" "$@" ;;
         commit-msg) shift; run_script "$OPS/git/commit-msg.sh" "$@" ;;
-        mr)         shift; run_script "$OPS/git/mr.sh" "$@" ;;
+        mr)
+          shift
+          if is_academic_mode; then
+            run_python_core git mr "$@"
+          fi
+          run_script "$OPS/git/mr.sh" "$@"
+          ;;
         done)       shift; run_script "$OPS/git/done.sh" "$@" ;;
         status)     shift; run_script "$OPS/git/status.sh" "$@" ;;
         *) devctl_die "未知 git 子命令: $1（devctl help）" ;;

@@ -18,7 +18,14 @@ PY
 
 run_preflight() {
   local cwd="$1"
-  (cd "$cwd" && DEVCTL_REPO_ROOT="$ROOT" DEVCTL_PRODUCT_LINE=academic bash "$ROOT/devctl" preflight)
+  (
+    cd "$cwd"
+    unset GITHUB_TOKEN GITHUB_ACCESS_TOKEN GITHUB_PRIVATE_TOKEN GITEE_TOKEN GITEE_ACCESS_TOKEN GITEE_PRIVATE_TOKEN access_token
+    DEVCTL_REPO_ROOT="$ROOT" \
+    DEVCTL_PRODUCT_LINE=academic \
+    GITEE_ENV_FILE="$cwd/missing-token-file.env" \
+      bash "$ROOT/devctl" preflight
+  )
 }
 
 assert_preflight_success() {
