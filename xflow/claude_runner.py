@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,6 +17,14 @@ class ClaudeRunResult:
     task_file: Path
     output_file: Path
     dry_run: bool
+
+
+@dataclass(frozen=True)
+class ClaudeDoctorResult:
+    claude_cli_ok: bool
+    academicforge_ok: bool
+    config_file: Path
+    install_command: str = "claude mcp add academicforge npx @hughyau/academicforge@latest"
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -53,6 +62,38 @@ def resolve_claude_command(env: Mapping[str, str]) -> list[str]:
     if not command:
         raise ValueError("DEVCTL_CLAUDE_COMMAND is empty")
     return shlex.split(command, posix=os.name != "nt")
+
+
+def resolve_claude_config(env: Mapping[str, str]) -> Path:
+    configured = env.get("DEVCTL_CLAUDE_CONFIG", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    home = Path.home()
+    return (home / ".claude.json").resolve()
+
+
+def is_academicforge_registered(config_file: Path) -> bool:
+    if not config_file.exists():
+        return False
+    try:
+        return "academicforge" in config_file.read_text(encoding="utf-8", errors="replace").lower()
+    except OSError:
+        return False
+
+
+def run_claude_doctor(env: Mapping[str, str]) -> ClaudeDoctorResult:
+    command = resolve_claude_command(env)
+    executable = command[0]
+    if Path(executable).is_absolute():
+        cli_ok = Path(executable).exists()
+    else:
+        cli_ok = shutil.which(executable) is not None
+    config = resolve_claude_config(env)
+    return ClaudeDoctorResult(
+        claude_cli_ok=cli_ok,
+        academicforge_ok=is_academicforge_registered(config),
+        config_file=config,
+    )
 
 
 def run_claude_task(

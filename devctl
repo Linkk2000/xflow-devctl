@@ -143,6 +143,7 @@ main() {
       shift
       [[ $# -ge 1 ]] || { usage; exit 1; }
       case "$1" in
+        doctor) shift; run_python_core claude doctor "$@" ;;
         run) shift; run_python_core claude run "$@" ;;
         *) devctl_die "unknown claude subcommand: $1 (devctl help)" ;;
       esac

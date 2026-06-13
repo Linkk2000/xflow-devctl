@@ -374,6 +374,66 @@ class ClaudeRunTests(unittest.TestCase):
                 os.environ.clear()
                 os.environ.update(original)
 
+    def test_claude_doctor_reports_missing_academicforge_without_installing(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            fake = repo / "fake_claude.py"
+            fake.write_text("print('fake')\n", encoding="utf-8")
+            config = repo / ".claude.json"
+            config.write_text("{}", encoding="utf-8")
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "DEVCTL_REPO_ROOT": str(repo),
+                        "DEVCTL_PRODUCT_LINE": "academic",
+                        "DEVCTL_CLAUDE_COMMAND": f"{sys.executable} {fake}",
+                        "DEVCTL_CLAUDE_CONFIG": str(config),
+                    }
+                )
+                out = StringIO()
+                with redirect_stdout(out):
+                    result = main(["claude", "doctor"])
+                self.assertEqual(result, 1)
+                text = out.getvalue()
+                self.assertIn("claude_cli: ok", text)
+                self.assertIn("academicforge: missing", text)
+                self.assertIn("No installation was performed.", text)
+                self.assertIn("claude mcp add academicforge npx @hughyau/academicforge@latest", text)
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_claude_doctor_accepts_registered_academicforge(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            fake = repo / "fake_claude.py"
+            fake.write_text("print('fake')\n", encoding="utf-8")
+            config = repo / ".claude.json"
+            config.write_text('{"mcpServers": {"academicforge": {}}}', encoding="utf-8")
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "DEVCTL_REPO_ROOT": str(repo),
+                        "DEVCTL_PRODUCT_LINE": "academic",
+                        "DEVCTL_CLAUDE_COMMAND": f"{sys.executable} {fake}",
+                        "DEVCTL_CLAUDE_CONFIG": str(config),
+                    }
+                )
+                out = StringIO()
+                with redirect_stdout(out):
+                    result = main(["claude", "doctor"])
+                self.assertEqual(result, 0)
+                text = out.getvalue()
+                self.assertIn("claude_cli: ok", text)
+                self.assertIn("academicforge: ok", text)
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
 
 class ApprovalTests(unittest.TestCase):
     def test_require_remote_approval_accepts_matching_local_review(self):

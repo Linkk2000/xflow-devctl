@@ -8,6 +8,12 @@ Issue (GitHub/Gitee):
 Note:
   Use --body-file for multi-line or shell-sensitive Markdown bodies. --body is for simple single-line text only.
 
+MR:
+  devctl git mr --title T [--body B | --body-file F] [--issue N]
+
+  Use --body-file for MR descriptions containing Markdown sections, code
+  fences, JSON, shell snippets, backticks, or multiple lines.
+
 Preflight:
   devctl preflight
       Validate Python 3.10+ runtime, repo root, tool root, and product-line context.
@@ -23,7 +29,12 @@ Academic checks:
   local-review also compares Approved SHA256 with the current file hash.
 
 Claude:
+  devctl claude doctor
   devctl claude run --issue N [--file F] [--output F] [--dry-run]
+
+  doctor checks whether the local Claude CLI is visible and whether
+  AcademicForge is registered in the Claude config. Missing AcademicForge is
+  reported with a reviewable command; no installation is performed.
 
   Validate a Claude task package, call the local Claude CLI with the package
   content, and write the result to the package Output File. Set
@@ -38,19 +49,19 @@ App:
   devctl app status
       Show recorded process, HTTP health, and log location.
 
-开发环境 (仅前端仓库):
+Development environment:
   devctl run [--backend PATH]
-      启动后端 + 前端，并打开浏览器
-      环境变量: XFLOW_BACKEND_ROOT (默认 ../xflow-server)
+      Start backend and frontend, then open the browser.
+      Environment variable: XFLOW_BACKEND_ROOT (default: ../xflow-server)
 
-配置:
-  GITEE_ENV_FILE     Token 文件路径 (默认 ~/gitee.env.local)
-  GITHUB_TOKEN       GitHub 私人令牌
-  GITEE_TOKEN        Gitee 私人令牌
-  XFLOW_PLATFORM     指定平台 (github|gitee，默认根据 remote 自动识别)
-  DEVCTL_BASE_BRANCH 默认主干 (默认自动检测 master/main)
-  DEVCTL_BRANCH_PREFIX 分支前缀 (默认 feature)
+Configuration:
+  GITEE_ENV_FILE     Token file path (default: ~/gitee.env.local)
+  GITHUB_TOKEN       GitHub personal access token
+  GITEE_TOKEN        Gitee personal access token
+  XFLOW_PLATFORM     Platform override (github|gitee; default: detect from remote)
+  DEVCTL_BASE_BRANCH Base branch override (default: auto-detect master/main)
+  DEVCTL_BRANCH_PREFIX Branch prefix (default: feature)
 
-Token 文件示例 (~/gitee.env.local):
+Token file example (~/gitee.env.local):
   GITHUB_TOKEN=your_github_token
   GITEE_TOKEN=your_gitee_token

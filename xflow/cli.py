@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from .approval import check_local_review_file, require_remote_approval
-from .claude_runner import run_claude_task
+from .claude_runner import run_claude_doctor, run_claude_task
 from .checks import (
     check_academic_issue,
     check_academic_mr,
@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     claude = sub.add_parser("claude")
     claude_sub = claude.add_subparsers(dest="claude_command")
+    claude_sub.add_parser("doctor")
     claude_run = claude_sub.add_parser("run")
     claude_run.add_argument("--issue", required=True)
     claude_run.add_argument("--file", type=Path)
@@ -128,6 +129,16 @@ def run_issue(args: argparse.Namespace) -> int:
 def run_claude(args: argparse.Namespace) -> int:
     context = RuntimeContext.from_env(Path(__file__).resolve().parents[1], os.environ)
     try:
+        if args.claude_command == "doctor":
+            doctor = run_claude_doctor(os.environ)
+            print(f"claude_cli: {'ok' if doctor.claude_cli_ok else 'missing'}")
+            print(f"academicforge: {'ok' if doctor.academicforge_ok else 'missing'}")
+            print(f"claude_config: {doctor.config_file}")
+            if not doctor.academicforge_ok:
+                print("No installation was performed.")
+                print("After human review, run:")
+                print(f"  {doctor.install_command}")
+            return 0 if doctor.claude_cli_ok and doctor.academicforge_ok else 1
         if args.claude_command != "run":
             raise ValueError(f"unknown claude subcommand: {args.claude_command}")
         task_file = args.file or resolve_check_file(context, args.issue, None, "claude-task.md")

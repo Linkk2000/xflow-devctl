@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# devctl git mr [--title T] [--body B] [--base BRANCH] [--issue N]
+# devctl git mr [--title T] [--body B] [--body-file F] [--base BRANCH] [--issue N]
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/common.sh
@@ -7,6 +7,7 @@ source "$SCRIPT_DIR/../lib/common.sh"
 
 title=""
 body=""
+body_file=""
 base=""
 issue=""
 
@@ -14,11 +15,28 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --title) title="$2"; shift 2 ;;
     --body) body="$2"; shift 2 ;;
+    --body-file) body_file="$2"; shift 2 ;;
     --base) base="$2"; shift 2 ;;
     --issue) issue="$2"; shift 2 ;;
     *) devctl_die "未知选项: $1" ;;
   esac
 done
+
+if [[ -n "$body" && -n "$body_file" ]]; then
+  devctl_die "error: use only one of --body or --body-file"
+fi
+if [[ -n "$body" ]]; then
+  devctl_validate_inline_issue_body "$body"
+fi
+if [[ -n "$body_file" ]]; then
+  [[ -f "$body_file" ]] || devctl_die "missing MR body file: $body_file"
+  body="$(cat "$body_file")"
+fi
+
+if [[ -n "${DEVCTL_PROVIDER_STUB:-}" ]]; then
+  # shellcheck disable=SC1090
+  source "$DEVCTL_PROVIDER_STUB"
+fi
 
 devctl_need_cmd git curl jq
 
@@ -32,7 +50,9 @@ slug="$(devctl_get_branch_meta slug)"
 
 devctl_academic_require_remote_approval "git-mr" "${DEVCTL_ACADEMIC_APPROVED_FILE:-}" "$issue"
 
-devctl_push_current_branch
+if [[ "${DEVCTL_SKIP_PUSH:-0}" != "1" ]]; then
+  devctl_push_current_branch
+fi
 
 # 去除分支前缀作为默认标题
 raw_title="$branch"
