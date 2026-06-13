@@ -42,6 +42,12 @@ EOF
   PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" exec "$py" -m xflow "$@"
 }
 
+try_python_core() {
+  local py
+  py="$(find_python)" || return 127
+  PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" "$py" -m xflow "$@"
+}
+
 # shellcheck source=lib/common.sh
 source "$OPS/lib/common.sh"
 
@@ -54,6 +60,22 @@ run_script() {
   shift
   [[ -x "$script" || -f "$script" ]] || devctl_die "缺少脚本: $script"
   exec bash "$script" "$@"
+}
+
+run_python_check_or_script() {
+  local subcommand="$1"
+  local script="$2"
+  shift 2
+  local status
+  if try_python_core check "$subcommand" "$@"; then
+    exit 0
+  else
+    status=$?
+    if [[ "$status" -eq 127 ]]; then
+      run_script "$script" "$@"
+    fi
+    exit "$status"
+  fi
 }
 
 main() {
@@ -98,11 +120,11 @@ main() {
       shift
       [[ $# -ge 1 ]] || { usage; exit 1; }
       case "$1" in
-        academic-issue) shift; run_script "$OPS/check/academic-issue.sh" "$@" ;;
+        academic-issue) shift; run_python_check_or_script academic-issue "$OPS/check/academic-issue.sh" "$@" ;;
         academic-mr)    shift; run_script "$OPS/check/academic-mr.sh" "$@" ;;
         claude-package) shift; run_script "$OPS/check/claude-package.sh" "$@" ;;
         local-review)   shift; run_script "$OPS/check/local-review.sh" "$@" ;;
-        tdd-result)     shift; run_script "$OPS/check/tdd-result.sh" "$@" ;;
+        tdd-result)     shift; run_python_check_or_script tdd-result "$OPS/check/tdd-result.sh" "$@" ;;
         *) devctl_die "unknown check subcommand: $1 (devctl help)" ;;
       esac
       ;;
