@@ -6,7 +6,12 @@ import sys
 from pathlib import Path
 
 from .approval import check_local_review_file, require_remote_approval
-from .checks import check_academic_issue, check_tdd_result
+from .checks import (
+    check_academic_issue,
+    check_academic_mr,
+    check_claude_package,
+    check_tdd_result,
+)
 from .env import RuntimeContext, detect_python_runtime
 from .paths import default_issue_file
 
@@ -24,6 +29,12 @@ def build_parser() -> argparse.ArgumentParser:
     tdd_result = check_sub.add_parser("tdd-result")
     tdd_result.add_argument("--issue")
     tdd_result.add_argument("--file", type=Path)
+    claude_package = check_sub.add_parser("claude-package")
+    claude_package.add_argument("--issue")
+    claude_package.add_argument("--file", type=Path)
+    academic_mr = check_sub.add_parser("academic-mr")
+    academic_mr.add_argument("--issue")
+    academic_mr.add_argument("--file", type=Path)
     local_review = check_sub.add_parser("local-review")
     local_review.add_argument("--issue")
     local_review.add_argument("--file", type=Path)
@@ -66,6 +77,12 @@ def run_check(args: argparse.Namespace) -> int:
         elif args.check_command == "tdd-result":
             path = resolve_check_file(context, args.issue, args.file, "tdd-result.md")
             check_tdd_result(path)
+        elif args.check_command == "claude-package":
+            path = resolve_check_file(context, args.issue, args.file, "claude-task.md")
+            check_claude_package(path)
+        elif args.check_command == "academic-mr":
+            path = resolve_check_file(context, args.issue, args.file, "mr-draft.md")
+            check_academic_mr(path)
         elif args.check_command == "local-review":
             path = resolve_check_file(context, args.issue, args.file, "issue-draft.md")
             issue = args.issue or "draft"

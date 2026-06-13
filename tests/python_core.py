@@ -10,7 +10,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from xflow.env import RuntimeContext, detect_python_runtime
-from xflow.checks import check_academic_issue, check_tdd_result
+from xflow.checks import (
+    check_academic_issue,
+    check_academic_mr,
+    check_claude_package,
+    check_tdd_result,
+)
 from xflow.cli import build_parser, main, resolve_check_file
 from xflow.approval import check_local_review_file, require_remote_approval
 
@@ -80,6 +85,8 @@ class CheckTests(unittest.TestCase):
     def test_check_without_issue_or_file_fails(self):
         self.assertEqual(main(["check", "academic-issue"]), 1)
         self.assertEqual(main(["check", "tdd-result"]), 1)
+        self.assertEqual(main(["check", "claude-package"]), 1)
+        self.assertEqual(main(["check", "academic-mr"]), 1)
 
     def test_check_defaults_resolve_issue_files(self):
         with TemporaryDirectory() as tmp:
@@ -91,6 +98,14 @@ class CheckTests(unittest.TestCase):
             self.assertEqual(
                 resolve_check_file(context, "1", None, "tdd-result.md"),
                 Path(tmp).resolve() / ".xflow" / "issue-1" / "tdd-result.md",
+            )
+            self.assertEqual(
+                resolve_check_file(context, "1", None, "claude-task.md"),
+                Path(tmp).resolve() / ".xflow" / "issue-1" / "claude-task.md",
+            )
+            self.assertEqual(
+                resolve_check_file(context, "1", None, "mr-draft.md"),
+                Path(tmp).resolve() / ".xflow" / "issue-1" / "mr-draft.md",
             )
 
     def test_academic_issue_rejects_missing_sections(self):
@@ -164,6 +179,126 @@ class CheckTests(unittest.TestCase):
                 encoding="utf-8",
             )
             check_tdd_result(path)
+
+    def test_claude_package_rejects_missing_sections(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".xflow" / "issue-1" / "claude-task.md"
+            path.parent.mkdir(parents=True)
+            path.write_text("# Claude Task Package\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Issue:"):
+                check_claude_package(path)
+
+    def test_claude_package_accepts_valid_template(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".xflow" / "issue-1" / "claude-task.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "# Claude Task Package\n\n"
+                "Issue: 1\n"
+                "AcademicForge Skill: paper-polish-workflow-skill@unknown\n"
+                "Input Files:\n"
+                "- draft.md: sha256-placeholder\n"
+                "Output File: .xflow/issue-1/claude-result.md\n\n"
+                "## Objective\nx\n\n"
+                "## Constraints\nx\n\n"
+                "## Required Output Format\nx\n\n"
+                "## Human Review Requirement\nx\n",
+                encoding="utf-8",
+            )
+            check_claude_package(path)
+
+    def test_claude_package_accepts_explicit_file_without_issue(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "claude-task.md"
+            path.write_text(
+                "# Claude Task Package\n\n"
+                "Issue: 1\n"
+                "AcademicForge Skill: paper-polish-workflow-skill@unknown\n"
+                "Input Files:\n"
+                "- draft.md: sha256-placeholder\n"
+                "Output File: .xflow/issue-1/claude-result.md\n\n"
+                "## Objective\nx\n\n"
+                "## Constraints\nx\n\n"
+                "## Required Output Format\nx\n\n"
+                "## Human Review Requirement\nx\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(main(["check", "claude-package", "--file", str(path)]), 0)
+
+    def test_academic_mr_rejects_missing_sections(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".xflow" / "issue-1" / "mr-draft.md"
+            path.parent.mkdir(parents=True)
+            path.write_text("# MR Draft\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Issue:"):
+                check_academic_mr(path)
+
+    def test_academic_mr_accepts_valid_template(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".xflow" / "issue-1" / "mr-draft.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "# MR Draft\n\n"
+                "Issue: 1\n"
+                "Target Branch: academic\n\n"
+                "## Summary\nx\n\n"
+                "## Evidence\n"
+                "- TDD Result: .xflow/issue-1/tdd-result.md\n"
+                "- Local Review: .xflow/issue-1/approvals/local-review.md\n\n"
+                "## Remote Actions Requested\nx\n",
+                encoding="utf-8",
+            )
+            check_academic_mr(path)
+
+    def test_academic_mr_rejects_missing_tdd_result_evidence(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".xflow" / "issue-1" / "mr-draft.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "# MR Draft\n\n"
+                "Issue: 1\n"
+                "Target Branch: academic\n\n"
+                "## Summary\nx\n\n"
+                "## Evidence\n"
+                "- Local Review: .xflow/issue-1/approvals/local-review.md\n\n"
+                "## Remote Actions Requested\nx\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "TDD Result:"):
+                check_academic_mr(path)
+
+    def test_academic_mr_rejects_missing_local_review_evidence(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".xflow" / "issue-1" / "mr-draft.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "# MR Draft\n\n"
+                "Issue: 1\n"
+                "Target Branch: academic\n\n"
+                "## Summary\nx\n\n"
+                "## Evidence\n"
+                "- TDD Result: .xflow/issue-1/tdd-result.md\n\n"
+                "## Remote Actions Requested\nx\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "Local Review:"):
+                check_academic_mr(path)
+
+    def test_academic_mr_accepts_explicit_file_without_issue(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mr-draft.md"
+            path.write_text(
+                "# MR Draft\n\n"
+                "Issue: 1\n"
+                "Target Branch: academic\n\n"
+                "## Summary\nx\n\n"
+                "## Evidence\n"
+                "- TDD Result: .xflow/issue-1/tdd-result.md\n"
+                "- Local Review: .xflow/issue-1/approvals/local-review.md\n\n"
+                "## Remote Actions Requested\nx\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(main(["check", "academic-mr", "--file", str(path)]), 0)
 
 
 class ApprovalTests(unittest.TestCase):

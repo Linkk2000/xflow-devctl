@@ -31,6 +31,29 @@ TDD_RESULT_REQUIRED = [
     "## Human Review Entry",
 ]
 
+CLAUDE_PACKAGE_REQUIRED = [
+    "# Claude Task Package",
+    "Issue:",
+    "AcademicForge Skill:",
+    "Input Files:",
+    "Output File:",
+    "## Objective",
+    "## Constraints",
+    "## Required Output Format",
+    "## Human Review Requirement",
+]
+
+ACADEMIC_MR_REQUIRED = [
+    "# MR Draft",
+    "Issue:",
+    "Target Branch:",
+    "## Summary",
+    "## Evidence",
+    "TDD Result:",
+    "Local Review:",
+    "## Remote Actions Requested",
+]
+
 
 def require_template(path: Path, required: list[str]) -> None:
     if not path.is_file():
@@ -47,3 +70,11 @@ def check_academic_issue(path: Path) -> None:
 
 def check_tdd_result(path: Path) -> None:
     require_template(path, TDD_RESULT_REQUIRED)
+
+
+def check_claude_package(path: Path) -> None:
+    require_template(path, CLAUDE_PACKAGE_REQUIRED)
+
+
+def check_academic_mr(path: Path) -> None:
+    require_template(path, ACADEMIC_MR_REQUIRED)
