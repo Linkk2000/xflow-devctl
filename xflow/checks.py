@@ -8,15 +8,15 @@ from .io import read_text_strict
 
 
 ACADEMIC_ISSUE_REQUIRED = [
-    "# Academic Issue Draft",
-    "Task Type:",
-    "Workflow Product Line:",
-    "Paper Base Branch:",
-    "Task Branch:",
-    "Target Artifacts:",
+    "<!-- xflow: academic-issue-draft -->",
+    "<!-- task-type:",
+    "<!-- workflow-product-line:",
+    "<!-- paper-base-branch:",
+    "<!-- task-branch:",
     "## Background",
     "## Goal",
     "## Scope",
+    "## Target Artifacts",
     "## Acceptance Criteria",
     "## Verification Plan",
     "## Human Review Gate",
@@ -48,16 +48,18 @@ CLAUDE_PACKAGE_REQUIRED = [
 ]
 
 ACADEMIC_MR_REQUIRED = [
-    "# MR Draft",
-    "Issue:",
-    "Workflow Product Line:",
-    "Paper Base Branch:",
-    "Task Branch:",
+    "<!-- xflow: academic-mr-draft -->",
+    "<!-- issue:",
+    "<!-- workflow-product-line:",
+    "<!-- paper-base-branch:",
+    "<!-- task-branch:",
     "## Summary",
     "## Evidence",
     "TDD Result:",
     "Local Review:",
-    "## Remote Actions Requested",
+    "## Verification",
+    "## Risks",
+    "## Review Request",
 ]
 
 OPS_SUBMODULES = (".xflow/ops/devctl", ".xflow/ops/workflow")
@@ -102,8 +104,16 @@ def reject_obsolete_academic_target_branch(path: Path) -> None:
         )
 
 
+def reject_internal_publish_heading(path: Path, headings: tuple[str, ...]) -> None:
+    text = read_text_strict(path)
+    for heading in headings:
+        if re.search(rf"(?m)^\s*{re.escape(heading)}\s*$", text):
+            raise ValueError(f"internal draft heading is not allowed in remote body: {heading}")
+
+
 def check_academic_issue(path: Path) -> None:
     reject_obsolete_academic_target_branch(path)
+    reject_internal_publish_heading(path, ("# Academic Issue Draft",))
     require_template(path, ACADEMIC_ISSUE_REQUIRED)
 
 
@@ -117,6 +127,7 @@ def check_claude_package(path: Path) -> None:
 
 def check_academic_mr(path: Path) -> None:
     reject_obsolete_academic_target_branch(path)
+    reject_internal_publish_heading(path, ("# MR Draft",))
     require_template(path, ACADEMIC_MR_REQUIRED)
 
 

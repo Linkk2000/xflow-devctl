@@ -55,14 +55,11 @@ mkdir -p "$tmpdir/.xflow/issues/issue-1/approvals"
 expect_fail academic-issue --issue 1
 
 cat >"$tmpdir/.xflow/issues/issue-1/issue-draft.md" <<'EOF'
-# Academic Issue Draft
-
-Task Type: tooling
-Workflow Product Line: academic
-Paper Base Branch: main
-Task Branch: feature/1-academic-gate
-Target Artifacts:
-- references/academic-workflow.md
+<!-- xflow: academic-issue-draft -->
+<!-- task-type: tooling -->
+<!-- workflow-product-line: academic -->
+<!-- paper-base-branch: main -->
+<!-- task-branch: feature/1-academic-gate -->
 
 ## Background
 Academic tasks need local review gates.
@@ -74,6 +71,9 @@ Validate academic task materials before remote writes.
 - Includes: local templates
 - Excludes: remote provider APIs
 - Affected paths: .xflow/issues/issue-1/
+
+## Target Artifacts
+- references/academic-workflow.md
 
 ## Acceptance Criteria
 - [ ] Required templates are complete.
@@ -91,9 +91,9 @@ expect_pass academic-issue --issue 1
 
 cp "$tmpdir/.xflow/issues/issue-1/issue-draft.md" "$tmpdir/.xflow/issues/issue-1/issue-draft.valid.md"
 sed -i \
-  -e '/Workflow Product Line: academic/d' \
-  -e '/Paper Base Branch: main/d' \
-  -e '/Task Branch: feature\/1-academic-gate/c\Target Branch: academic' \
+  -e '/workflow-product-line: academic/d' \
+  -e '/paper-base-branch: main/d' \
+  -e '/task-branch: feature\/1-academic-gate/c\Target Branch: academic' \
   "$tmpdir/.xflow/issues/issue-1/issue-draft.md"
 expect_fail academic-issue --issue 1
 mv "$tmpdir/.xflow/issues/issue-1/issue-draft.valid.md" "$tmpdir/.xflow/issues/issue-1/issue-draft.md"
@@ -160,12 +160,13 @@ EOF
 expect_pass claude-package --issue 1
 
 cat >"$tmpdir/.xflow/issues/issue-1/mr-draft.md" <<'EOF'
-# MR Draft
+<!-- xflow: academic-mr-draft -->
+<!-- issue: 1 -->
+<!-- workflow-product-line: academic -->
+<!-- paper-base-branch: main -->
+<!-- task-branch: feature/1-academic-gate -->
 
-Issue: 1
-Workflow Product Line: academic
-Paper Base Branch: main
-Task Branch: feature/1-academic-gate
+Closes #1
 
 ## Summary
 - Add academic local gate checks.
@@ -174,18 +175,23 @@ Task Branch: feature/1-academic-gate
 - TDD Result: .xflow/issues/issue-1/tdd-result.md
 - Local Review: .xflow/issues/issue-1/approvals/local-review.md
 
-## Remote Actions Requested
-- push current branch
-- create MR
+## Verification
+- bash tests/academic-checks.sh
+
+## Risks
+- Local approval authenticity still depends on reviewer discipline.
+
+## Review Request
+- Please review scope, verification evidence, and local approval record.
 EOF
 
 expect_pass academic-mr --issue 1
 
 cp "$tmpdir/.xflow/issues/issue-1/mr-draft.md" "$tmpdir/.xflow/issues/issue-1/mr-draft.valid.md"
 sed -i \
-  -e '/Workflow Product Line: academic/d' \
-  -e '/Paper Base Branch: main/d' \
-  -e '/Task Branch: feature\/1-academic-gate/c\Target Branch: academic' \
+  -e '/workflow-product-line: academic/d' \
+  -e '/paper-base-branch: main/d' \
+  -e '/task-branch: feature\/1-academic-gate/c\Target Branch: academic' \
   "$tmpdir/.xflow/issues/issue-1/mr-draft.md"
 expect_fail academic-mr --issue 1
 mv "$tmpdir/.xflow/issues/issue-1/mr-draft.valid.md" "$tmpdir/.xflow/issues/issue-1/mr-draft.md"

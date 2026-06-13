@@ -13,16 +13,20 @@ if grep -Eq '^[[:space:]]*Target Branch:[[:space:]]*academic[[:space:]]*$' "$fil
   devctl_die "obsolete academic branch field in $file: use Workflow Product Line, Paper Base Branch, and Task Branch"
 fi
 
+if grep -Eq '^[[:space:]]*# Academic Issue Draft[[:space:]]*$' "$file" 2>/dev/null; then
+  devctl_die "internal draft heading is not allowed in remote body: # Academic Issue Draft"
+fi
+
 academic_check_template "$file" \
-  "# Academic Issue Draft" \
-  "Task Type:" \
-  "Workflow Product Line:" \
-  "Paper Base Branch:" \
-  "Task Branch:" \
-  "Target Artifacts:" \
+  "<!-- xflow: academic-issue-draft -->" \
+  "<!-- task-type:" \
+  "<!-- workflow-product-line:" \
+  "<!-- paper-base-branch:" \
+  "<!-- task-branch:" \
   "## Background" \
   "## Goal" \
   "## Scope" \
+  "## Target Artifacts" \
   "## Acceptance Criteria" \
   "## Verification Plan" \
   "## Human Review Gate"

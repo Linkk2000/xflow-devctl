@@ -53,7 +53,7 @@ assert_academic_issue_create_gate_blocks() {
   tmpdir="$(mktemp -d)"
   body="$tmpdir/.xflow/issues/issue-draft/issue-draft.md"
   mkdir -p "$(dirname "$body")"
-  echo "# Academic Issue Draft" >"$body"
+  printf '%s\n' '<!-- xflow: academic-issue-draft -->' >"$body"
 
   if output="$(
     DEVCTL_REPO_ROOT="$tmpdir" \
@@ -93,7 +93,7 @@ assert_academic_issue_create_fail_closed() {
   tmpdir="$(mktemp -d)"
   body="$tmpdir/.xflow/issues/issue-draft/issue-draft.md"
   mkdir -p "$(dirname "$body")"
-  echo "# Academic Issue Draft" >"$body"
+  printf '%s\n' '<!-- xflow: academic-issue-draft -->' >"$body"
 
   if output="$(
     DEVCTL_REPO_ROOT="$tmpdir" \
