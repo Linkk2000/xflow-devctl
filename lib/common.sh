@@ -40,6 +40,97 @@ devctl_validate_inline_issue_body() {
   fi
 }
 
+devctl_abs_path() {
+  local path="$1" dir base
+  if [[ "$path" = /* ]]; then
+    dir="$(dirname "$path")"
+    base="$(basename "$path")"
+  else
+    dir="$(dirname "$DEVCTL_REPO_ROOT/$path")"
+    base="$(basename "$path")"
+  fi
+  (cd "$dir" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$base") || return 1
+}
+
+devctl_sha256_file() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  else
+    devctl_die "sha256sum or shasum is required for local review checks"
+  fi
+}
+
+devctl_issue_artifact_dir() {
+  local issue="$1"
+  if [[ "$issue" == "draft" ]]; then
+    echo "$DEVCTL_REPO_ROOT/.xflow/issues/issue-draft"
+  else
+    echo "$DEVCTL_REPO_ROOT/.xflow/issues/issue-${issue}"
+  fi
+}
+
+devctl_default_issue_file() {
+  local issue="$1" file_name="$2"
+  echo "$(devctl_issue_artifact_dir "$issue")/${file_name}"
+}
+
+devctl_review_field() {
+  local file="$1" key="$2"
+  grep -m1 -E "^${key}:" "$file" 2>/dev/null | sed -E "s/^${key}:[[:space:]]*//"
+}
+
+devctl_check_template_file() {
+  local file="$1"
+  shift
+  [[ -f "$file" ]] || devctl_die "missing required file: $file"
+  local needle
+  for needle in "$@"; do
+    grep -Fq -- "$needle" "$file" || devctl_die "missing required text '$needle' in $file"
+  done
+}
+
+devctl_reject_publish_heading() {
+  local file="$1"
+  shift
+  [[ -f "$file" ]] || devctl_die "missing required file: $file"
+  local heading
+  for heading in "$@"; do
+    if grep -Eq "^[[:space:]]*${heading}[[:space:]]*$" "$file"; then
+      devctl_die "internal draft heading is not allowed in remote body"
+    fi
+  done
+}
+
+devctl_require_local_review() {
+  local issue="$1" action="$2" approved_file="$3"
+  local review_file approved_action approved_path approved_hash actual_hash expected_abs approved_abs decision
+  review_file="$(devctl_issue_artifact_dir "$issue")/approvals/local-review.md"
+  [[ -f "$approved_file" ]] || devctl_die "approved file does not exist: $approved_file"
+  [[ -f "$review_file" ]] || devctl_die "local review approval required: $review_file"
+
+  approved_action="$(devctl_review_field "$review_file" "Approved Action")"
+  approved_path="$(devctl_review_field "$review_file" "Approved File")"
+  approved_hash="$(devctl_review_field "$review_file" "Approved SHA256")"
+  decision="$(devctl_review_field "$review_file" "Approved")"
+
+  [[ "$decision" == "yes" ]] || devctl_die "local review is not approved in $review_file"
+  if [[ "$approved_action" != "$action" && "$approved_action" != "remote-write" ]]; then
+    devctl_die "local review action mismatch: expected $action, got $approved_action"
+  fi
+  [[ -n "$approved_path" ]] || devctl_die "missing Approved File in $review_file"
+  [[ -n "$approved_hash" ]] || devctl_die "missing Approved SHA256 in $review_file"
+
+  expected_abs="$(devctl_abs_path "$approved_file")"
+  approved_abs="$(devctl_abs_path "$approved_path")"
+  [[ "$expected_abs" == "$approved_abs" ]] || devctl_die "local review file mismatch: expected $approved_file, got $approved_path"
+
+  actual_hash="$(devctl_sha256_file "$approved_file")"
+  [[ "$actual_hash" == "$approved_hash" ]] || devctl_die "local review hash mismatch for $approved_file"
+}
+
 devctl_project_local_dir() {
   local dir="$DEVCTL_REPO_ROOT/.xflow-local"
   mkdir -p "$dir"

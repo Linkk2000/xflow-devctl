@@ -6,7 +6,14 @@ Issue (GitHub/Gitee):
   devctl issue close <number>
 
 Note:
-  Use --body-file for multi-line or shell-sensitive Markdown bodies. --body is for simple single-line text only.
+  Core remote writes require local review of the exact body/evidence file.
+  Use --body-file for issue create/comment and git mr.
+  Required approval file: .xflow/issues/issue-<id>/approvals/local-review.md
+
+Check:
+  devctl check issue-draft [--issue draft|N] [--file F]
+  devctl check mr-draft --issue N [--file F]
+  devctl check local-review --issue draft|N --file F --action issue-create|issue-comment|issue-close|git-mr
 
 App:
   devctl app start-frontend [--port PORT] [--foreground]

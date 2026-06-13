@@ -30,6 +30,8 @@ if [[ -n "$body_file" ]]; then
 fi
 
 [[ -n "$body" ]] || devctl_die "评论内容不能为空"
+[[ -n "$body_file" ]] || devctl_die "remote issue comments require --body-file for local review"
+devctl_require_local_review "$number" "issue-comment" "$body_file"
 
 if [[ -z "$body_file" && -n "$body" ]]; then
   devctl_validate_inline_issue_body "$body"

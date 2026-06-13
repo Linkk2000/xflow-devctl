@@ -15,6 +15,12 @@ export DEVCTL_TOOL_ROOT="$ROOT"
 export DEVCTL_REPO_ROOT
 export DEVCTL_OPS_ROOT="$OPS"
 
+case "${1:-help}" in
+  -h|--help|help|check)
+    export DEVCTL_SKIP_PROVIDER_LOAD=1
+    ;;
+esac
+
 # shellcheck source=lib/common.sh
 source "$OPS/lib/common.sh"
 
@@ -61,6 +67,16 @@ main() {
         comment) shift; run_script "$OPS/issue/comment.sh" "$@" ;;
         close)   shift; run_script "$OPS/issue/close.sh" "$@" ;;
         *) devctl_die "未知 issue 子命令: $1（devctl help）" ;;
+      esac
+      ;;
+    check)
+      shift
+      [[ $# -ge 1 ]] || { usage; exit 1; }
+      case "$1" in
+        issue-draft)  shift; run_script "$OPS/check/issue-draft.sh" "$@" ;;
+        mr-draft)     shift; run_script "$OPS/check/mr-draft.sh" "$@" ;;
+        local-review) shift; run_script "$OPS/check/local-review.sh" "$@" ;;
+        *) devctl_die "unknown check subcommand: $1 (devctl help)" ;;
       esac
       ;;
     app)

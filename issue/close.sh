@@ -20,6 +20,9 @@ done
 
 [[ -n "$number" ]] || devctl_die "用法: devctl issue close <number>"
 
+approved_file="${DEVCTL_APPROVED_FILE:-$(devctl_default_issue_file "$number" walkthrough.md)}"
+devctl_require_local_review "$number" "issue-close" "$approved_file"
+
 devctl_need_cmd jq
 
 devctl_info "正在关闭 Issue #${number}..."

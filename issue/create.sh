@@ -31,6 +31,9 @@ if [[ -n "$body_file" ]]; then
   body="$(cat "$body_file")"
 fi
 
+[[ -n "$body_file" ]] || devctl_die "remote issue creation requires --body-file for local review"
+devctl_require_local_review "draft" "issue-create" "$body_file"
+
 if [[ -z "$body_file" && -n "$body" ]]; then
   devctl_validate_inline_issue_body "$body"
 fi
