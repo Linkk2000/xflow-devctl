@@ -18,7 +18,15 @@ from .checks import (
 )
 from .env import RuntimeContext, detect_python_runtime
 from .paths import default_issue_file
-from .providers import create_issue, create_pull_request
+from .providers import (
+    close_issue,
+    comment_issue,
+    create_issue,
+    create_pull_request,
+    get_pull_request,
+    list_issues,
+    show_issue,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -52,6 +60,17 @@ def build_parser() -> argparse.ArgumentParser:
     issue_create.add_argument("--body")
     issue_create.add_argument("--body-file", type=Path)
     issue_create.add_argument("--labels")
+    issue_list = issue_sub.add_parser("list")
+    issue_list.add_argument("--state", choices=("open", "closed", "all"), default="open")
+    issue_list.add_argument("--limit", type=int, default=20)
+    issue_show = issue_sub.add_parser("show")
+    issue_show.add_argument("number")
+    issue_comment = issue_sub.add_parser("comment")
+    issue_comment.add_argument("number")
+    issue_comment.add_argument("--body")
+    issue_comment.add_argument("--body-file", type=Path)
+    issue_close = issue_sub.add_parser("close")
+    issue_close.add_argument("number")
 
     git = sub.add_parser("git")
     git_sub = git.add_subparsers(dest="git_command")
@@ -61,6 +80,8 @@ def build_parser() -> argparse.ArgumentParser:
     git_mr.add_argument("--body-file", type=Path)
     git_mr.add_argument("--base")
     git_mr.add_argument("--issue")
+    git_pr_get = git_sub.add_parser("pr-get")
+    git_pr_get.add_argument("number")
 
     claude = sub.add_parser("claude")
     claude_sub = claude.add_subparsers(dest="claude_command")
@@ -126,6 +147,57 @@ def run_check(args: argparse.Namespace) -> int:
 def run_issue(args: argparse.Namespace) -> int:
     context = RuntimeContext.from_env(Path(__file__).resolve().parents[1], os.environ)
     try:
+        if args.issue_command == "list":
+            if args.limit < 1 or args.limit > 100:
+                raise ValueError("--limit must be between 1 and 100")
+            rows = list_issues(context.repo_root, args.state, args.limit, os.environ)
+            for row in rows:
+                print(f"#{row.get('number', '')}\t[{row.get('state', '')}]\t{row.get('title', '')}")
+            return 0
+
+        if args.issue_command == "show":
+            issue = show_issue(context.repo_root, args.number, os.environ)
+            print(f"#{issue.get('number', args.number)} [{issue.get('state', '')}] {issue.get('title', '')}")
+            body = str(issue.get("body", "") or "")
+            if body:
+                print()
+                print(body)
+            html_url = str(issue.get("html_url", "") or "")
+            if html_url:
+                print()
+                print(html_url)
+            return 0
+
+        if args.issue_command == "comment":
+            if args.body and args.body_file:
+                raise ValueError("use only one of --body or --body-file")
+            if args.body:
+                raise ValueError("academic issue comment requires --body-file")
+            body_file = args.body_file or default_issue_file(context.repo_root, args.number, "comment-draft.md")
+            require_remote_approval(context.repo_root, "issue-comment", body_file, args.number)
+            body = body_file.read_text(encoding="utf-8")
+            result = comment_issue(context.repo_root, args.number, body, os.environ)
+            print(f"[INFO] Comment posted on Issue #{args.number}")
+            html_url = str(result.get("html_url", "") or "")
+            if html_url:
+                print(f"[INFO] {html_url}")
+            return 0
+
+        if args.issue_command == "close":
+            approved_file = (
+                Path(os.environ["DEVCTL_ACADEMIC_APPROVED_FILE"])
+                if os.environ.get("DEVCTL_ACADEMIC_APPROVED_FILE")
+                else default_issue_file(context.repo_root, args.number, "walkthrough.md")
+            )
+            require_remote_approval(context.repo_root, "issue-close", approved_file, args.number)
+            result = close_issue(context.repo_root, args.number, os.environ)
+            number = str(result.get("number", args.number) or args.number)
+            print(f"[INFO] Issue #{number} closed")
+            html_url = str(result.get("html_url", "") or "")
+            if html_url:
+                print(f"[INFO] {html_url}")
+            return 0
+
         if args.issue_command != "create":
             raise ValueError(f"unknown issue subcommand: {args.issue_command}")
         if args.body_file is None:
@@ -229,6 +301,21 @@ def derive_mr_title(branch: str, issue: str) -> str:
 def run_git(args: argparse.Namespace) -> int:
     context = RuntimeContext.from_env(Path(__file__).resolve().parents[1], os.environ)
     try:
+        if args.git_command == "pr-get":
+            pr = get_pull_request(context.repo_root, args.number, os.environ)
+            print(f"#{pr.get('number', args.number)} [{pr.get('state', '')}] {pr.get('title', '')}")
+            head = pr.get("head", {})
+            base = pr.get("base", {})
+            head_ref = head.get("ref", "") if isinstance(head, dict) else ""
+            base_ref = base.get("ref", "") if isinstance(base, dict) else ""
+            if head_ref or base_ref:
+                print(f"{head_ref} -> {base_ref}")
+            html_url = str(pr.get("html_url", "") or "")
+            if html_url:
+                print()
+                print(html_url)
+            return 0
+
         if args.git_command != "mr":
             raise ValueError(f"unknown git subcommand: {args.git_command}")
         if args.body and args.body_file:

@@ -837,6 +837,247 @@ class IssueProviderTests(unittest.TestCase):
             thread.join(timeout=5)
             server.server_close()
 
+    def test_issue_list_reads_github_and_filters_pull_request_items(self):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append({"path": self.path, "authorization": self.headers.get("Authorization")})
+                payload = json.dumps(
+                    [
+                        {"number": 1, "state": "open", "title": "Draft polish"},
+                        {"number": 2, "state": "open", "title": "PR mirror", "pull_request": {"url": "x"}},
+                    ]
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, _format, *args):
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with TemporaryDirectory() as tmp:
+                original = os.environ.copy()
+                try:
+                    os.environ.clear()
+                    os.environ.update(
+                        {
+                            "DEVCTL_REPO_ROOT": tmp,
+                            "DEVCTL_PRODUCT_LINE": "academic",
+                            "XFLOW_PLATFORM": "github",
+                            "GITHUB_API_BASE": f"http://127.0.0.1:{server.server_port}",
+                            "GITHUB_TOKEN": "token-value",
+                            "DEVCTL_OWNER": "Linkk2000",
+                            "DEVCTL_REPO": "paper-demo",
+                        }
+                    )
+                    out = StringIO()
+                    with redirect_stdout(out):
+                        result = main(["issue", "list", "--state", "open", "--limit", "2"])
+                    self.assertEqual(result, 0)
+                    text = out.getvalue()
+                    self.assertIn("#1\t[open]\tDraft polish", text)
+                    self.assertNotIn("PR mirror", text)
+                    self.assertEqual(len(requests), 1)
+                    self.assertTrue(requests[0]["path"].startswith("/repos/Linkk2000/paper-demo/issues?"))
+                    self.assertIn("state=open", requests[0]["path"])
+                    self.assertIn("per_page=2", requests[0]["path"])
+                    self.assertEqual(requests[0]["authorization"], "Bearer token-value")
+                finally:
+                    os.environ.clear()
+                    os.environ.update(original)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_issue_show_reads_github_details(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                payload = json.dumps(
+                    {
+                        "number": 7,
+                        "state": "open",
+                        "title": "Academic draft",
+                        "body": "Body text",
+                        "html_url": "https://github.example/issues/7",
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, _format, *args):
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with TemporaryDirectory() as tmp:
+                original = os.environ.copy()
+                try:
+                    os.environ.clear()
+                    os.environ.update(
+                        {
+                            "DEVCTL_REPO_ROOT": tmp,
+                            "DEVCTL_PRODUCT_LINE": "academic",
+                            "XFLOW_PLATFORM": "github",
+                            "GITHUB_API_BASE": f"http://127.0.0.1:{server.server_port}",
+                            "GITHUB_TOKEN": "token-value",
+                            "DEVCTL_OWNER": "Linkk2000",
+                            "DEVCTL_REPO": "paper-demo",
+                        }
+                    )
+                    out = StringIO()
+                    with redirect_stdout(out):
+                        result = main(["issue", "show", "7"])
+                    self.assertEqual(result, 0)
+                    text = out.getvalue()
+                    self.assertIn("#7 [open] Academic draft", text)
+                    self.assertIn("Body text", text)
+                    self.assertIn("https://github.example/issues/7", text)
+                finally:
+                    os.environ.clear()
+                    os.environ.update(original)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_issue_comment_posts_after_local_approval(self):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                requests.append({"path": self.path, "body": json.loads(self.rfile.read(length).decode("utf-8"))})
+                payload = json.dumps({"html_url": "https://github.example/issues/7#comment"}).encode("utf-8")
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, _format, *args):
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                comment = repo / ".xflow" / "issues" / "issue-7" / "comment-draft.md"
+                comment.parent.mkdir(parents=True)
+                comment.write_text("Reviewed comment\n", encoding="utf-8")
+                write_local_review(repo, "7", "issue-comment", comment)
+                original = os.environ.copy()
+                try:
+                    os.environ.clear()
+                    os.environ.update(
+                        {
+                            "DEVCTL_REPO_ROOT": str(repo),
+                            "DEVCTL_PRODUCT_LINE": "academic",
+                            "XFLOW_PLATFORM": "github",
+                            "GITHUB_API_BASE": f"http://127.0.0.1:{server.server_port}",
+                            "GITHUB_TOKEN": "token-value",
+                            "DEVCTL_OWNER": "Linkk2000",
+                            "DEVCTL_REPO": "paper-demo",
+                        }
+                    )
+                    out = StringIO()
+                    with redirect_stdout(out):
+                        result = main(["issue", "comment", "7", "--body-file", str(comment)])
+                    self.assertEqual(result, 0)
+                    self.assertIn("Comment posted on Issue #7", out.getvalue())
+                    self.assertEqual(requests, [{"path": "/repos/Linkk2000/paper-demo/issues/7/comments", "body": {"body": "Reviewed comment\n"}}])
+                finally:
+                    os.environ.clear()
+                    os.environ.update(original)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_issue_comment_rejects_inline_body_in_academic_mode(self):
+        with TemporaryDirectory() as tmp:
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update({"DEVCTL_REPO_ROOT": tmp, "DEVCTL_PRODUCT_LINE": "academic"})
+                err = StringIO()
+                with redirect_stderr(err):
+                    result = main(["issue", "comment", "7", "--body", "inline"])
+                self.assertEqual(result, 1)
+                self.assertIn("academic issue comment requires --body-file", err.getvalue())
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_issue_close_patches_after_local_approval(self):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_PATCH(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                requests.append({"path": self.path, "body": json.loads(self.rfile.read(length).decode("utf-8"))})
+                payload = json.dumps({"number": 7, "state": "closed", "html_url": "https://github.example/issues/7"}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, _format, *args):
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                walkthrough = repo / ".xflow" / "issues" / "issue-7" / "walkthrough.md"
+                walkthrough.parent.mkdir(parents=True)
+                walkthrough.write_text("Ready to close\n", encoding="utf-8")
+                write_local_review(repo, "7", "issue-close", walkthrough)
+                original = os.environ.copy()
+                try:
+                    os.environ.clear()
+                    os.environ.update(
+                        {
+                            "DEVCTL_REPO_ROOT": str(repo),
+                            "DEVCTL_PRODUCT_LINE": "academic",
+                            "XFLOW_PLATFORM": "github",
+                            "GITHUB_API_BASE": f"http://127.0.0.1:{server.server_port}",
+                            "GITHUB_TOKEN": "token-value",
+                            "DEVCTL_OWNER": "Linkk2000",
+                            "DEVCTL_REPO": "paper-demo",
+                        }
+                    )
+                    out = StringIO()
+                    with redirect_stdout(out):
+                        result = main(["issue", "close", "7"])
+                    self.assertEqual(result, 0)
+                    self.assertIn("Issue #7 closed", out.getvalue())
+                    self.assertEqual(requests, [{"path": "/repos/Linkk2000/paper-demo/issues/7", "body": {"state": "closed"}}])
+                finally:
+                    os.environ.clear()
+                    os.environ.update(original)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
 
 class PullRequestProviderTests(unittest.TestCase):
     def init_repo(self, path: Path) -> None:
@@ -977,6 +1218,64 @@ class PullRequestProviderTests(unittest.TestCase):
             finally:
                 os.environ.clear()
                 os.environ.update(original)
+
+    def test_git_pr_get_reads_github_details(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                payload = json.dumps(
+                    {
+                        "number": 9,
+                        "state": "open",
+                        "title": "Paper polish",
+                        "html_url": "https://github.example/pull/9",
+                        "head": {"ref": "feature/1-polish"},
+                        "base": {"ref": "main"},
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, _format, *args):
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                self.init_repo(repo)
+                original = os.environ.copy()
+                try:
+                    os.environ.clear()
+                    os.environ.update(
+                        {
+                            "DEVCTL_REPO_ROOT": str(repo),
+                            "DEVCTL_PRODUCT_LINE": "academic",
+                            "XFLOW_PLATFORM": "github",
+                            "GITHUB_API_BASE": f"http://127.0.0.1:{server.server_port}",
+                            "GITHUB_TOKEN": "token-value",
+                            "PATH": original.get("PATH", ""),
+                        }
+                    )
+                    out = StringIO()
+                    with redirect_stdout(out):
+                        result = main(["git", "pr-get", "9"])
+                    self.assertEqual(result, 0)
+                    text = out.getvalue()
+                    self.assertIn("#9 [open] Paper polish", text)
+                    self.assertIn("feature/1-polish -> main", text)
+                    self.assertIn("https://github.example/pull/9", text)
+                finally:
+                    os.environ.clear()
+                    os.environ.update(original)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
 
 
 if __name__ == "__main__":

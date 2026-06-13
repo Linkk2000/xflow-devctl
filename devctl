@@ -118,6 +118,13 @@ main() {
           fi
           run_script "$OPS/git/mr.sh" "$@"
           ;;
+        pr-get)
+          shift
+          if is_academic_mode; then
+            run_python_core git pr-get "$@"
+          fi
+          devctl_die "git pr-get is available in academic Python mode only"
+          ;;
         done)       shift; run_script "$OPS/git/done.sh" "$@" ;;
         status)     shift; run_script "$OPS/git/status.sh" "$@" ;;
         *) devctl_die "未知 git 子命令: $1（devctl help）" ;;
@@ -134,10 +141,34 @@ main() {
           fi
           run_script "$OPS/issue/create.sh" "$@"
           ;;
-        list)    shift; run_script "$OPS/issue/list.sh" "$@" ;;
-        show)    shift; run_script "$OPS/issue/show.sh" "$@" ;;
-        comment) shift; run_script "$OPS/issue/comment.sh" "$@" ;;
-        close)   shift; run_script "$OPS/issue/close.sh" "$@" ;;
+        list)
+          shift
+          if is_academic_mode; then
+            run_python_core issue list "$@"
+          fi
+          run_script "$OPS/issue/list.sh" "$@"
+          ;;
+        show)
+          shift
+          if is_academic_mode; then
+            run_python_core issue show "$@"
+          fi
+          run_script "$OPS/issue/show.sh" "$@"
+          ;;
+        comment)
+          shift
+          if is_academic_mode; then
+            run_python_core issue comment "$@"
+          fi
+          run_script "$OPS/issue/comment.sh" "$@"
+          ;;
+        close)
+          shift
+          if is_academic_mode; then
+            run_python_core issue close "$@"
+          fi
+          run_script "$OPS/issue/close.sh" "$@"
+          ;;
         *) devctl_die "未知 issue 子命令: $1（devctl help）" ;;
       esac
       ;;

@@ -70,6 +70,24 @@ assert_academic_issue_create_gate_blocks() {
   rm -rf "$tmpdir"
 }
 
+assert_academic_issue_comment_rejects_inline_body() {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+
+  if output="$(
+    DEVCTL_REPO_ROOT="$tmpdir" \
+    DEVCTL_PRODUCT_LINE=academic \
+      bash "$ROOT/devctl" issue comment 7 --body "inline body" 2>&1
+  )"; then
+    echo "expected academic issue comment to reject inline body" >&2
+    echo "$output" >&2
+    rm -rf "$tmpdir"
+    exit 1
+  fi
+  echo "$output" | grep -F "academic issue comment requires --body-file" >/dev/null
+  rm -rf "$tmpdir"
+}
+
 assert_academic_issue_create_fail_closed() {
   local tmpdir body
   tmpdir="$(mktemp -d)"
@@ -99,6 +117,7 @@ if has_python_310; then
   assert_preflight_success "$ROOT"
   assert_preflight_success "$outside_dir"
   assert_academic_issue_create_gate_blocks
+  assert_academic_issue_comment_rejects_inline_body
 else
   assert_preflight_fail_closed "$ROOT"
   assert_preflight_fail_closed "$outside_dir"

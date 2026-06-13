@@ -7,16 +7,21 @@ Issue (GitHub/Gitee):
 
 Note:
   Use --body-file for multi-line or shell-sensitive Markdown bodies. --body is for simple single-line text only.
-  In academic Python mode, issue create currently supports GitHub through
-  GITHUB_TOKEN after the local approval gate passes.
+  In academic Python mode, GitHub issue create/list/show/comment/close are
+  handled by the Python core through GITHUB_TOKEN. issue create, comment, and
+  close require the local approval gate before remote writes. issue comment
+  rejects inline --body in academic mode; use --body-file or
+  .xflow/issues/issue-<id>/comment-draft.md.
 
 MR:
   devctl git mr --title T [--body B | --body-file F] [--issue N]
+  devctl git pr-get <number>
 
   Use --body-file for MR descriptions containing Markdown sections, code
   fences, JSON, shell snippets, backticks, or multiple lines.
   In academic Python mode, git mr creates a GitHub PR after local approval
-  and requires --body-file or the default issue MR draft.
+  and requires --body-file or the default issue MR draft. git pr-get reads a
+  GitHub PR without a local approval gate because it performs no remote write.
 
 Preflight:
   devctl preflight
