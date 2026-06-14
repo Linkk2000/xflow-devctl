@@ -12,7 +12,7 @@ provider_init() {
     set +a
   fi
   GITEE_TOKEN="${GITEE_TOKEN:-${GITEE_ACCESS_TOKEN:-${access_token:-${GITEE_PRIVATE_TOKEN:-}}}}"
-  [[ -n "$GITEE_TOKEN" ]] || devctl_die "未找到 Gitee Token。请设置 GITEE_TOKEN 或写入 ${GITEE_ENV_FILE:-$HOME/gitee.env.local}"
+  [[ -n "$GITEE_TOKEN" ]] || devctl_die "missing Gitee token: set GITEE_TOKEN or write ${GITEE_ENV_FILE:-$HOME/gitee.env.local}"
 }
 
 devctl_gitee_repo_path() {
@@ -31,7 +31,7 @@ devctl_gitee_api() {
   http_code="$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" \
     -H 'Content-Type: application/json' \
     -G --data-urlencode "access_token=${GITEE_TOKEN}" \
-    "$url" "$@")" || devctl_die "Gitee API 请求失败: $method $path"
+    "$url" "$@")" || devctl_die "Gitee API request failed: $method $path"
   if [[ "$http_code" -ge 400 ]]; then
     devctl_error "Gitee API ${http_code}: $(cat "$tmp")"
     rm -f "$tmp"
@@ -50,7 +50,7 @@ devctl_gitee_api_json() {
   http_code="$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" \
     -H 'Content-Type: application/json' \
     -d "$body" \
-    "$url")" || devctl_die "Gitee API 请求失败: $method $path"
+    "$url")" || devctl_die "Gitee API request failed: $method $path"
   if [[ "$http_code" -ge 400 ]]; then
     devctl_error "Gitee API ${http_code}: $(cat "$tmp")"
     rm -f "$tmp"

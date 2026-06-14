@@ -15,19 +15,19 @@ while [[ $# -gt 0 ]]; do
     --body) body="$2"; shift 2 ;;
     --body-file) body_file="$2"; shift 2 ;;
     --labels) labels="$2"; shift 2 ;;
-    -*) devctl_die "未知选项: $1" ;;
+    -*) devctl_die "unknown option: $1" ;;
     *)
-      [[ -z "$title" ]] || devctl_die "多余的参数: $1"
+      [[ -z "$title" ]] || devctl_die "extra argument: $1"
       title="$1"
       shift
       ;;
   esac
 done
 
-[[ -n "$title" ]] || devctl_die "用法: devctl issue create <title> [--body B] [--body-file F] [--labels a,b]"
+[[ -n "$title" ]] || devctl_die "usage: devctl issue create <title> [--body B] [--body-file F] [--labels a,b]"
 
 if [[ -n "$body_file" ]]; then
-  [[ -f "$body_file" ]] || devctl_die "文件不存在: $body_file"
+  [[ -f "$body_file" ]] || devctl_die "file not found: $body_file"
   body="$(cat "$body_file")"
 fi
 
@@ -44,6 +44,6 @@ resp="$(provider_issue_create "$title" "$body" "$labels")"
 number="$(devctl_json_field "$resp" '.number // empty')"
 url="$(devctl_json_field "$resp" '.html_url // empty')"
 
-devctl_info "Issue #${number} 已创建"
+devctl_info "Issue #${number} created"
 [[ -n "$url" ]] && devctl_info "$url"
 echo "$number"

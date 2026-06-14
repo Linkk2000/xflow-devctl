@@ -12,7 +12,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --state) state="$2"; shift 2 ;;
     --limit) limit="$2"; shift 2 ;;
-    *) devctl_die "未知选项: $1" ;;
+    *) devctl_die "unknown option: $1" ;;
   esac
 done
 
@@ -22,7 +22,7 @@ case "$state" in
   open) filter_state="open" ;;
   closed) filter_state="closed" ;;
   all) filter_state="" ;;
-  *) devctl_die "--state 必须是 open|closed|all" ;;
+  *) devctl_die "--state must be open|closed|all" ;;
 esac
 
 resp="$(provider_issue_list "$filter_state" "$limit")"
@@ -34,8 +34,8 @@ else
   # 如果返回错误对象，打印它的 message，或者直接报错
   message="$(echo "$resp" | jq -r '.message // empty')"
   if [[ -n "$message" ]]; then
-    devctl_die "API 返回错误: $message"
+    devctl_die "API returned an error: $message"
   else
-    devctl_die "API 返回异常响应: $resp"
+    devctl_die "API returned an unexpected response: $resp"
   fi
 fi

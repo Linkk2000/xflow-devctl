@@ -24,7 +24,7 @@ devctl_die() {
 devctl_need_cmd() {
   local c
   for c in "$@"; do
-    command -v "$c" >/dev/null 2>&1 || devctl_die "缺少命令: $c"
+    command -v "$c" >/dev/null 2>&1 || devctl_die "missing command: $c"
   done
 }
 
@@ -77,7 +77,7 @@ devctl_parse_owner_repo() {
     DEVCTL_OWNER="${BASH_REMATCH[2]}"
     DEVCTL_REPO="${BASH_REMATCH[3]%.git}"
   else
-    devctl_die "无法从 origin 解析 owner/repo: $url"
+    devctl_die "cannot parse owner/repo from origin: $url"
   fi
   export DEVCTL_OWNER DEVCTL_REPO
 }
@@ -103,7 +103,7 @@ devctl_load_provider() {
     devctl_parse_owner_repo
     provider_init
   else
-    devctl_die "不支持的平台提供者: $platform (未找到 $provider_script)"
+    devctl_die "unsupported platform provider: $platform (missing $provider_script)"
   fi
 }
 
@@ -126,13 +126,13 @@ devctl_default_base_branch() {
 
 devctl_require_clean_worktree() {
   if ! git -C "$DEVCTL_REPO_ROOT" diff --quiet 2>/dev/null; then
-    devctl_die "工作区有未暂存修改，请先 commit 或 stash"
+    devctl_die "working tree has unstaged changes; commit or stash first"
   fi
   if ! git -C "$DEVCTL_REPO_ROOT" diff --cached --quiet 2>/dev/null; then
-    devctl_die "暂存区有未提交修改，请先 commit 或 reset"
+    devctl_die "index has staged changes; commit or reset first"
   fi
   if [[ -n "$(git -C "$DEVCTL_REPO_ROOT" ls-files --others --exclude-standard)" ]]; then
-    devctl_die "存在未跟踪文件，请先处理（add / .gitignore / 删除）"
+    devctl_die "untracked files exist; add, ignore, or remove them first"
   fi
 }
 
@@ -147,7 +147,7 @@ devctl_branch_slugify() {
 devctl_branch_name_from_slug() {
   local slug issue prefix="${DEVCTL_BRANCH_PREFIX:-feat}"
   slug="$(devctl_branch_slugify "$1")"
-  [[ -n "$slug" ]] || devctl_die "slug 无效"
+  [[ -n "$slug" ]] || devctl_die "invalid slug"
   issue="${2:-}"
   if [[ -n "$issue" ]]; then
     echo "${prefix}/${issue}-${slug}"
@@ -242,7 +242,7 @@ devctl_push_current_branch() {
   branch="$(devctl_current_branch)"
   upstream="$(git -C "$DEVCTL_REPO_ROOT" rev-parse --abbrev-ref "${branch}@{upstream}" 2>/dev/null || true)"
   if [[ -z "$upstream" ]]; then
-    devctl_info "推送并设置 upstream: origin/${branch}"
+    devctl_info "pushing and setting upstream: origin/${branch}"
     git -C "$DEVCTL_REPO_ROOT" push -u origin "$branch"
   else
     git -C "$DEVCTL_REPO_ROOT" push origin "$branch"
@@ -287,7 +287,7 @@ devctl_summarize_commit_message() {
   scope="$(devctl_guess_commit_scope)"
   files="$( { git -C "$DEVCTL_REPO_ROOT" diff --cached --name-only; git -C "$DEVCTL_REPO_ROOT" diff --name-only; } 2>/dev/null | wc -l | tr -d ' ')"
   if [[ "$files" -eq 0 ]]; then
-    devctl_die "没有可总结的变更（工作区与暂存区均为空）"
+    devctl_die "no changes to summarize; working tree and index are empty"
   fi
   summary="$( { git -C "$DEVCTL_REPO_ROOT" diff --cached --name-only; git -C "$DEVCTL_REPO_ROOT" diff --name-only; } 2>/dev/null \
     | sort -u | head -3 | xargs -I{} basename {} | paste -sd', ' -)"
@@ -304,7 +304,7 @@ devctl_json_field() {
   if command -v jq >/dev/null 2>&1; then
     echo "$json" | jq -r "$jq_expr"
   else
-    devctl_die "需要 jq 解析 Gitee API 响应（请安装 jq）"
+    devctl_die "jq is required to parse the Gitee API response"
   fi
 }
 

@@ -43,16 +43,31 @@ Academic checks:
 
 Claude:
   devctl claude doctor
+  devctl claude skills
   devctl claude run --issue N [--file F] [--output F] [--dry-run]
 
   doctor checks whether the local Claude CLI is visible and whether
   AcademicForge is registered in the Claude config. Missing AcademicForge is
   reported with a reviewable command; no installation is performed.
 
+  skills lists the verified AcademicForge command catalog that can be used in
+  Claude task package Invocation fields.
+
   Validate a Claude task package, call the local Claude CLI with the package
   content, and write the result to the package Output File. Set
   DEVCTL_CLAUDE_COMMAND to override the command prefix. The default command is
   `claude -p <task-package-content>`.
+
+AI rule entrypoints:
+  devctl rules list
+  devctl rules sync <id> [--force]
+  devctl rules sync --all [--force]
+
+  Read .xflow/ops/workflow/templates/ai-rules.json and copy the selected
+  AI-client rule file into the paper repository root. This lets a repository
+  initialized by one tool add another tool's entrypoint later, for example
+  adding Cursor's .cursorrules after Codex created AGENTS.md. Existing edited
+  files are not overwritten unless --force is used after human review.
 
 App:
   devctl app start-frontend [--port PORT] [--foreground]

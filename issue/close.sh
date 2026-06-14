@@ -9,23 +9,23 @@ number=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -*) devctl_die "未知选项: $1" ;;
+    -*) devctl_die "unknown option: $1" ;;
     *)
-      [[ -z "$number" ]] || devctl_die "多余的参数: $1"
+      [[ -z "$number" ]] || devctl_die "extra argument: $1"
       number="$1"
       shift
       ;;
   esac
 done
 
-[[ -n "$number" ]] || devctl_die "用法: devctl issue close <number>"
+[[ -n "$number" ]] || devctl_die "usage: devctl issue close <number>"
 
 devctl_academic_require_remote_approval "issue-close" "${DEVCTL_ACADEMIC_APPROVED_FILE:-}" "$number"
 
 devctl_need_cmd jq
 
-devctl_info "正在关闭 Issue #${number}..."
+devctl_info "closing Issue #${number}"
 # shellcheck disable=SC2034
 resp="$(provider_issue_close "$number")"
 
-devctl_info "Issue #${number} 已关闭。"
+devctl_info "Issue #${number} closed"

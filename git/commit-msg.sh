@@ -14,7 +14,7 @@ while getopts ":acm:" opt; do
     a) stage_all=1 ;;
     c) do_commit=1 ;;
     m) override="$OPTARG" ;;
-    *) devctl_die "用法: devctl git commit-msg [-a] [-c] [-m message]" ;;
+    *) devctl_die "usage: devctl git commit-msg [-a] [-c] [-m message]" ;;
   esac
 done
 
@@ -25,13 +25,13 @@ if [[ "$stage_all" -eq 1 ]]; then
 fi
 
 msg="$(devctl_summarize_commit_message "$override")"
-devctl_info "建议提交信息:"
+devctl_info "suggested commit message:"
 printf '\n  %s\n\n' "$msg"
 
 if [[ "$do_commit" -eq 1 ]]; then
   git -C "$DEVCTL_REPO_ROOT" commit -m "$msg"
-  devctl_info "已提交"
+  devctl_info "committed"
 else
-  devctl_info "确认提交: devctl git commit-msg -c"
-  devctl_info "或: git commit -m $(printf '%q' "$msg")"
+  devctl_info "confirm commit: devctl git commit-msg -c"
+  devctl_info "or: git commit -m $(printf '%q' "$msg")"
 fi

@@ -67,7 +67,7 @@ usage() {
 run_script() {
   local script="$1"
   shift
-  [[ -x "$script" || -f "$script" ]] || devctl_die "缺少脚本: $script"
+  [[ -x "$script" || -f "$script" ]] || devctl_die "missing script: $script"
   exec bash "$script" "$@"
 }
 
@@ -127,7 +127,7 @@ main() {
           ;;
         done)       shift; run_script "$OPS/git/done.sh" "$@" ;;
         status)     shift; run_script "$OPS/git/status.sh" "$@" ;;
-        *) devctl_die "未知 git 子命令: $1（devctl help）" ;;
+        *) devctl_die "unknown git subcommand: $1 (devctl help)" ;;
       esac
       ;;
     issue)
@@ -169,7 +169,7 @@ main() {
           fi
           run_script "$OPS/issue/close.sh" "$@"
           ;;
-        *) devctl_die "未知 issue 子命令: $1（devctl help）" ;;
+        *) devctl_die "unknown issue subcommand: $1 (devctl help)" ;;
       esac
       ;;
     check)
@@ -189,9 +189,14 @@ main() {
       [[ $# -ge 1 ]] || { usage; exit 1; }
       case "$1" in
         doctor) shift; run_python_core claude doctor "$@" ;;
+        skills) shift; run_python_core claude skills "$@" ;;
         run) shift; run_python_core claude run "$@" ;;
         *) devctl_die "unknown claude subcommand: $1 (devctl help)" ;;
       esac
+      ;;
+    rules)
+      shift
+      run_python_core rules "$@"
       ;;
     app)
       shift
@@ -208,7 +213,7 @@ main() {
       run_script "$OPS/run.sh" "$@"
       ;;
     *)
-      devctl_die "未知命令: $1（devctl help）"
+      devctl_die "unknown command: $1 (devctl help)"
       ;;
   esac
 }

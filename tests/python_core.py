@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import subprocess
 import sys
 import threading
@@ -24,6 +25,35 @@ from xflow.checks import (
 )
 from xflow.cli import build_parser, main, resolve_check_file
 from xflow.approval import check_local_review_file, require_remote_approval
+
+
+def write_rule_manifest(repo_root):
+    templates = Path(repo_root) / ".xflow" / "ops" / "workflow" / "templates"
+    templates.mkdir(parents=True)
+    (templates / "codex-agents.academic.md").write_text("codex rules\n", encoding="utf-8")
+    (templates / "cursorrules.academic").write_text("cursor rules\n", encoding="utf-8")
+    (templates / "ai-rules.json").write_text(
+        json.dumps(
+            {
+                "rules": [
+                    {
+                        "id": "codex",
+                        "target": "AGENTS.md",
+                        "template": "codex-agents.academic.md",
+                        "description": "Codex project instructions",
+                    },
+                    {
+                        "id": "cursor",
+                        "target": ".cursorrules",
+                        "template": "cursorrules.academic",
+                        "description": "Cursor project rules",
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return templates
 
 
 def write_local_review(
@@ -77,6 +107,84 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(context.repo_root, Path(tmp).resolve())
             self.assertEqual(context.tool_root, ROOT)
             self.assertEqual(context.product_line, "academic")
+
+    def test_shell_terminal_messages_are_ascii(self):
+        message_pattern = re.compile(r"\bdevctl_(?:info|warn|die)\s+(['\"])(.*?)\1")
+        offenders = []
+        for path in [ROOT / "devctl", *ROOT.glob("*.sh"), *ROOT.glob("*/*.sh"), *ROOT.glob("*/*/*.sh")]:
+            if not path.is_file():
+                continue
+            for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                for match in message_pattern.finditer(line):
+                    message = match.group(2)
+                    if not message.isascii():
+                        offenders.append(f"{path.relative_to(ROOT)}:{line_number}: {message}")
+        self.assertEqual(offenders, [])
+
+
+class RuleSyncTests(unittest.TestCase):
+    def test_rules_list_reads_workflow_manifest(self):
+        with TemporaryDirectory() as tmp:
+            write_rule_manifest(tmp)
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update({"DEVCTL_REPO_ROOT": tmp, "DEVCTL_PRODUCT_LINE": "academic"})
+                out = StringIO()
+                with redirect_stdout(out):
+                    result = main(["rules", "list"])
+                self.assertEqual(result, 0)
+                text = out.getvalue()
+                self.assertIn("codex\tAGENTS.md\tCodex project instructions", text)
+                self.assertIn("cursor\t.cursorrules\tCursor project rules", text)
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_rules_commands_are_registered_by_parser(self):
+        parser = build_parser()
+        args = parser.parse_args(["rules", "sync", "cursor"])
+        self.assertEqual(args.command, "rules")
+        self.assertEqual(args.rules_command, "sync")
+        self.assertEqual(args.rule_id, "cursor")
+
+    def test_rules_sync_can_add_cursor_after_codex_initialization(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            write_rule_manifest(repo)
+            (repo / "AGENTS.md").write_text("codex rules\n", encoding="utf-8")
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update({"DEVCTL_REPO_ROOT": str(repo), "DEVCTL_PRODUCT_LINE": "academic"})
+                out = StringIO()
+                with redirect_stdout(out):
+                    result = main(["rules", "sync", "cursor"])
+                self.assertEqual(result, 0)
+                self.assertEqual((repo / ".cursorrules").read_text(encoding="utf-8"), "cursor rules\n")
+                self.assertIn("synced cursor -> .cursorrules", out.getvalue())
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_rules_sync_refuses_to_overwrite_existing_different_file_without_force(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            write_rule_manifest(repo)
+            (repo / ".cursorrules").write_text("local edits\n", encoding="utf-8")
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update({"DEVCTL_REPO_ROOT": str(repo), "DEVCTL_PRODUCT_LINE": "academic"})
+                err = StringIO()
+                with redirect_stderr(err):
+                    result = main(["rules", "sync", "cursor"])
+                self.assertEqual(result, 1)
+                self.assertIn("--force", err.getvalue())
+                self.assertEqual((repo / ".cursorrules").read_text(encoding="utf-8"), "local edits\n")
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
 
 
 class CheckTests(unittest.TestCase):

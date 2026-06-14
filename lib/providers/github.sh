@@ -12,7 +12,7 @@ provider_init() {
     set +a
   fi
   GITHUB_TOKEN="${GITHUB_TOKEN:-${GITHUB_ACCESS_TOKEN:-${access_token:-${GITHUB_PRIVATE_TOKEN:-}}}}"
-  [[ -n "$GITHUB_TOKEN" ]] || devctl_die "未找到 GitHub Token。请设置 GITHUB_TOKEN 或写入 ${GITEE_ENV_FILE:-$HOME/gitee.env.local}"
+  [[ -n "$GITHUB_TOKEN" ]] || devctl_die "missing GitHub token: set GITHUB_TOKEN or write ${GITEE_ENV_FILE:-$HOME/gitee.env.local}"
 }
 
 devctl_github_repo_path() {
@@ -34,7 +34,7 @@ devctl_github_api() {
     -H "X-GitHub-Api-Version: 2022-11-28" \
     -H "User-Agent: xflow-devctl" \
     -G \
-    "$url" "$@")" || devctl_die "GitHub API 请求失败: $method $path"
+    "$url" "$@")" || devctl_die "GitHub API request failed: $method $path"
   if [[ "$http_code" -ge 400 ]]; then
     devctl_error "GitHub API ${http_code}: $(cat "$tmp")"
     rm -f "$tmp"
@@ -57,7 +57,7 @@ devctl_github_api_json() {
     -H "User-Agent: xflow-devctl" \
     -H 'Content-Type: application/json' \
     -d "$body" \
-    "$url")" || devctl_die "GitHub API 请求失败: $method $path"
+    "$url")" || devctl_die "GitHub API request failed: $method $path"
   if [[ "$http_code" -ge 400 ]]; then
     devctl_error "GitHub API ${http_code}: $(cat "$tmp")"
     rm -f "$tmp"

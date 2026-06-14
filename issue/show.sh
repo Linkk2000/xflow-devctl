@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/../lib/common.sh"
 
 number="${1:-}"
-[[ -n "$number" ]] || devctl_die "用法: devctl issue show <number>"
+[[ -n "$number" ]] || devctl_die "usage: devctl issue show <number>"
 
 devctl_need_cmd jq
 

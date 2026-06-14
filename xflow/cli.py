@@ -28,6 +28,7 @@ from .providers import (
     list_issues,
     show_issue,
 )
+from .rules import load_rule_entries, find_rule_entry, sync_rule
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -93,6 +94,14 @@ def build_parser() -> argparse.ArgumentParser:
     claude_run.add_argument("--file", type=Path)
     claude_run.add_argument("--output", type=Path)
     claude_run.add_argument("--dry-run", action="store_true")
+
+    rules = sub.add_parser("rules")
+    rules_sub = rules.add_subparsers(dest="rules_command")
+    rules_sub.add_parser("list")
+    rules_sync = rules_sub.add_parser("sync")
+    rules_sync.add_argument("rule_id", nargs="?")
+    rules_sync.add_argument("--all", action="store_true")
+    rules_sync.add_argument("--force", action="store_true")
     return parser
 
 
@@ -394,6 +403,29 @@ def run_claude(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_rules(args: argparse.Namespace) -> int:
+    context = RuntimeContext.from_env(Path(__file__).resolve().parents[1], os.environ)
+    try:
+        if args.rules_command == "list":
+            for entry in load_rule_entries(context.repo_root):
+                print(f"{entry.rule_id}\t{entry.target.as_posix()}\t{entry.description}")
+            return 0
+        if args.rules_command == "sync":
+            if args.all and args.rule_id:
+                raise ValueError("use either a rule id or --all, not both")
+            if not args.all and not args.rule_id:
+                raise ValueError("rules sync requires a rule id or --all")
+            entries = load_rule_entries(context.repo_root) if args.all else [find_rule_entry(context.repo_root, args.rule_id)]
+            for entry in entries:
+                target = sync_rule(context.repo_root, entry, force=args.force)
+                print(f"[INFO] synced {entry.rule_id} -> {target.relative_to(context.repo_root).as_posix()}")
+            return 0
+        raise ValueError(f"unknown rules subcommand: {args.rules_command}")
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -407,5 +439,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_git(args)
     if args.command == "claude":
         return run_claude(args)
+    if args.command == "rules":
+        return run_rules(args)
     parser.print_help()
     return 0
