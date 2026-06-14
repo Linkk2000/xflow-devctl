@@ -20,6 +20,7 @@ from xflow.checks import (
     check_claude_package,
     check_submodule_hygiene,
     check_tdd_result,
+    load_academicforge_skill_names,
 )
 from xflow.cli import build_parser, main, resolve_check_file
 from xflow.approval import check_local_review_file, require_remote_approval
@@ -270,7 +271,9 @@ class CheckTests(unittest.TestCase):
             path.write_text(
                 "# Claude Task Package\n\n"
                 "Issue: 1\n"
-                "AcademicForge Skill: paper-polish-workflow-skill@unknown\n"
+                "Claude Skill: peer-review\n"
+                "Skill Source: AcademicForge\n"
+                "Invocation: /peer-review\n"
                 "Input Files:\n"
                 "- draft.md: sha256-placeholder\n"
                 "Output File: .xflow/issues/issue-1/claude-result.md\n\n"
@@ -282,13 +285,109 @@ class CheckTests(unittest.TestCase):
             )
             check_claude_package(path)
 
+    def test_academicforge_catalog_is_a_verified_command_set(self):
+        names = load_academicforge_skill_names()
+        self.assertEqual(len(names), 271)
+        self.assertFalse(any(name.startswith("#") for name in names))
+        self.assertIn("peer-review", names)
+        self.assertIn("ppw-reviewer-simulation", names)
+        self.assertIn("paper-polish-workflow", names)
+        self.assertNotIn("paper-review", names)
+
+    def test_claude_package_accepts_another_verified_forge_skill(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".xflow" / "issues" / "issue-1" / "claude-task.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "# Claude Task Package\n\n"
+                "Issue: 1\n"
+                "Claude Skill: ppw-reviewer-simulation\n"
+                "Skill Source: AcademicForge\n"
+                "Invocation: /ppw-reviewer-simulation\n"
+                "Input Files:\n"
+                "- draft.md: sha256-placeholder\n"
+                "Output File: .xflow/issues/issue-1/claude-result.md\n\n"
+                "## Objective\nx\n\n"
+                "## Constraints\nx\n\n"
+                "## Required Output Format\nx\n\n"
+                "## Human Review Requirement\nx\n",
+                encoding="utf-8",
+            )
+            check_claude_package(path)
+
+    def test_claude_package_rejects_any_unknown_forge_skill_invocation(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".xflow" / "issues" / "issue-1" / "claude-task.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "# Claude Task Package\n\n"
+                "Issue: 1\n"
+                "Claude Skill: definitely-not-a-forge-skill\n"
+                "Skill Source: AcademicForge\n"
+                "Invocation: /definitely-not-a-forge-skill\n"
+                "Input Files:\n"
+                "- draft.md: sha256-placeholder\n"
+                "Output File: .xflow/issues/issue-1/claude-result.md\n\n"
+                "## Objective\nx\n\n"
+                "## Constraints\nx\n\n"
+                "## Required Output Format\nx\n\n"
+                "## Human Review Requirement\nx\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "unknown AcademicForge skill"):
+                check_claude_package(path)
+
+    def test_claude_package_rejects_skill_and_invocation_mismatch(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".xflow" / "issues" / "issue-1" / "claude-task.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "# Claude Task Package\n\n"
+                "Issue: 1\n"
+                "Claude Skill: peer-review\n"
+                "Skill Source: AcademicForge\n"
+                "Invocation: /ppw-reviewer-simulation\n"
+                "Input Files:\n"
+                "- draft.md: sha256-placeholder\n"
+                "Output File: .xflow/issues/issue-1/claude-result.md\n\n"
+                "## Objective\nx\n\n"
+                "## Constraints\nx\n\n"
+                "## Required Output Format\nx\n\n"
+                "## Human Review Requirement\nx\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "does not match Invocation"):
+                check_claude_package(path)
+
+    def test_claude_package_rejects_obsolete_academicforge_skill_field(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".xflow" / "issues" / "issue-1" / "claude-task.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "# Claude Task Package\n\n"
+                "Issue: 1\n"
+                "AcademicForge Skill: paper-polish-workflow-skill@unknown\n"
+                "Input Files:\n"
+                "- draft.md: sha256-placeholder\n"
+                "Output File: .xflow/issues/issue-1/claude-result.md\n\n"
+                "## Objective\nx\n\n"
+                "## Constraints\nx\n\n"
+                "## Required Output Format\nx\n\n"
+                "## Human Review Requirement\nx\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "obsolete Claude skill field"):
+                check_claude_package(path)
+
     def test_claude_package_accepts_explicit_file_without_issue(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "claude-task.md"
             path.write_text(
                 "# Claude Task Package\n\n"
                 "Issue: 1\n"
-                "AcademicForge Skill: paper-polish-workflow-skill@unknown\n"
+                "Claude Skill: peer-review\n"
+                "Skill Source: AcademicForge\n"
+                "Invocation: /peer-review\n"
                 "Input Files:\n"
                 "- draft.md: sha256-placeholder\n"
                 "Output File: .xflow/issues/issue-1/claude-result.md\n\n"
@@ -541,7 +640,9 @@ class ClaudeRunTests(unittest.TestCase):
         path.write_text(
             "# Claude Task Package\n\n"
             f"Issue: {issue}\n"
-            "AcademicForge Skill: paper-polish-workflow-skill@unknown\n"
+            "Claude Skill: peer-review\n"
+            "Skill Source: AcademicForge\n"
+            "Invocation: /peer-review\n"
             "Input Files:\n"
             "- draft.md: sha256-placeholder\n"
             f"Output File: .xflow/issues/issue-{issue}/claude-result.md\n\n"
@@ -550,11 +651,36 @@ class ClaudeRunTests(unittest.TestCase):
             "## Constraints\n"
             "Do not change citations.\n\n"
             "## Required Output Format\n"
-            "Return Markdown only.\n\n"
+            "## Summary\n"
+            "## Proposed Changes\n"
+            "## Risks\n"
+            "## Questions\n\n"
             "## Human Review Requirement\n"
             "Human review is required before using this output.\n",
             encoding="utf-8",
         )
+        return path
+
+    def install_forge_skill(self, repo, skill="peer-review"):
+        path = Path(repo) / ".claude" / "skills" / skill / "SKILL.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(f"# {skill}\n", encoding="utf-8")
+        return path
+
+    def install_official_layout_forge_skill(self, repo, skill="peer-review"):
+        path = (
+            Path(repo)
+            / ".claude"
+            / "skills"
+            / "academic-forge"
+            / "skills"
+            / "scientific-agent-skills"
+            / "skills"
+            / skill
+            / "SKILL.md"
+        )
+        path.parent.mkdir(parents=True)
+        path.write_text(f"# {skill}\n", encoding="utf-8")
         return path
 
     def test_claude_run_dry_run_validates_task_without_writing_output(self):
@@ -575,15 +701,34 @@ class ClaudeRunTests(unittest.TestCase):
                 os.environ.clear()
                 os.environ.update(original)
 
+    def test_claude_skills_lists_verified_catalog(self):
+        out = StringIO()
+        with redirect_stdout(out):
+            result = main(["claude", "skills"])
+        self.assertEqual(result, 0)
+        text = out.getvalue()
+        self.assertIn("peer-review", text)
+        self.assertIn("ppw-reviewer-simulation", text)
+        self.assertNotIn("paper-review", text)
+
     def test_claude_run_executes_configured_command_and_writes_output(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             self.write_claude_task(repo)
+            self.install_forge_skill(repo)
             fake = repo / "fake_claude.py"
             fake.write_text(
                 "import sys\n"
                 "prompt = sys.argv[sys.argv.index('-p') + 1]\n"
+                "print('## Summary')\n"
                 "print('CLAUDE_RESULT')\n"
+                "print('## Proposed Changes')\n"
+                "print('- none')\n"
+                "print('## Risks')\n"
+                "print('- none')\n"
+                "print('## Questions')\n"
+                "print('- none')\n"
+                "print('HAS_INVOCATION=' + str(prompt.startswith('/peer-review')))\n"
                 "print('HAS_OBJECTIVE=' + str('## Objective' in prompt))\n",
                 encoding="utf-8",
             )
@@ -602,7 +747,209 @@ class ClaudeRunTests(unittest.TestCase):
                 output = repo / ".xflow" / "issues" / "issue-1" / "claude-result.md"
                 self.assertTrue(output.exists())
                 self.assertIn("CLAUDE_RESULT", output.read_text(encoding="utf-8"))
+                self.assertIn("HAS_INVOCATION=True", output.read_text(encoding="utf-8"))
                 self.assertIn("HAS_OBJECTIVE=True", output.read_text(encoding="utf-8"))
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_claude_run_rejects_official_nested_layout_without_flat_skill(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.write_claude_task(repo)
+            self.install_official_layout_forge_skill(repo)
+            fake = repo / "fake_claude.py"
+            fake.write_text(
+                "print('## Summary')\n"
+                "print('ok')\n"
+                "print('## Proposed Changes')\n"
+                "print('- none')\n"
+                "print('## Risks')\n"
+                "print('- none')\n"
+                "print('## Questions')\n"
+                "print('- none')\n",
+                encoding="utf-8",
+            )
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "DEVCTL_REPO_ROOT": str(repo),
+                        "DEVCTL_PRODUCT_LINE": "academic",
+                        "DEVCTL_CLAUDE_COMMAND": f"{sys.executable} {fake}",
+                    }
+                )
+                err = StringIO()
+                with redirect_stderr(err):
+                    result = main(["claude", "run", "--issue", "1"])
+                self.assertEqual(result, 1)
+                self.assertIn("not Claude-resolvable", err.getvalue())
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_claude_run_preserves_skill_invocation_arguments(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            task = self.write_claude_task(repo)
+            text = task.read_text(encoding="utf-8").replace(
+                "Invocation: /peer-review",
+                "Invocation: /peer-review focus=methodology severity=major",
+            )
+            task.write_text(text, encoding="utf-8")
+            self.install_forge_skill(repo)
+            fake = repo / "fake_claude.py"
+            fake.write_text(
+                "import sys\n"
+                "prompt = sys.argv[sys.argv.index('-p') + 1]\n"
+                "print('## Summary')\n"
+                "print(prompt.splitlines()[0])\n"
+                "print('## Proposed Changes')\n"
+                "print('- none')\n"
+                "print('## Risks')\n"
+                "print('- none')\n"
+                "print('## Questions')\n"
+                "print('- none')\n",
+                encoding="utf-8",
+            )
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "DEVCTL_REPO_ROOT": str(repo),
+                        "DEVCTL_PRODUCT_LINE": "academic",
+                        "DEVCTL_CLAUDE_COMMAND": f"{sys.executable} {fake}",
+                    }
+                )
+                result = main(["claude", "run", "--issue", "1"])
+                self.assertEqual(result, 0)
+                output = repo / ".xflow" / "issues" / "issue-1" / "claude-result.md"
+                self.assertIn("/peer-review focus=methodology severity=major", output.read_text(encoding="utf-8"))
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_claude_run_appends_configured_cli_arguments_before_prompt(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.write_claude_task(repo)
+            self.install_forge_skill(repo)
+            seen = repo / "seen-args.txt"
+            fake = repo / "fake_claude.py"
+            fake.write_text(
+                "import pathlib, sys\n"
+                f"pathlib.Path({str(seen)!r}).write_text('\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+                "print('## Summary')\n"
+                "print('ok')\n"
+                "print('## Proposed Changes')\n"
+                "print('- none')\n"
+                "print('## Risks')\n"
+                "print('- none')\n"
+                "print('## Questions')\n"
+                "print('- none')\n",
+                encoding="utf-8",
+            )
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "DEVCTL_REPO_ROOT": str(repo),
+                        "DEVCTL_PRODUCT_LINE": "academic",
+                        "DEVCTL_CLAUDE_COMMAND": f"{sys.executable} {fake}",
+                        "DEVCTL_CLAUDE_ARGS": "--model sonnet --permission-mode dontAsk",
+                    }
+                )
+                result = main(["claude", "run", "--issue", "1"])
+                self.assertEqual(result, 0)
+                args = seen.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(args[:4], ["--model", "sonnet", "--permission-mode", "dontAsk"])
+                self.assertIn("-p", args)
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_claude_run_rejects_generic_success_output(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.write_claude_task(repo)
+            self.install_forge_skill(repo)
+            fake = repo / "fake_claude.py"
+            fake.write_text(
+                "print('I can help with academic writing. What would you like me to do?')\n",
+                encoding="utf-8",
+            )
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "DEVCTL_REPO_ROOT": str(repo),
+                        "DEVCTL_PRODUCT_LINE": "academic",
+                        "DEVCTL_CLAUDE_COMMAND": f"{sys.executable} {fake}",
+                    }
+                )
+                err = StringIO()
+                with redirect_stderr(err):
+                    result = main(["claude", "run", "--issue", "1"])
+                self.assertEqual(result, 1)
+                self.assertIn("Claude output appears non-actionable", err.getvalue())
+                self.assertFalse((repo / ".xflow" / "issues" / "issue-1" / "claude-result.md").exists())
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_claude_run_rejects_missing_academicforge_install(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.write_claude_task(repo)
+            fake = repo / "fake_claude.py"
+            fake.write_text("print('## Summary')\n", encoding="utf-8")
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "DEVCTL_REPO_ROOT": str(repo),
+                        "DEVCTL_PRODUCT_LINE": "academic",
+                        "DEVCTL_CLAUDE_COMMAND": f"{sys.executable} {fake}",
+                    }
+                )
+                err = StringIO()
+                with redirect_stderr(err):
+                    result = main(["claude", "run", "--issue", "1"])
+                self.assertEqual(result, 1)
+                self.assertIn("AcademicForge skill is not installed", err.getvalue())
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_claude_run_rejects_missing_installed_child_skill(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.write_claude_task(repo)
+            root = repo / ".claude" / "skills" / "academic-forge" / "SKILL.md"
+            root.parent.mkdir(parents=True)
+            root.write_text("# AcademicForge\n", encoding="utf-8")
+            fake = repo / "fake_claude.py"
+            fake.write_text("print('## Summary')\n", encoding="utf-8")
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "DEVCTL_REPO_ROOT": str(repo),
+                        "DEVCTL_PRODUCT_LINE": "academic",
+                        "DEVCTL_CLAUDE_COMMAND": f"{sys.executable} {fake}",
+                    }
+                )
+                err = StringIO()
+                with redirect_stderr(err):
+                    result = main(["claude", "run", "--issue", "1"])
+                self.assertEqual(result, 1)
+                self.assertIn("not Claude-resolvable", err.getvalue())
             finally:
                 os.environ.clear()
                 os.environ.update(original)
@@ -633,12 +980,12 @@ class ClaudeRunTests(unittest.TestCase):
                 self.assertIn("claude_cli: ok", text)
                 self.assertIn("academicforge: missing", text)
                 self.assertIn("No installation was performed.", text)
-                self.assertIn("claude mcp add academicforge npx @hughyau/academicforge@latest", text)
+                self.assertIn(".claude", text)
             finally:
                 os.environ.clear()
                 os.environ.update(original)
 
-    def test_claude_doctor_accepts_registered_academicforge(self):
+    def test_claude_doctor_rejects_mcp_config_without_skill_directory(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
             fake = repo / "fake_claude.py"
@@ -659,10 +1006,66 @@ class ClaudeRunTests(unittest.TestCase):
                 out = StringIO()
                 with redirect_stdout(out):
                     result = main(["claude", "doctor"])
+                self.assertEqual(result, 1)
+                text = out.getvalue()
+                self.assertIn("claude_cli: ok", text)
+                self.assertIn("academicforge: missing", text)
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_claude_doctor_accepts_project_flat_academicforge_skill(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            fake = repo / "fake_claude.py"
+            fake.write_text("print('fake')\n", encoding="utf-8")
+            skill = self.install_forge_skill(repo)
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "DEVCTL_REPO_ROOT": str(repo),
+                        "DEVCTL_PRODUCT_LINE": "academic",
+                        "DEVCTL_CLAUDE_COMMAND": f"{sys.executable} {fake}",
+                    }
+                )
+                out = StringIO()
+                with redirect_stdout(out):
+                    result = main(["claude", "doctor"])
                 self.assertEqual(result, 0)
                 text = out.getvalue()
                 self.assertIn("claude_cli: ok", text)
                 self.assertIn("academicforge: ok", text)
+                self.assertIn(str(skill), text)
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_claude_doctor_rejects_official_nested_layout_without_flat_skill(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            fake = repo / "fake_claude.py"
+            fake.write_text("print('fake')\n", encoding="utf-8")
+            child = self.install_official_layout_forge_skill(repo)
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "DEVCTL_REPO_ROOT": str(repo),
+                        "DEVCTL_PRODUCT_LINE": "academic",
+                        "DEVCTL_CLAUDE_COMMAND": f"{sys.executable} {fake}",
+                    }
+                )
+                out = StringIO()
+                with redirect_stdout(out):
+                    result = main(["claude", "doctor"])
+                self.assertEqual(result, 1)
+                text = out.getvalue()
+                self.assertIn("academicforge: missing", text)
+                self.assertIn("academicforge_source_root", text)
+                self.assertIn(str(child.parents[4]), text)
             finally:
                 os.environ.clear()
                 os.environ.update(original)

@@ -136,7 +136,9 @@ cat >"$tmpdir/.xflow/issues/issue-1/claude-task.md" <<'EOF'
 # Claude Task Package
 
 Issue: 1
-AcademicForge Skill: paper-polish-workflow-skill@unknown
+Claude Skill: peer-review
+Skill Source: AcademicForge
+Invocation: /peer-review
 Input Files:
 - draft.md: sha256-placeholder
 Output File: .xflow/issues/issue-1/claude-result.md

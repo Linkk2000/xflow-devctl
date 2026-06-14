@@ -38,7 +38,9 @@ TDD_RESULT_REQUIRED = [
 CLAUDE_PACKAGE_REQUIRED = [
     "# Claude Task Package",
     "Issue:",
-    "AcademicForge Skill:",
+    "Claude Skill:",
+    "Skill Source:",
+    "Invocation:",
     "Input Files:",
     "Output File:",
     "## Objective",
@@ -46,6 +48,8 @@ CLAUDE_PACKAGE_REQUIRED = [
     "## Required Output Format",
     "## Human Review Requirement",
 ]
+
+ACADEMICFORGE_CATALOG = Path(__file__).resolve().parent / "catalogs" / "academicforge-skills.txt"
 
 ACADEMIC_MR_REQUIRED = [
     "<!-- xflow: academic-mr-draft -->",
@@ -95,6 +99,68 @@ def require_template(path: Path, required: list[str]) -> None:
             raise ValueError(f"missing required text '{needle}' in {path}")
 
 
+def load_academicforge_skill_names(catalog: Path = ACADEMICFORGE_CATALOG) -> set[str]:
+    if not catalog.is_file():
+        raise ValueError(f"missing AcademicForge skill catalog: {catalog}")
+    names: set[str] = set()
+    for raw_line in catalog.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip().lstrip("\ufeff")
+        if not line or line.startswith("#"):
+            continue
+        names.add(line)
+    if not names:
+        raise ValueError(f"empty AcademicForge skill catalog: {catalog}")
+    return names
+
+
+def _field_value(text: str, field: str) -> str:
+    match = re.search(rf"(?m)^{re.escape(field)}\s*(.+?)\s*$", text)
+    return match.group(1).strip() if match else ""
+
+
+def _invocation_skill(invocation: str) -> str:
+    match = re.match(r"^/([A-Za-z0-9][A-Za-z0-9_.-]*)(?:\s|$)", invocation.strip())
+    if not match:
+        raise ValueError("Invocation must start with an explicit Claude skill command such as /peer-review")
+    return match.group(1)
+
+
+def reject_obsolete_claude_skill_field(path: Path) -> None:
+    text = read_text_strict(path)
+    if re.search(r"(?m)^AcademicForge Skill:", text):
+        raise ValueError("obsolete Claude skill field in task package: use Claude Skill, Skill Source, and Invocation")
+
+
+def validate_claude_skill_invocation(path: Path) -> None:
+    text = read_text_strict(path)
+    reject_obsolete_claude_skill_field(path)
+    skill = _field_value(text, "Claude Skill:")
+    source = _field_value(text, "Skill Source:")
+    invocation = _field_value(text, "Invocation:")
+    invocation_skill = _invocation_skill(invocation)
+    if skill != invocation_skill:
+        raise ValueError(f"Claude Skill '{skill}' does not match Invocation '/{invocation_skill}'")
+
+    if "academicforge" in source.lower():
+        allowed = load_academicforge_skill_names()
+        if skill not in allowed:
+            raise ValueError(f"unknown AcademicForge skill '{skill}': update the catalog or choose a verified skill")
+
+
+def claude_invocation_from_package(path: Path) -> str:
+    text = read_text_strict(path)
+    invocation = _field_value(text, "Invocation:")
+    _invocation_skill(invocation)
+    return invocation
+
+
+def claude_skill_source_from_package(path: Path) -> tuple[str, str]:
+    text = read_text_strict(path)
+    skill = _field_value(text, "Claude Skill:")
+    source = _field_value(text, "Skill Source:")
+    return skill, source
+
+
 def reject_obsolete_academic_target_branch(path: Path) -> None:
     text = read_text_strict(path)
     if re.search(r"(?m)^\s*Target Branch:\s*academic\s*$", text):
@@ -122,7 +188,9 @@ def check_tdd_result(path: Path) -> None:
 
 
 def check_claude_package(path: Path) -> None:
+    reject_obsolete_claude_skill_field(path)
     require_template(path, CLAUDE_PACKAGE_REQUIRED)
+    validate_claude_skill_invocation(path)
 
 
 def check_academic_mr(path: Path) -> None:

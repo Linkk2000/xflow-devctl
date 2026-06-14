@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from .checks import check_claude_package
+from .checks import (
+    check_claude_package,
+    claude_invocation_from_package,
+    claude_skill_source_from_package,
+    load_academicforge_skill_names,
+)
 from .env import RuntimeContext
 
 
@@ -23,8 +28,20 @@ class ClaudeRunResult:
 class ClaudeDoctorResult:
     claude_cli_ok: bool
     academicforge_ok: bool
-    config_file: Path
-    install_command: str = "claude mcp add academicforge npx @hughyau/academicforge@latest"
+    source_root: Path | None
+    resolvable_skills: tuple[Path, ...]
+    checked_skill_roots: tuple[Path, ...]
+    install_hint: str = (
+        "Install or mirror AcademicForge skills into Claude-resolvable paths such as "
+        ".claude/skills/peer-review/SKILL.md."
+    )
+
+
+GENERIC_CLAUDE_OUTPUT_MARKERS = (
+    "unknown command:",
+    "what would you like me to do",
+    "what would you like me to help",
+)
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -61,38 +78,136 @@ def resolve_claude_command(env: Mapping[str, str]) -> list[str]:
     command = env.get("DEVCTL_CLAUDE_COMMAND", "claude").strip()
     if not command:
         raise ValueError("DEVCTL_CLAUDE_COMMAND is empty")
-    return shlex.split(command, posix=os.name != "nt")
+    parts = shlex.split(command, posix=os.name != "nt")
+    executable = parts[0]
+    if not Path(executable).is_absolute():
+        resolved = shutil.which(executable)
+        if resolved:
+            parts[0] = resolved
+    return parts
 
 
-def resolve_claude_config(env: Mapping[str, str]) -> Path:
-    configured = env.get("DEVCTL_CLAUDE_CONFIG", "").strip()
+def resolve_claude_args(env: Mapping[str, str]) -> list[str]:
+    args = env.get("DEVCTL_CLAUDE_ARGS", "").strip()
+    if not args:
+        return []
+    return shlex.split(args, posix=os.name != "nt")
+
+
+def _safe_home() -> Path | None:
+    try:
+        return Path.home()
+    except RuntimeError:
+        return None
+
+
+def _configured_path(env: Mapping[str, str], name: str) -> Path | None:
+    configured = env.get(name, "").strip()
     if configured:
         return Path(configured).expanduser().resolve()
-    home = Path.home()
-    return (home / ".claude.json").resolve()
+    return None
 
 
-def is_academicforge_registered(config_file: Path) -> bool:
-    if not config_file.exists():
+def academicforge_install_candidates(env: Mapping[str, str]) -> tuple[Path, ...]:
+    candidates: list[Path] = []
+    explicit = _configured_path(env, "DEVCTL_ACADEMICFORGE_SKILL_FILE")
+    if explicit:
+        candidates.append(explicit.parent)
+    explicit_dir = _configured_path(env, "DEVCTL_ACADEMICFORGE_SKILL_DIR")
+    if explicit_dir:
+        candidates.append(explicit_dir)
+    repo_root = _configured_path(env, "DEVCTL_REPO_ROOT")
+    if repo_root:
+        candidates.append(repo_root / ".claude" / "skills" / "academic-forge")
+    home = _safe_home()
+    if home:
+        candidates.append(home / ".claude" / "skills" / "academic-forge")
+    return tuple(dict.fromkeys(path.resolve() for path in candidates))
+
+
+def claude_skill_roots(env: Mapping[str, str]) -> tuple[Path, ...]:
+    candidates: list[Path] = []
+    repo_root = _configured_path(env, "DEVCTL_REPO_ROOT")
+    if repo_root:
+        candidates.append(repo_root / ".claude" / "skills")
+    home = _safe_home()
+    if home:
+        candidates.append(home / ".claude" / "skills")
+    return tuple(dict.fromkeys(path.resolve() for path in candidates))
+
+
+def _has_skill_file(root: Path) -> bool:
+    if not root.is_dir():
         return False
-    try:
-        return "academicforge" in config_file.read_text(encoding="utf-8", errors="replace").lower()
-    except OSError:
-        return False
+    return any(root.rglob("SKILL.md"))
+
+
+def find_academicforge_install_root(env: Mapping[str, str]) -> Path | None:
+    for candidate in academicforge_install_candidates(env):
+        if _has_skill_file(candidate):
+            return candidate
+    return None
+
+
+def find_resolvable_claude_skill(env: Mapping[str, str], skill_name: str) -> Path | None:
+    for root in claude_skill_roots(env):
+        candidate = root / skill_name / "SKILL.md"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def find_resolvable_academicforge_skills(env: Mapping[str, str]) -> tuple[Path, ...]:
+    names = load_academicforge_skill_names()
+    found: list[Path] = []
+    for root in claude_skill_roots(env):
+        if not root.is_dir():
+            continue
+        for child in root.iterdir():
+            if child.is_dir() and child.name in names and (child / "SKILL.md").is_file():
+                found.append((child / "SKILL.md").resolve())
+    return tuple(sorted(dict.fromkeys(found)))
+
+
+def find_installed_academicforge_skill(env: Mapping[str, str], skill_name: str) -> Path | None:
+    return find_resolvable_claude_skill(env, skill_name)
+
+
+def require_installed_academicforge_skill(env: Mapping[str, str], skill_name: str) -> None:
+    source_root = find_academicforge_install_root(env)
+    if find_resolvable_claude_skill(env, skill_name) is None:
+        if source_root is not None:
+            raise ValueError(
+                f"installed AcademicForge source exists at {source_root}, but /{skill_name} is not Claude-resolvable. "
+                f"Mirror or copy it to .claude/skills/{skill_name}/SKILL.md before running Claude."
+            )
+        raise ValueError(
+            f"AcademicForge skill is not installed in a Claude-resolvable path: /{skill_name}. "
+            "Run `devctl claude doctor` and obtain human approval before installing or mirroring skills."
+        )
+
+
+def validate_claude_output(text: str) -> None:
+    if not text.strip():
+        raise ValueError("Claude output is empty")
+    lowered = text.lower()
+    for marker in GENERIC_CLAUDE_OUTPUT_MARKERS:
+        if marker in lowered:
+            raise ValueError(f"Claude output appears non-actionable: {marker}")
 
 
 def run_claude_doctor(env: Mapping[str, str]) -> ClaudeDoctorResult:
     command = resolve_claude_command(env)
     executable = command[0]
-    if Path(executable).is_absolute():
-        cli_ok = Path(executable).exists()
-    else:
-        cli_ok = shutil.which(executable) is not None
-    config = resolve_claude_config(env)
+    cli_ok = Path(executable).exists() if Path(executable).is_absolute() else shutil.which(executable) is not None
+    source_root = find_academicforge_install_root(env)
+    resolvable_skills = find_resolvable_academicforge_skills(env)
     return ClaudeDoctorResult(
         claude_cli_ok=cli_ok,
-        academicforge_ok=is_academicforge_registered(config),
-        config_file=config,
+        academicforge_ok=bool(resolvable_skills),
+        source_root=source_root,
+        resolvable_skills=resolvable_skills,
+        checked_skill_roots=claude_skill_roots(env),
     )
 
 
@@ -112,11 +227,17 @@ def run_claude_task(
     if dry_run:
         return ClaudeRunResult(task_file=task_file, output_file=resolved_output, dry_run=True)
 
-    prompt = task_file.read_text(encoding="utf-8")
+    task_text = task_file.read_text(encoding="utf-8")
+    invocation = claude_invocation_from_package(task_file)
+    skill_name, skill_source = claude_skill_source_from_package(task_file)
+    if "academicforge" in skill_source.lower():
+        require_installed_academicforge_skill(env, skill_name)
+    prompt = f"{invocation}\n\n{task_text}"
     command = resolve_claude_command(env)
+    args = resolve_claude_args(env)
     try:
         completed = subprocess.run(
-            [*command, "-p", prompt],
+            [*command, *args, "-p", prompt],
             cwd=context.repo_root,
             text=True,
             encoding="utf-8",
@@ -128,9 +249,12 @@ def run_claude_task(
         raise ValueError("Claude CLI not found. Install or expose `claude`, or set DEVCTL_CLAUDE_COMMAND.") from exc
 
     if completed.returncode != 0:
-        stderr = completed.stderr.strip() or "no stderr"
-        raise ValueError(f"Claude CLI failed with exit code {completed.returncode}: {stderr}")
+        stderr = completed.stderr.strip()
+        stdout = completed.stdout.strip()
+        detail = stderr or stdout or "no output"
+        raise ValueError(f"Claude CLI failed with exit code {completed.returncode}: {detail}")
 
+    validate_claude_output(completed.stdout)
     resolved_output.parent.mkdir(parents=True, exist_ok=True)
     resolved_output.write_text(completed.stdout, encoding="utf-8")
     return ClaudeRunResult(task_file=task_file, output_file=resolved_output, dry_run=False)
