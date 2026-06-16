@@ -432,9 +432,7 @@ def check_current_task(repo_root: Path, issue: str | None = None) -> None:
         raise ValueError("current-task missing State field")
 
     pr_number = _git_config_value(repo_root, "devctl.pr")
-    lowered = text.lower()
-    mentions_forbidden_pr = "forbidden" in lowered and ("pr" in lowered or "mr" in lowered or "push" in lowered)
-    if pr_number and (state not in POST_PR_STATES or mentions_forbidden_pr):
+    if pr_number and state not in POST_PR_STATES:
         raise ValueError(
             "stale current-task: PR metadata exists but current-task still describes a pre-PR or forbidden remote-write state. "
             "Update .xflow/current-task.md from .xflow/issues/issue-<id>/state-update-suggestion.md."

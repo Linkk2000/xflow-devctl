@@ -337,6 +337,23 @@ class CheckTests(unittest.TestCase):
             subprocess.run(["git", "-C", str(repo), "config", "--local", "devctl.pr", "12"], check=True)
             check_current_task(repo, "7")
 
+    def test_current_task_allows_post_pr_warning_not_to_create_another_pr(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.init_scope_repo(repo)
+            current = repo / ".xflow" / "current-task.md"
+            current.parent.mkdir(parents=True)
+            current.write_text(
+                "# Current Task\n\n"
+                "Issue: 7\n"
+                "State: S9_REMOTE_REVIEW_AND_CI\n\n"
+                "Forbidden Actions:\n"
+                "- create another PR only to record local metadata\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(repo), "config", "--local", "devctl.pr", "12"], check=True)
+            check_current_task(repo, "7")
+
     def test_check_current_task_cli_uses_repo_root(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
