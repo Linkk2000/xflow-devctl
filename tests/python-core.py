@@ -35,6 +35,30 @@ def run_devctl(repo_root: Path, *args: str, expect: int = 0) -> subprocess.Compl
     return result
 
 
+def run_devctl_with_env(repo_root: Path, extra_env: dict[str, str], *args: str, expect: int = 0) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.update(extra_env)
+    env["DEVCTL_REPO_ROOT"] = str(repo_root)
+    env["DEVCTL_TOOL_ROOT"] = str(OPS_ROOT)
+    env["DEVCTL_OPS_ROOT"] = str(OPS_ROOT)
+    env["PYTHONPATH"] = str(OPS_ROOT)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env.setdefault("DEVCTL_SKIP_PROVIDER_LOAD", "1")
+    result = subprocess.run(
+        [sys.executable, "-m", "xflow", *args],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != expect:
+        print(result.stdout)
+        print(result.stderr, file=sys.stderr)
+        raise AssertionError(f"expected exit {expect}, got {result.returncode}: {' '.join(args)}")
+    return result
+
+
 def write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8", newline="\n")
@@ -98,6 +122,16 @@ Closes #1
         )
 
         run_devctl(repo, "preflight")
+
+        env_file = repo / ".xflow" / "local" / "env.local"
+        write(env_file, "GITHUB_TOKEN=secret-token-value\nGITEE_TOKEN=other-secret\n")
+        preflight = run_devctl_with_env(repo, {"XFLOW_ENV_FILE": str(env_file)}, "preflight")
+        assert f"env_file: {env_file}" in preflight.stdout
+        assert "GITHUB_TOKEN=SET" in preflight.stdout
+        assert "GITEE_TOKEN=SET" in preflight.stdout
+        assert "secret-token-value" not in preflight.stdout
+        assert "other-secret" not in preflight.stdout
+
         run_devctl(repo, "check", "issue-draft", "--file", str(issue_file))
         run_devctl(repo, "check", "mr-draft", "--issue", "1")
 

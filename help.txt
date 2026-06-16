@@ -42,6 +42,9 @@ App:
   devctl app status
 
 Config:
+  XFLOW_ENV_FILE            explicit env file for one run
+  ~/.xflow/env.local        preferred user-level env file
+  ~/gitee.env.local         legacy env file fallback
   GITHUB_TOKEN              GitHub personal access token
   GITEE_TOKEN               Gitee personal access token
   XFLOW_PLATFORM            github|gitee

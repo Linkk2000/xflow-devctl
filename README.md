@@ -28,3 +28,16 @@ devctl migrate inspect
 
 PowerShell users should prefer `devctl.ps1`, which invokes the Python core and
 sets `PYTHONDONTWRITEBYTECODE=1` to avoid `__pycache__` byproducts.
+
+User-level parameters should live in `~/.xflow/env.local`:
+
+```text
+GITHUB_TOKEN=...
+GITEE_TOKEN=...
+XFLOW_PLATFORM=github
+```
+
+`XFLOW_ENV_FILE` may point at an explicit env file for one run. The legacy
+`~/gitee.env.local` path remains a compatibility fallback. `devctl preflight`
+prints which env files were loaded and whether tokens are set, but never prints
+token values.

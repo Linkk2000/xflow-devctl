@@ -8,7 +8,7 @@ from pathlib import Path
 
 from . import approval, providers, rules
 from .checks import check_issue_draft, check_mr_draft, check_submodule_hygiene
-from .env import RuntimeContext, python_version
+from .env import RuntimeContext, load_env_files, python_version, token_status_lines
 from .migration import inspect, write_wrappers
 from .paths import default_issue_file
 
@@ -106,6 +106,14 @@ def run_preflight() -> int:
     print(f"tool_root: {ctx.tool_root}")
     print(f"repo_root: {ctx.repo_root}")
     print(f"product_line: {ctx.product_line or 'unset'}")
+    loaded = os.environ.get("XFLOW_LOADED_ENV_FILES", "")
+    if loaded:
+        for path in loaded.split(os.pathsep):
+            print(f"env_file: {path}")
+    else:
+        print("env_file: <none>")
+    for line in token_status_lines(os.environ):
+        print(line)
     return 0
 
 
@@ -313,6 +321,7 @@ def run_migrate(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_env_files(os.environ)
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
