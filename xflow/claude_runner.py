@@ -91,7 +91,19 @@ def resolve_claude_args(env: Mapping[str, str]) -> list[str]:
     args = env.get("DEVCTL_CLAUDE_ARGS", "").strip()
     if not args:
         return []
-    return shlex.split(args, posix=os.name != "nt")
+    parsed = shlex.split(args, posix=os.name != "nt")
+    return ["" if arg in ('""', "''") else arg for arg in parsed]
+
+
+def resolve_claude_timeout(env: Mapping[str, str]) -> float:
+    raw = env.get("DEVCTL_CLAUDE_TIMEOUT_SECONDS", "300").strip()
+    try:
+        timeout = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"invalid DEVCTL_CLAUDE_TIMEOUT_SECONDS: {raw}") from exc
+    if timeout <= 0:
+        raise ValueError("DEVCTL_CLAUDE_TIMEOUT_SECONDS must be positive")
+    return timeout
 
 
 def _safe_home() -> Path | None:
@@ -235,6 +247,7 @@ def run_claude_task(
     prompt = f"{invocation}\n\n{task_text}"
     command = resolve_claude_command(env)
     args = resolve_claude_args(env)
+    timeout = resolve_claude_timeout(env)
     try:
         completed = subprocess.run(
             [*command, *args, "-p", prompt],
@@ -244,9 +257,15 @@ def run_claude_task(
             errors="replace",
             capture_output=True,
             check=False,
+            timeout=timeout,
         )
     except FileNotFoundError as exc:
         raise ValueError("Claude CLI not found. Install or expose `claude`, or set DEVCTL_CLAUDE_COMMAND.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(
+            f"Claude CLI timed out after {timeout:g} seconds. "
+            "Use DEVCTL_CLAUDE_ARGS to constrain tools or DEVCTL_CLAUDE_TIMEOUT_SECONDS to adjust the limit."
+        ) from exc
 
     if completed.returncode != 0:
         stderr = completed.stderr.strip()

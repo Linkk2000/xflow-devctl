@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Mapping
 
 from .approval import check_local_review_file, prepare_local_review_file, require_remote_approval
-from .claude_runner import run_claude_doctor, run_claude_task
+from .claude_runner import find_resolvable_claude_skill, run_claude_doctor, run_claude_task
 from .checks import (
     check_academic_issue,
     check_academic_mr,
@@ -418,7 +418,9 @@ def run_claude(args: argparse.Namespace) -> int:
             return 0 if doctor.claude_cli_ok and doctor.academicforge_ok else 1
         if args.claude_command == "skills":
             for name in sorted(load_academicforge_skill_names()):
-                print(name)
+                installed = find_resolvable_claude_skill(os.environ, name)
+                status = "installed" if installed else "missing"
+                print(f"{name}\t{status}\t{installed or ''}")
             return 0
         if args.claude_command != "run":
             raise ValueError(f"unknown claude subcommand: {args.claude_command}")

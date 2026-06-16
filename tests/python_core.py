@@ -1032,6 +1032,25 @@ class ClaudeRunTests(unittest.TestCase):
         self.assertIn("ppw-reviewer-simulation", text)
         self.assertNotIn("paper-review", text)
 
+    def test_claude_skills_marks_installed_and_missing_catalog_entries(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.install_forge_skill(repo, "literature-review")
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update({"DEVCTL_REPO_ROOT": str(repo), "DEVCTL_PRODUCT_LINE": "academic"})
+                out = StringIO()
+                with redirect_stdout(out):
+                    result = main(["claude", "skills"])
+                self.assertEqual(result, 0)
+                text = out.getvalue()
+                self.assertIn("literature-review\tinstalled\t", text)
+                self.assertIn("paper-lookup\tmissing\t", text)
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
     def test_claude_run_executes_configured_command_and_writes_output(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -1188,6 +1207,77 @@ class ClaudeRunTests(unittest.TestCase):
                 args = seen.read_text(encoding="utf-8").splitlines()
                 self.assertEqual(args[:4], ["--model", "sonnet", "--permission-mode", "dontAsk"])
                 self.assertIn("-p", args)
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_claude_run_normalizes_empty_quoted_cli_argument(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.write_claude_task(repo)
+            self.install_forge_skill(repo)
+            seen = repo / "seen-args.txt"
+            fake = repo / "fake_claude.py"
+            fake.write_text(
+                "import pathlib, sys\n"
+                f"pathlib.Path({str(seen)!r}).write_text('\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+                "print('## Summary')\n"
+                "print('ok')\n"
+                "print('## Proposed Changes')\n"
+                "print('- none')\n"
+                "print('## Risks')\n"
+                "print('- none')\n"
+                "print('## Questions')\n"
+                "print('- none')\n",
+                encoding="utf-8",
+            )
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "DEVCTL_REPO_ROOT": str(repo),
+                        "DEVCTL_PRODUCT_LINE": "academic",
+                        "DEVCTL_CLAUDE_COMMAND": f"{sys.executable} {fake}",
+                        "DEVCTL_CLAUDE_ARGS": '--tools "" --max-budget-usd 0.10',
+                    }
+                )
+                result = main(["claude", "run", "--issue", "1"])
+                self.assertEqual(result, 0)
+                args = seen.read_text(encoding="utf-8").splitlines()
+                self.assertEqual(args[:4], ["--tools", "", "--max-budget-usd", "0.10"])
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_claude_run_times_out_with_clear_error(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.write_claude_task(repo)
+            self.install_forge_skill(repo)
+            fake = repo / "slow_claude.py"
+            fake.write_text(
+                "import time\n"
+                "time.sleep(2)\n"
+                "print('too late')\n",
+                encoding="utf-8",
+            )
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update(
+                    {
+                        "DEVCTL_REPO_ROOT": str(repo),
+                        "DEVCTL_PRODUCT_LINE": "academic",
+                        "DEVCTL_CLAUDE_COMMAND": f"{sys.executable} {fake}",
+                        "DEVCTL_CLAUDE_TIMEOUT_SECONDS": "0.1",
+                    }
+                )
+                err = StringIO()
+                with redirect_stderr(err):
+                    result = main(["claude", "run", "--issue", "1"])
+                self.assertEqual(result, 1)
+                self.assertIn("Claude CLI timed out after", err.getvalue())
             finally:
                 os.environ.clear()
                 os.environ.update(original)
