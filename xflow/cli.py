@@ -21,6 +21,7 @@ from .checks import (
     load_academicforge_skill_names,
 )
 from .env import RuntimeContext, detect_python_runtime
+from .migration import inspect_migration, write_v2_wrapper_files
 from .paths import default_issue_file
 from .providers import (
     close_issue,
@@ -120,6 +121,11 @@ def build_parser() -> argparse.ArgumentParser:
     approval_prepare.add_argument("--command", dest="suggested_command")
     approval_prepare.add_argument("--reviewer", default="<human reviewer>")
     approval_prepare.add_argument("--force", action="store_true")
+
+    migrate = sub.add_parser("migrate")
+    migrate_sub = migrate.add_subparsers(dest="migrate_command")
+    migrate_sub.add_parser("inspect")
+    migrate_sub.add_parser("wrappers")
     return parser
 
 
@@ -474,6 +480,27 @@ def run_approval(args: argparse.Namespace) -> int:
         return 1
 
 
+def run_migrate(args: argparse.Namespace) -> int:
+    context = RuntimeContext.from_env(Path(__file__).resolve().parents[1], os.environ)
+    try:
+        if args.migrate_command == "inspect":
+            report = inspect_migration(context.repo_root)
+            print(f"legacy_ops_present: {'yes' if report.legacy_ops_present else 'no'}")
+            print(f"v2_ops_present: {'yes' if report.v2_ops_present else 'no'}")
+            for message in report.messages:
+                print(f"- {message}")
+            return 0
+        if args.migrate_command == "wrappers":
+            written = write_v2_wrapper_files(context.repo_root)
+            names = ", ".join(path.name for path in written)
+            print(f"[INFO] wrote devctl wrappers: {names}")
+            return 0
+        raise ValueError(f"unknown migrate subcommand: {args.migrate_command}")
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -491,5 +518,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_rules(args)
     if args.command == "approval":
         return run_approval(args)
+    if args.command == "migrate":
+        return run_migrate(args)
     parser.print_help()
     return 0

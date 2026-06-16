@@ -33,6 +33,7 @@ from xflow.approval import (
     require_remote_approval,
     sha256_file,
 )
+from xflow.migration import build_v2_wrapper_files, inspect_migration, write_v2_wrapper_files
 
 
 def write_rule_manifest(repo_root):
@@ -199,6 +200,66 @@ class RuleSyncTests(unittest.TestCase):
             finally:
                 os.environ.clear()
                 os.environ.update(original)
+
+
+class MigrationTests(unittest.TestCase):
+    def test_migration_inspect_detects_legacy_ops_layout(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "_ops" / "devctl").mkdir(parents=True)
+            (repo / "_ops" / "workflow").mkdir(parents=True)
+            (repo / ".gitmodules").write_text(
+                '[submodule "_ops/devctl"]\n'
+                "\tpath = _ops/devctl\n"
+                "\turl = https://github.com/Linkk2000/xflow-devctl.git\n"
+                '[submodule "_ops/workflow"]\n'
+                "\tpath = _ops/workflow\n"
+                "\turl = https://github.com/Linkk2000/xflow-skills.git\n",
+                encoding="utf-8",
+            )
+
+            report = inspect_migration(repo)
+
+            self.assertTrue(report.legacy_ops_present)
+            self.assertFalse(report.v2_ops_present)
+            self.assertIn("legacy _ops layout detected", report.messages)
+            self.assertIn("https submodule URL detected", report.messages)
+
+    def test_v2_wrappers_are_native_and_do_not_install_academicforge(self):
+        files = build_v2_wrapper_files()
+        ps1 = files["devctl.ps1"]
+        bash = files["devctl"]
+
+        self.assertIn(".xflow\\ops\\devctl", ps1)
+        self.assertIn("python -m xflow @args", ps1)
+        self.assertNotIn("bash $RealDevctl", ps1)
+        self.assertNotIn("claude mcp add", ps1)
+        self.assertIn(".xflow/ops/devctl/devctl", bash)
+        self.assertNotIn("claude mcp add", bash)
+
+    def test_migrate_wrappers_cli_writes_reviewable_files(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update({"DEVCTL_REPO_ROOT": str(repo), "DEVCTL_PRODUCT_LINE": "academic"})
+                out = StringIO()
+                with redirect_stdout(out):
+                    result = main(["migrate", "wrappers"])
+                self.assertEqual(result, 0)
+                self.assertIn("wrote devctl wrappers", out.getvalue())
+                self.assertIn("python -m xflow @args", (repo / "devctl.ps1").read_text(encoding="utf-8"))
+                self.assertIn(".xflow/ops/devctl/devctl", (repo / "devctl").read_text(encoding="utf-8"))
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_migrate_commands_are_registered_by_parser(self):
+        parser = build_parser()
+        args = parser.parse_args(["migrate", "inspect"])
+        self.assertEqual(args.command, "migrate")
+        self.assertEqual(args.migrate_command, "inspect")
 
 
 class CheckTests(unittest.TestCase):

@@ -200,6 +200,10 @@ main() {
       shift
       run_python_core rules "$@"
       ;;
+    migrate)
+      shift
+      run_python_core migrate "$@"
+      ;;
     approval)
       shift
       run_python_core approval "$@"

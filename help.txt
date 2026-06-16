@@ -76,6 +76,16 @@ AI rule entrypoints:
   adding Cursor's .cursorrules after Codex created AGENTS.md. Existing edited
   files are not overwritten unless --force is used after human review.
 
+Migration helpers:
+  devctl migrate inspect
+  devctl migrate wrappers
+
+  inspect reports whether the paper repository still uses the legacy _ops
+  layout, HTTPS submodule URLs, missing .xflow/ops paths, or missing
+  ignore = untracked. wrappers writes v2 root devctl/devctl.ps1 wrappers that
+  point to .xflow/ops/devctl. The Windows wrapper calls Python directly and
+  does not call bash, WSL, Claude, or any installer.
+
 Local approval:
   devctl approval prepare --issue N --action ACTION --file F [--command C] [--force]
 
