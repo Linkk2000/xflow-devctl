@@ -192,6 +192,7 @@ main() {
       case "$1" in
         doctor) shift; run_python_core claude doctor "$@" ;;
         skills) shift; run_python_core claude skills "$@" ;;
+        setup) shift; run_python_core claude setup "$@" ;;
         run) shift; run_python_core claude run "$@" ;;
         *) devctl_die "unknown claude subcommand: $1 (devctl help)" ;;
       esac

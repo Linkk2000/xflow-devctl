@@ -9,6 +9,13 @@ from typing import Mapping
 
 from .approval import check_local_review_file, prepare_local_review_file, require_remote_approval
 from .claude_runner import find_resolvable_claude_skill, run_claude_doctor, run_claude_task
+from .claude_setup import (
+    DEFAULT_SETUP_SKILLS,
+    apply_setup_plan,
+    parse_skill_list,
+    setup_status_lines,
+    write_setup_plan,
+)
 from .checks import (
     check_academic_issue,
     check_academic_mr,
@@ -98,6 +105,19 @@ def build_parser() -> argparse.ArgumentParser:
     claude_sub = claude.add_subparsers(dest="claude_command")
     claude_sub.add_parser("doctor")
     claude_sub.add_parser("skills")
+    claude_setup = claude_sub.add_parser("setup")
+    claude_setup_sub = claude_setup.add_subparsers(dest="claude_setup_command")
+    claude_setup_sub.add_parser("inspect")
+    claude_setup_plan = claude_setup_sub.add_parser("plan")
+    claude_setup_plan.add_argument("--skills")
+    claude_setup_plan.add_argument("--all", action="store_true")
+    claude_setup_plan.add_argument("--source-repo", default="git@github.com:HughYau/AcademicForge.git")
+    claude_setup_plan.add_argument("--source-ref", default="main")
+    claude_setup_plan.add_argument("--source-dir", default=".xflow/local/academicforge-source")
+    claude_setup_plan.add_argument("--target-root", default=".claude/skills")
+    claude_setup_plan.add_argument("--plan-file", type=Path)
+    claude_setup_apply = claude_setup_sub.add_parser("apply")
+    claude_setup_apply.add_argument("--plan", type=Path, default=Path(".xflow/local/claude-setup-plan.md"))
     claude_run = claude_sub.add_parser("run")
     claude_run.add_argument("--issue", required=True)
     claude_run.add_argument("--file", type=Path)
@@ -422,6 +442,35 @@ def run_claude(args: argparse.Namespace) -> int:
                 status = "installed" if installed else "missing"
                 print(f"{name}\t{status}\t{installed or ''}")
             return 0
+        if args.claude_command == "setup":
+            if args.claude_setup_command == "inspect":
+                for line in setup_status_lines(context):
+                    print(line)
+                return 0
+            if args.claude_setup_command == "plan":
+                if args.all:
+                    skills = tuple(sorted(load_academicforge_skill_names()))
+                else:
+                    skills = parse_skill_list(args.skills) if args.skills else DEFAULT_SETUP_SKILLS
+                plan = write_setup_plan(
+                    context,
+                    skills,
+                    source_repo=args.source_repo,
+                    source_ref=args.source_ref,
+                    source_dir=args.source_dir,
+                    target_root=args.target_root,
+                    plan_file=args.plan_file,
+                )
+                print(f"[INFO] claude setup plan written: {plan}")
+                print("[INFO] review the plan and set Approved: yes before apply")
+                return 0
+            if args.claude_setup_command == "apply":
+                written = apply_setup_plan(context.repo_root, args.plan)
+                print(f"[INFO] installed claude skills: {len(written)}")
+                for path in written:
+                    print(f"  {path}")
+                return 0
+            raise ValueError(f"unknown claude setup subcommand: {args.claude_setup_command}")
         if args.claude_command != "run":
             raise ValueError(f"unknown claude subcommand: {args.claude_command}")
         task_file = args.file or resolve_check_file(context, args.issue, None, "claude-task.md")

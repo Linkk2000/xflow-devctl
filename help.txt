@@ -51,14 +51,21 @@ Academic checks:
 Claude:
   devctl claude doctor
   devctl claude skills
+  devctl claude setup inspect
+  devctl claude setup plan [--skills A,B|--all]
+  devctl claude setup apply --plan .xflow/local/claude-setup-plan.md
   devctl claude run --issue N [--file F] [--output F] [--dry-run]
 
   doctor checks whether the local Claude CLI is visible and whether
-  AcademicForge is registered in the Claude config. Missing AcademicForge is
-  reported with a reviewable command; no installation is performed.
+  AcademicForge-derived skills are available in Claude-resolvable paths.
+  Missing skills are reported; no installation is performed.
 
-  skills lists the verified AcademicForge command catalog that can be used in
-  Claude task package Invocation fields.
+  skills lists the verified AcademicForge command catalog and marks commands as
+  installed or missing for the current machine.
+
+  setup inspect is read-only. setup plan writes a reviewable local plan with
+  Approved: no. setup apply copies approved skills into project-local
+  .claude/skills only after the plan is changed to Approved: yes.
 
   Validate a Claude task package, call the local Claude CLI with the package
   content, and write the result to the package Output File. Set

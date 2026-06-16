@@ -1453,6 +1453,113 @@ class ClaudeRunTests(unittest.TestCase):
                 os.environ.clear()
                 os.environ.update(original)
 
+    def test_claude_setup_inspect_reports_project_skill_status(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.install_forge_skill(repo, "literature-review")
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update({"DEVCTL_REPO_ROOT": str(repo), "DEVCTL_PRODUCT_LINE": "academic"})
+                out = StringIO()
+                with redirect_stdout(out):
+                    result = main(["claude", "setup", "inspect"])
+                self.assertEqual(result, 0)
+                text = out.getvalue()
+                self.assertIn("target_root:", text)
+                self.assertIn("literature-review\tinstalled\t", text)
+                self.assertIn("paper-lookup\tmissing\t", text)
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_claude_setup_plan_writes_reviewable_unapproved_plan(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            catalog = repo / ".xflow" / "ops" / "workflow" / "references" / "academicforge-skill-catalog.md"
+            catalog.parent.mkdir(parents=True)
+            catalog.write_text(
+                "| Command | Source Path |\n"
+                "| --- | --- |\n"
+                "| `/literature-review` | `skills/scientific-agent-skills/skills/literature-review` |\n",
+                encoding="utf-8",
+            )
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update({"DEVCTL_REPO_ROOT": str(repo), "DEVCTL_PRODUCT_LINE": "academic"})
+                result = main(["claude", "setup", "plan", "--skills", "literature-review"])
+                self.assertEqual(result, 0)
+                plan = repo / ".xflow" / "local" / "claude-setup-plan.md"
+                text = plan.read_text(encoding="utf-8")
+                self.assertIn("Approved: no", text)
+                self.assertIn("Source Repo: git@github.com:HughYau/AcademicForge.git", text)
+                self.assertIn("- literature-review: skills/scientific-agent-skills/skills/literature-review", text)
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_claude_setup_apply_rejects_unapproved_plan(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            plan = repo / ".xflow" / "local" / "claude-setup-plan.md"
+            plan.parent.mkdir(parents=True)
+            plan.write_text(
+                "# Claude Skill Setup Plan\n\n"
+                "Approved: no\n"
+                "Source Repo: git@github.com:HughYau/AcademicForge.git\n"
+                "Source Ref: main\n"
+                "Source Directory: .xflow/local/academicforge-source\n"
+                "Target Root: .claude/skills\n\n"
+                "## Skills\n\n"
+                "- literature-review: skills/scientific-agent-skills/skills/literature-review\n",
+                encoding="utf-8",
+            )
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update({"DEVCTL_REPO_ROOT": str(repo), "DEVCTL_PRODUCT_LINE": "academic"})
+                err = StringIO()
+                with redirect_stderr(err):
+                    result = main(["claude", "setup", "apply", "--plan", str(plan)])
+                self.assertEqual(result, 1)
+                self.assertIn("Approved: yes", err.getvalue())
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_claude_setup_apply_copies_approved_project_local_skill(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            source = repo / ".xflow" / "local" / "academicforge-source"
+            skill_source = source / "skills" / "scientific-agent-skills" / "skills" / "literature-review"
+            skill_source.mkdir(parents=True)
+            (skill_source / "SKILL.md").write_text("# literature-review\n", encoding="utf-8")
+            plan = repo / ".xflow" / "local" / "claude-setup-plan.md"
+            plan.parent.mkdir(parents=True, exist_ok=True)
+            plan.write_text(
+                "# Claude Skill Setup Plan\n\n"
+                "Approved: yes\n"
+                "Source Repo: git@github.com:HughYau/AcademicForge.git\n"
+                "Source Ref: main\n"
+                "Source Directory: .xflow/local/academicforge-source\n"
+                "Target Root: .claude/skills\n\n"
+                "## Skills\n\n"
+                "- literature-review: skills/scientific-agent-skills/skills/literature-review\n",
+                encoding="utf-8",
+            )
+            original = os.environ.copy()
+            try:
+                os.environ.clear()
+                os.environ.update({"DEVCTL_REPO_ROOT": str(repo), "DEVCTL_PRODUCT_LINE": "academic"})
+                result = main(["claude", "setup", "apply", "--plan", str(plan)])
+                self.assertEqual(result, 0)
+                installed = repo / ".claude" / "skills" / "literature-review" / "SKILL.md"
+                self.assertEqual(installed.read_text(encoding="utf-8"), "# literature-review\n")
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
     def test_claude_doctor_rejects_official_nested_layout_without_flat_skill(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
