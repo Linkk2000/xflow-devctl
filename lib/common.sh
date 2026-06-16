@@ -191,6 +191,38 @@ devctl_academic_sha256() {
   sha256sum "$file" | awk '{print $1}'
 }
 
+devctl_academic_field() {
+  local field="$1" file="$2"
+  grep -E "^${field}:" "$file" | head -1 | sed "s/^${field}:[[:space:]]*//"
+}
+
+devctl_academic_abs_path() {
+  local path="$1" dir base
+  case "$path" in
+    /*) ;;
+    *) path="$DEVCTL_REPO_ROOT/$path" ;;
+  esac
+  dir="$(dirname "$path")"
+  base="$(basename "$path")"
+  if [[ -d "$dir" ]]; then
+    printf '%s/%s\n' "$(cd "$dir" && pwd -P)" "$base"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+devctl_academic_reject_placeholder_field() {
+  local field="$1" file="$2" value upper
+  value="$(devctl_academic_field "$field" "$file")"
+  upper="$(printf '%s' "$value" | tr '[:lower:]' '[:upper:]')"
+  case "$value" in
+    *"<"*|*">"*) devctl_die "invalid academic approval: placeholder remains in $field" ;;
+  esac
+  case "$upper" in
+    *TODO*|*TBD*) devctl_die "invalid academic approval: placeholder remains in $field" ;;
+  esac
+}
+
 devctl_academic_default_approved_file() {
   local action="$1" issue="${2:-}"
   case "$action" in
@@ -225,16 +257,27 @@ devctl_academic_require_remote_approval() {
   grep -Fq "Approved Action:" "$approval_file" || devctl_die "invalid academic approval: missing action"
   grep -Fq "Approved SHA256:" "$approval_file" || devctl_die "invalid academic approval: missing hash"
 
-  local approved_action expected actual
-  approved_action="$(grep -E '^Approved Action:' "$approval_file" | head -1 | sed 's/^Approved Action:[[:space:]]*//')"
+  local required_field
+  for required_field in Reviewer "Approved At" "Approved Action" "Approved File" "Approved SHA256" Approved; do
+    grep -Fq "${required_field}:" "$approval_file" || devctl_die "invalid academic approval: missing $required_field"
+    devctl_academic_reject_placeholder_field "$required_field" "$approval_file"
+  done
+
+  local approved_action approved_file_text declared_file actual_file expected actual
+  approved_action="$(devctl_academic_field "Approved Action" "$approval_file")"
   case "$approved_action" in
     "$action"|"remote-write"|"remote write"|"all-remote-writes") ;;
     *) devctl_die "academic approval action mismatch: expected $action, got $approved_action" ;;
   esac
 
-  expected="$(grep -E '^Approved SHA256:' "$approval_file" | head -1 | sed 's/^Approved SHA256:[[:space:]]*//')"
+  approved_file_text="$(devctl_academic_field "Approved File" "$approval_file")"
+  declared_file="$(devctl_academic_abs_path "$approved_file_text")"
+  actual_file="$(devctl_academic_abs_path "$approved_file")"
+  [[ "$declared_file" == "$actual_file" ]] || devctl_die "academic approval file mismatch: expected $approved_file, got $approved_file_text"
+
+  expected="$(devctl_academic_field "Approved SHA256" "$approval_file" | tr '[:upper:]' '[:lower:]')"
   actual="$(devctl_academic_sha256 "$approved_file")"
-  [[ "$expected" == "$actual" ]] || devctl_die "academic approval hash mismatch for $approved_file"
+  [[ "$expected" == "$actual" ]] || devctl_die "academic approval hash mismatch for $approved_file: expected $expected, actual $actual"
 }
 
 devctl_push_current_branch() {

@@ -22,8 +22,18 @@ academic_check_template "$review_file" \
   "## Decision" \
   "Approved: yes"
 
-expected="$(grep -E '^Approved SHA256:' "$review_file" | head -1 | sed 's/^Approved SHA256:[[:space:]]*//')"
+for field in Reviewer "Approved At" "Approved Action" "Approved File" "Approved SHA256" Approved; do
+  grep -Fq "${field}:" "$review_file" || devctl_die "invalid approval: missing $field"
+  devctl_academic_reject_placeholder_field "$field" "$review_file"
+done
+
+approved_file_text="$(devctl_academic_field "Approved File" "$review_file")"
+declared_file="$(devctl_academic_abs_path "$approved_file_text")"
+actual_file="$(devctl_academic_abs_path "$approved_file")"
+[[ "$declared_file" == "$actual_file" ]] || devctl_die "approval file mismatch: expected $approved_file, got $approved_file_text"
+
+expected="$(devctl_academic_field "Approved SHA256" "$review_file" | tr '[:upper:]' '[:lower:]')"
 actual="$(academic_sha256 "$approved_file")"
-[[ "$expected" == "$actual" ]] || devctl_die "approval hash mismatch for $approved_file"
+[[ "$expected" == "$actual" ]] || devctl_die "approval hash mismatch for $approved_file: expected $expected, actual $actual"
 
 devctl_info "local-review check passed: $review_file"

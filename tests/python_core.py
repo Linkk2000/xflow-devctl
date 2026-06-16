@@ -19,12 +19,20 @@ from xflow.checks import (
     check_academic_issue,
     check_academic_mr,
     check_claude_package,
+    check_current_task,
+    check_scope,
     check_submodule_hygiene,
     check_tdd_result,
     load_academicforge_skill_names,
 )
 from xflow.cli import build_parser, main, resolve_check_file
-from xflow.approval import check_local_review_file, require_remote_approval
+from xflow.approval import (
+    check_local_review_file,
+    parse_field,
+    prepare_local_review_file,
+    require_remote_approval,
+    sha256_file,
+)
 
 
 def write_rule_manifest(repo_root):
@@ -156,7 +164,13 @@ class RuleSyncTests(unittest.TestCase):
             original = os.environ.copy()
             try:
                 os.environ.clear()
-                os.environ.update({"DEVCTL_REPO_ROOT": str(repo), "DEVCTL_PRODUCT_LINE": "academic"})
+                os.environ.update(
+                    {
+                        "DEVCTL_REPO_ROOT": str(repo),
+                        "DEVCTL_PRODUCT_LINE": "academic",
+                        "PATH": original.get("PATH", ""),
+                    }
+                )
                 out = StringIO()
                 with redirect_stdout(out):
                     result = main(["rules", "sync", "cursor"])
@@ -221,6 +235,127 @@ class CheckTests(unittest.TestCase):
                 resolve_check_file(context, "1", None, "mr-draft.md"),
                 Path(tmp).resolve() / ".xflow" / "issues" / "issue-1" / "mr-draft.md",
             )
+
+    def init_scope_repo(self, repo: Path) -> None:
+        repo.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test User"], check=True)
+        (repo / "README.md").write_text("paper\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "init", "-q"], check=True)
+
+    def write_scope_file(self, repo: Path, relative: str, text: str = "x\n") -> None:
+        path = repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def test_scope_review_only_expands_issue_id_and_allows_local_scratch(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.init_scope_repo(repo)
+            self.write_scope_file(repo, ".xflow/issues/issue-7/review.md")
+            self.write_scope_file(repo, ".xflow/local/body.md")
+            self.write_scope_file(repo, "reviews/issue-7/matrix.md")
+            check_scope(repo, "7", "review-only")
+
+    def test_scope_review_only_does_not_allow_other_issue_directory(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.init_scope_repo(repo)
+            self.write_scope_file(repo, ".xflow/issues/issue-5/review.md")
+            with self.assertRaisesRegex(ValueError, "outside review-only allowlist"):
+                check_scope(repo, "7", "review-only")
+
+    def test_scope_review_only_blocks_unlisted_paper_content_without_hardcoded_denylist(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.init_scope_repo(repo)
+            self.write_scope_file(repo, "manuscript/main.tex")
+            with self.assertRaisesRegex(ValueError, "protected hint"):
+                check_scope(repo, "7", "review-only")
+
+    def test_scope_review_only_accepts_project_allowlist_extension(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.init_scope_repo(repo)
+            self.write_scope_file(
+                repo,
+                ".xflow/scope-policy.json",
+                json.dumps({"review_only": {"allow": ["analysis/issue-<id>/**"]}}),
+            )
+            self.write_scope_file(repo, "analysis/issue-7/notes.md")
+            check_scope(repo, "7", "review-only")
+
+    def test_check_scope_cli_uses_repo_root(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.init_scope_repo(repo)
+            self.write_scope_file(repo, ".xflow/issues/issue-7/review.md")
+            original = os.environ.copy()
+            try:
+                os.environ.update({"DEVCTL_REPO_ROOT": str(repo), "DEVCTL_PRODUCT_LINE": "academic"})
+                self.assertEqual(main(["check", "scope", "--issue", "7", "--mode", "review-only"]), 0)
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
+    def test_current_task_rejects_pr_created_while_state_still_forbids_pr(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.init_scope_repo(repo)
+            current = repo / ".xflow" / "current-task.md"
+            current.parent.mkdir(parents=True)
+            current.write_text(
+                "# Current Task\n\n"
+                "Issue: 7\n"
+                "State: G3_LOCAL_REVIEW_RESULT\n\n"
+                "Forbidden Actions:\n"
+                "- push\n"
+                "- create PR\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(repo), "config", "--local", "devctl.pr", "12"], check=True)
+            with self.assertRaisesRegex(ValueError, "stale current-task"):
+                check_current_task(repo, "7")
+
+    def test_current_task_accepts_pr_created_state_without_forbidden_pr(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.init_scope_repo(repo)
+            current = repo / ".xflow" / "current-task.md"
+            current.parent.mkdir(parents=True)
+            current.write_text(
+                "# Current Task\n\n"
+                "Issue: 7\n"
+                "State: S9_REMOTE_REVIEW_AND_CI\n\n"
+                "Allowed Actions:\n"
+                "- inspect PR\n"
+                "- wait for remote review\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(repo), "config", "--local", "devctl.pr", "12"], check=True)
+            check_current_task(repo, "7")
+
+    def test_check_current_task_cli_uses_repo_root(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.init_scope_repo(repo)
+            current = repo / ".xflow" / "current-task.md"
+            current.parent.mkdir(parents=True)
+            current.write_text(
+                "# Current Task\n\n"
+                "Issue: 7\n"
+                "State: S5_WRITE_TDD_RESULT\n",
+                encoding="utf-8",
+            )
+            original = os.environ.copy()
+            try:
+                os.environ.update({"DEVCTL_REPO_ROOT": str(repo), "DEVCTL_PRODUCT_LINE": "academic"})
+                self.assertEqual(main(["check", "current-task", "--issue", "7"]), 0)
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
 
     def test_academic_issue_rejects_missing_sections(self):
         with TemporaryDirectory() as tmp:
@@ -1180,6 +1315,60 @@ class ClaudeRunTests(unittest.TestCase):
 
 
 class ApprovalTests(unittest.TestCase):
+    def test_prepare_local_review_prefills_mechanical_fields_without_approving(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            artifact = repo / ".xflow" / "issues" / "issue-7" / "mr-draft.md"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_text("MR body\n", encoding="utf-8")
+
+            review = prepare_local_review_file(repo, "7", "git-mr", artifact)
+            text = review.read_text(encoding="utf-8")
+
+            self.assertIn("# Local Review Approval", text)
+            self.assertIn("Issue: 7", text)
+            self.assertIn("Reviewer: <human reviewer>", text)
+            self.assertIn("Approved Action: git-mr", text)
+            self.assertIn("Approved File: .xflow/issues/issue-7/mr-draft.md", text)
+            self.assertIn(f"Approved SHA256: {sha256_file(artifact)}", text)
+            self.assertIn("Approved: no", text)
+            self.assertIn("Suggested Command:", text)
+            self.assertTrue(parse_field(text, "Approved SHA256").islower())
+
+    def test_prepare_local_review_cli_writes_active_approval_file(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            artifact = repo / ".xflow" / "issues" / "issue-7" / "comment-draft.md"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_text("Comment\n", encoding="utf-8")
+            original = os.environ.copy()
+            try:
+                os.environ.update({"DEVCTL_REPO_ROOT": str(repo), "DEVCTL_PRODUCT_LINE": "academic"})
+                out = StringIO()
+                with redirect_stdout(out):
+                    result = main(
+                        [
+                            "approval",
+                            "prepare",
+                            "--issue",
+                            "7",
+                            "--action",
+                            "issue-comment",
+                            "--file",
+                            str(artifact),
+                            "--command",
+                            "devctl issue comment 7 --body-file .xflow/issues/issue-7/comment-draft.md",
+                        ]
+                    )
+                self.assertEqual(result, 0)
+                self.assertIn("local review prepared", out.getvalue())
+                review = repo / ".xflow" / "issues" / "issue-7" / "approvals" / "local-review.md"
+                self.assertTrue(review.is_file())
+                self.assertIn("Approved: no", review.read_text(encoding="utf-8"))
+            finally:
+                os.environ.clear()
+                os.environ.update(original)
+
     def test_require_remote_approval_accepts_matching_local_review(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -1189,6 +1378,30 @@ class ApprovalTests(unittest.TestCase):
             write_local_review(repo, "draft", "issue-create", artifact)
 
             require_remote_approval(repo, "issue-create", artifact, "draft")
+
+    def test_require_remote_approval_accepts_uppercase_hash(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            artifact = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b"academic draft\n")
+            write_local_review(repo, "draft", "issue-create", artifact, sha=sha256_file(artifact).upper())
+
+            require_remote_approval(repo, "issue-create", artifact, "draft")
+
+    def test_require_remote_approval_rejects_template_placeholders(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            artifact = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b"academic draft\n")
+            write_local_review(repo, "draft", "issue-create", artifact)
+            review = repo / ".xflow" / "issues" / "issue-draft" / "approvals" / "local-review.md"
+            text = review.read_text(encoding="utf-8").replace("Reviewer: user", "Reviewer: <human reviewer>")
+            review.write_text(text, encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "placeholder"):
+                require_remote_approval(repo, "issue-create", artifact, "draft")
 
     def test_require_remote_approval_accepts_repo_relative_paths_from_outside_cwd(self):
         with TemporaryDirectory() as tmp:
@@ -1804,6 +2017,20 @@ class PullRequestProviderTests(unittest.TestCase):
                         stdout=subprocess.PIPE,
                     ).stdout.strip()
                     self.assertEqual(stored, "9")
+                    stored_url = subprocess.run(
+                        ["git", "-C", str(repo), "config", "--local", "--get", "devctl.pr-url"],
+                        check=True,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                    ).stdout.strip()
+                    self.assertEqual(stored_url, "https://github.example/pull/9")
+                    suggestion = repo / ".xflow" / "issues" / "issue-1" / "state-update-suggestion.md"
+                    self.assertTrue(suggestion.is_file())
+                    suggestion_text = suggestion.read_text(encoding="utf-8")
+                    self.assertIn("Issue: 1", suggestion_text)
+                    self.assertIn("PR: 9", suggestion_text)
+                    self.assertIn("State: S9_REMOTE_REVIEW_AND_CI", suggestion_text)
+                    self.assertIn("No second local approval is required", suggestion_text)
                 finally:
                     os.environ.clear()
                     os.environ.update(original)

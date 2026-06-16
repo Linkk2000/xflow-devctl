@@ -33,10 +33,17 @@ Academic checks:
   devctl check claude-package --issue N [--file F]
   devctl check academic-mr --issue N [--file F]
   devctl check local-review --issue N --file F
+  devctl check scope --issue N [--mode review-only]
+  devctl check current-task [--issue N]
   devctl check submodule-hygiene
 
   These checks validate local Academic XFlow templates before remote writes.
   local-review also compares Approved SHA256 with the current file hash.
+  scope verifies changed files against the task mode allowlist. In review-only
+  mode, default allowed paths are issue-local evidence directories and
+  .xflow/local; extend with .xflow/scope-policy.json after human review.
+  current-task detects stale .xflow/current-task.md state, such as a local PR
+  number existing while the task file still forbids push or PR creation.
   submodule-hygiene verifies that .xflow/ops/devctl and .xflow/ops/workflow are free of
   tracked changes and common byproducts, and that .gitmodules uses
   ignore = untracked for both tool submodules.
@@ -68,6 +75,14 @@ AI rule entrypoints:
   initialized by one tool add another tool's entrypoint later, for example
   adding Cursor's .cursorrules after Codex created AGENTS.md. Existing edited
   files are not overwritten unless --force is used after human review.
+
+Local approval:
+  devctl approval prepare --issue N --action ACTION --file F [--command C] [--force]
+
+  Pre-fill the active local review file with mechanical fields: approved file,
+  lowercase SHA256, timestamp, action, and suggested command. The generated file
+  keeps Approved: no; the human reviewer must change it to Approved: yes after
+  inspecting the exact artifact and command.
 
 App:
   devctl app start-frontend [--port PORT] [--foreground]

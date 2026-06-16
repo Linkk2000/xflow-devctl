@@ -7,14 +7,17 @@ import sys
 from pathlib import Path
 from typing import Mapping
 
-from .approval import check_local_review_file, require_remote_approval
+from .approval import check_local_review_file, prepare_local_review_file, require_remote_approval
 from .claude_runner import run_claude_doctor, run_claude_task
 from .checks import (
     check_academic_issue,
     check_academic_mr,
     check_claude_package,
+    check_current_task,
     check_submodule_hygiene,
+    check_scope,
     check_tdd_result,
+    write_pr_state_update_suggestion,
     load_academicforge_skill_names,
 )
 from .env import RuntimeContext, detect_python_runtime
@@ -53,6 +56,11 @@ def build_parser() -> argparse.ArgumentParser:
     local_review = check_sub.add_parser("local-review")
     local_review.add_argument("--issue")
     local_review.add_argument("--file", type=Path)
+    scope = check_sub.add_parser("scope")
+    scope.add_argument("--issue", required=True)
+    scope.add_argument("--mode", default="review-only")
+    current_task = check_sub.add_parser("current-task")
+    current_task.add_argument("--issue")
     check_sub.add_parser("submodule-hygiene")
 
     issue = sub.add_parser("issue")
@@ -102,6 +110,16 @@ def build_parser() -> argparse.ArgumentParser:
     rules_sync.add_argument("rule_id", nargs="?")
     rules_sync.add_argument("--all", action="store_true")
     rules_sync.add_argument("--force", action="store_true")
+
+    approval = sub.add_parser("approval")
+    approval_sub = approval.add_subparsers(dest="approval_command")
+    approval_prepare = approval_sub.add_parser("prepare")
+    approval_prepare.add_argument("--issue", required=True)
+    approval_prepare.add_argument("--action", required=True)
+    approval_prepare.add_argument("--file", required=True, type=Path)
+    approval_prepare.add_argument("--command", dest="suggested_command")
+    approval_prepare.add_argument("--reviewer", default="<human reviewer>")
+    approval_prepare.add_argument("--force", action="store_true")
     return parser
 
 
@@ -146,6 +164,12 @@ def run_check(args: argparse.Namespace) -> int:
         elif args.check_command == "submodule-hygiene":
             path = context.repo_root
             check_submodule_hygiene(path)
+        elif args.check_command == "scope":
+            path = context.repo_root
+            check_scope(path, args.issue, args.mode)
+        elif args.check_command == "current-task":
+            path = context.repo_root / ".xflow" / "current-task.md"
+            check_current_task(context.repo_root, args.issue)
         else:
             raise ValueError(f"unknown check subcommand: {args.check_command}")
     except ValueError as exc:
@@ -351,6 +375,9 @@ def run_git(args: argparse.Namespace) -> int:
         title = args.title or derive_mr_title(branch, issue)
         result = create_pull_request(context.repo_root, title, body, branch, base, os.environ)
         git_set_config(context.repo_root, "pr", result.number)
+        if result.html_url:
+            git_set_config(context.repo_root, "pr-url", result.html_url)
+        write_pr_state_update_suggestion(context.repo_root, issue, result.number, result.html_url)
     except ValueError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
@@ -426,6 +453,27 @@ def run_rules(args: argparse.Namespace) -> int:
         return 1
 
 
+def run_approval(args: argparse.Namespace) -> int:
+    context = RuntimeContext.from_env(Path(__file__).resolve().parents[1], os.environ)
+    try:
+        if args.approval_command == "prepare":
+            review_file = prepare_local_review_file(
+                context.repo_root,
+                args.issue,
+                args.action,
+                args.file,
+                command=args.suggested_command,
+                reviewer=args.reviewer,
+                force=args.force,
+            )
+            print(f"[INFO] local review prepared: {review_file}")
+            return 0
+        raise ValueError(f"unknown approval subcommand: {args.approval_command}")
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -441,5 +489,7 @@ def main(argv: list[str] | None = None) -> int:
         return run_claude(args)
     if args.command == "rules":
         return run_rules(args)
+    if args.command == "approval":
+        return run_approval(args)
     parser.print_help()
     return 0
