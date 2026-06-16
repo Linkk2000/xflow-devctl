@@ -22,6 +22,7 @@ Check:
   devctl preflight
   devctl check issue-draft [--issue draft|N] [--file F]
   devctl check mr-draft --issue N [--file F]
+  devctl check current-task [--issue N]
   devctl check local-review --issue draft|N --file F --action issue-create|issue-comment|issue-close|git-mr
   devctl check submodule-hygiene
 

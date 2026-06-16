@@ -20,6 +20,7 @@ Useful commands:
 ```text
 devctl preflight
 devctl approval prepare --issue draft --action issue-create --file .xflow/issues/issue-draft/issue-draft.md
+devctl check current-task --issue 1
 devctl check local-review --issue draft --file .xflow/issues/issue-draft/issue-draft.md --action issue-create
 devctl check submodule-hygiene
 devctl rules list

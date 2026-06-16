@@ -10,6 +10,9 @@ from pathlib import Path
 
 
 OPS_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(OPS_ROOT))
+
+from xflow.checks import write_pr_state_update_suggestion
 
 
 def run_devctl(repo_root: Path, *args: str, expect: int = 0) -> subprocess.CompletedProcess[str]:
@@ -134,6 +137,35 @@ Closes #1
 
         run_devctl(repo, "check", "issue-draft", "--file", str(issue_file))
         run_devctl(repo, "check", "mr-draft", "--issue", "1")
+
+        current_task = repo / ".xflow" / "current-task.md"
+        write(
+            current_task,
+            """# XFlow Current Task
+
+Issue: 1
+State: S6_PREPARE_COMMIT_AND_MR_DRAFT
+
+## Allowed Actions
+- Draft MR body.
+
+## Forbidden Actions
+- Create PR before local human approval.
+""",
+        )
+        run_devctl(repo, "check", "current-task", "--issue", "1")
+        git(repo, "config", "--local", "devctl.pr", "9")
+        run_devctl(repo, "check", "current-task", "--issue", "1", expect=1)
+        current_task.write_text(
+            current_task.read_text(encoding="utf-8").replace(
+                "S6_PREPARE_COMMIT_AND_MR_DRAFT", "S9_REMOTE_REVIEW_AND_CI"
+            ),
+            encoding="utf-8",
+        )
+        run_devctl(repo, "check", "current-task", "--issue", "1")
+        suggestion = write_pr_state_update_suggestion(repo, "1", "9", "https://example.test/pull/9")
+        assert suggestion.is_file()
+        assert "Suggested State: S9_REMOTE_REVIEW_AND_CI" in suggestion.read_text(encoding="utf-8")
 
         bad_issue = issue_file.with_name("bad-issue.md")
         shutil.copyfile(issue_file, bad_issue)

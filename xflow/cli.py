@@ -7,7 +7,13 @@ import sys
 from pathlib import Path
 
 from . import approval, providers, rules
-from .checks import check_issue_draft, check_mr_draft, check_submodule_hygiene
+from .checks import (
+    check_current_task,
+    check_issue_draft,
+    check_mr_draft,
+    check_submodule_hygiene,
+    write_pr_state_update_suggestion,
+)
 from .env import RuntimeContext, load_env_files, python_version, token_status_lines
 from .migration import inspect, write_wrappers
 from .paths import default_issue_file
@@ -31,6 +37,8 @@ def build_parser() -> argparse.ArgumentParser:
     local_review.add_argument("--file", required=True, type=Path)
     local_review.add_argument("--action")
     check_sub.add_parser("submodule-hygiene")
+    current_task = check_sub.add_parser("current-task")
+    current_task.add_argument("--issue")
 
     issue = sub.add_parser("issue")
     issue_sub = issue.add_subparsers(dest="issue_command")
@@ -134,6 +142,9 @@ def run_check(args: argparse.Namespace) -> int:
     elif args.check_command == "submodule-hygiene":
         path = ctx.repo_root
         check_submodule_hygiene(path)
+    elif args.check_command == "current-task":
+        path = ctx.repo_root / ".xflow" / "current-task.md"
+        check_current_task(ctx.repo_root, args.issue)
     else:
         raise ValueError(f"unknown check subcommand: {args.check_command}")
     print(f"[INFO] {args.check_command} check passed: {path}")
@@ -269,9 +280,13 @@ def run_git(args: argparse.Namespace) -> int:
         return 0
     result = providers.create_pull_request(ctx.repo_root, title, body_file.read_text(encoding="utf-8"), branch, base, os.environ)
     subprocess.run(["git", "-C", str(ctx.repo_root), "config", "--local", "devctl.pr", result.number], check=False)
+    if result.html_url:
+        subprocess.run(["git", "-C", str(ctx.repo_root), "config", "--local", "devctl.pr-url", result.html_url], check=False)
+    suggestion = write_pr_state_update_suggestion(ctx.repo_root, issue, result.number, result.html_url)
     print(f"[INFO] PR #{result.number} created")
     if result.html_url:
         print(f"[INFO] {result.html_url}")
+    print(f"[INFO] state update suggestion: {suggestion}")
     print(result.number)
     return 0
 
