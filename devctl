@@ -16,7 +16,7 @@ export DEVCTL_REPO_ROOT
 export DEVCTL_OPS_ROOT="$OPS"
 
 case "${1:-help}" in
-  -h|--help|help|check)
+  -h|--help|help|check|git|issue|preflight|approval|rules|migrate)
     export DEVCTL_SKIP_PROVIDER_LOAD=1
     ;;
 esac
@@ -31,8 +31,14 @@ usage() {
 run_script() {
   local script="$1"
   shift
-  [[ -x "$script" || -f "$script" ]] || devctl_die "缺少脚本: $script"
+  [[ -x "$script" || -f "$script" ]] || devctl_die "missing script: $script"
   exec bash "$script" "$@"
+}
+
+run_python() {
+  export PYTHONDONTWRITEBYTECODE=1
+  export PYTHONPATH="$OPS${PYTHONPATH:+:$PYTHONPATH}"
+  exec python -m xflow "$@"
 }
 
 main() {
@@ -45,39 +51,30 @@ main() {
     -h|--help|help)
       usage
       ;;
+    preflight|approval|rules|migrate)
+      run_python "$@"
+      ;;
     git)
       shift
       [[ $# -ge 1 ]] || { usage; exit 1; }
       case "$1" in
         start)      shift; run_script "$OPS/git/start.sh" "$@" ;;
         commit-msg) shift; run_script "$OPS/git/commit-msg.sh" "$@" ;;
-        mr)         shift; run_script "$OPS/git/mr.sh" "$@" ;;
+        mr|pr-get)  run_python git "$@" ;;
         done)       shift; run_script "$OPS/git/done.sh" "$@" ;;
         status)     shift; run_script "$OPS/git/status.sh" "$@" ;;
-        *) devctl_die "未知 git 子命令: $1（devctl help）" ;;
+        *) devctl_die "unknown git subcommand: $1 (devctl help)" ;;
       esac
       ;;
     issue)
       shift
       [[ $# -ge 1 ]] || { usage; exit 1; }
-      case "$1" in
-        create)  shift; run_script "$OPS/issue/create.sh" "$@" ;;
-        list)    shift; run_script "$OPS/issue/list.sh" "$@" ;;
-        show)    shift; run_script "$OPS/issue/show.sh" "$@" ;;
-        comment) shift; run_script "$OPS/issue/comment.sh" "$@" ;;
-        close)   shift; run_script "$OPS/issue/close.sh" "$@" ;;
-        *) devctl_die "未知 issue 子命令: $1（devctl help）" ;;
-      esac
+      run_python issue "$@"
       ;;
     check)
       shift
       [[ $# -ge 1 ]] || { usage; exit 1; }
-      case "$1" in
-        issue-draft)  shift; run_script "$OPS/check/issue-draft.sh" "$@" ;;
-        mr-draft)     shift; run_script "$OPS/check/mr-draft.sh" "$@" ;;
-        local-review) shift; run_script "$OPS/check/local-review.sh" "$@" ;;
-        *) devctl_die "unknown check subcommand: $1 (devctl help)" ;;
-      esac
+      run_python check "$@"
       ;;
     app)
       shift
@@ -94,7 +91,7 @@ main() {
       run_script "$OPS/run.sh" "$@"
       ;;
     *)
-      devctl_die "未知命令: $1（devctl help）"
+      devctl_die "unknown command: $1 (devctl help)"
       ;;
   esac
 }

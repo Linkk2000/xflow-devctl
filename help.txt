@@ -5,37 +5,51 @@ Issue (GitHub/Gitee):
   devctl issue comment <number> [--body B] [--body-file F]
   devctl issue close <number>
 
-Note:
-  Core remote writes require local review of the exact body/evidence file.
+Git:
+  devctl git start <slug> [--issue N]
+  devctl git commit-msg [summary]
+  devctl git mr [--title T] [--body-file F] [--base BRANCH] [--issue N]
+  devctl git pr-get <number>
+  devctl git status
+  devctl git done
+
+Core remote-write rule:
+  Remote writes require local human review of the exact body/evidence file.
   Use --body-file for issue create/comment and git mr.
-  Required approval file: .xflow/issues/issue-<id>/approvals/local-review.md
+  Active approval file: .xflow/issues/issue-<id>/approvals/local-review.md
 
 Check:
+  devctl preflight
   devctl check issue-draft [--issue draft|N] [--file F]
   devctl check mr-draft --issue N [--file F]
+  devctl check current-task [--issue N]
   devctl check local-review --issue draft|N --file F --action issue-create|issue-comment|issue-close|git-mr
+  devctl check submodule-hygiene
+
+Approval:
+  devctl approval prepare --issue draft|N --action ACTION --file F [--command CMD] [--reviewer NAME] [--force]
+
+AI rules:
+  devctl rules list
+  devctl rules sync <rule-id>|--all [--force]
+
+Migration:
+  devctl migrate inspect
+  devctl migrate wrappers
 
 App:
   devctl app start-frontend [--port PORT] [--foreground]
-      Start the frontend dev server with a WSL-safe Vite config.
   devctl app stop-frontend
-      Stop the recorded frontend dev server process.
   devctl app status
-      Show recorded process, HTTP health, and log location.
 
-开发环境 (仅前端仓库):
-  devctl run [--backend PATH]
-      启动后端 + 前端，并打开浏览器
-      环境变量: XFLOW_BACKEND_ROOT (默认 ../xflow-server)
-
-配置:
-  GITEE_ENV_FILE     Token 文件路径 (默认 ~/gitee.env.local)
-  GITHUB_TOKEN       GitHub 私人令牌
-  GITEE_TOKEN        Gitee 私人令牌
-  XFLOW_PLATFORM     指定平台 (github|gitee，默认根据 remote 自动识别)
-  DEVCTL_BASE_BRANCH 默认主干 (默认自动检测 master/main)
-  DEVCTL_BRANCH_PREFIX 分支前缀 (默认 feature)
-
-Token 文件示例 (~/gitee.env.local):
-  GITHUB_TOKEN=your_github_token
-  GITEE_TOKEN=your_gitee_token
+Config:
+  XFLOW_ENV_FILE            explicit env file for one run
+  ~/.xflow/env.local        preferred user-level env file
+  ~/gitee.env.local         legacy env file fallback
+  GITHUB_TOKEN              GitHub personal access token
+  GITEE_TOKEN               Gitee personal access token
+  XFLOW_PLATFORM            github|gitee
+  DEVCTL_BASE_BRANCH        default base branch
+  DEVCTL_BRANCH_PREFIX      task branch prefix
+  DEVCTL_REPO_ROOT          target repository root
+  PYTHONDONTWRITEBYTECODE   set to 1 to avoid __pycache__
