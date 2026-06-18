@@ -42,3 +42,8 @@ XFLOW_PLATFORM=github
 `~/gitee.env.local` path remains a compatibility fallback. `devctl preflight`
 prints which env files were loaded and whether tokens are set, but never prints
 token values.
+
+The Python provider supports GitHub and Gitee. `XFLOW_PLATFORM` may be set to
+`github` or `gitee`; otherwise devctl infers the platform from the `origin`
+remote URL. Gitee calls use the v5 OpenAPI shape and `GITEE_TOKEN`; set
+`GITEE_API_BASE` only for tests or custom hosts.

@@ -49,6 +49,8 @@ Config:
   GITHUB_TOKEN              GitHub personal access token
   GITEE_TOKEN               Gitee personal access token
   XFLOW_PLATFORM            github|gitee
+  GITHUB_API_BASE           GitHub API base override for tests or enterprise hosts
+  GITEE_API_BASE            Gitee API v5 base override; default https://gitee.com/api/v5
   DEVCTL_BASE_BRANCH        default base branch
   DEVCTL_BRANCH_PREFIX      task branch prefix
   DEVCTL_REPO_ROOT          target repository root

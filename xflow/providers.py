@@ -59,7 +59,7 @@ def owner_repo(repo_root: Path, env: Mapping[str, str]) -> tuple[str, str]:
     parsed = parse_owner_repo(remote_url(repo_root))
     if parsed:
         return parsed
-    raise ValueError("cannot resolve GitHub owner/repo; set DEVCTL_OWNER and DEVCTL_REPO or configure origin")
+    raise ValueError("cannot resolve repository owner/repo; set DEVCTL_OWNER and DEVCTL_REPO or configure origin")
 
 
 def platform(repo_root: Path, env: Mapping[str, str]) -> str:
@@ -80,6 +80,14 @@ def token(env: Mapping[str, str]) -> str:
     raise ValueError("missing GitHub token: set GITHUB_TOKEN")
 
 
+def gitee_token(env: Mapping[str, str]) -> str:
+    for name in ("GITEE_TOKEN", "GITEE_ACCESS_TOKEN", "access_token"):
+        value = env.get(name, "").strip()
+        if value:
+            return value
+    raise ValueError("missing Gitee token: set GITEE_TOKEN")
+
+
 def headers(value: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {value}",
@@ -95,7 +103,34 @@ def api_url(repo_root: Path, env: Mapping[str, str], suffix: str) -> str:
     return f"{base}/repos/{owner}/{repo}/{suffix.lstrip('/')}"
 
 
-def request_json(method: str, url: str, request_headers: Mapping[str, str], payload: Mapping[str, object] | None = None):
+def gitee_api_base(env: Mapping[str, str]) -> str:
+    return env.get("GITEE_API_BASE", "https://gitee.com/api/v5").rstrip("/")
+
+
+def gitee_headers() -> dict[str, str]:
+    return {
+        "Accept": "application/json",
+        "User-Agent": "xflow-devctl",
+    }
+
+
+def gitee_repo_url(repo_root: Path, env: Mapping[str, str], suffix: str) -> str:
+    owner, repo = owner_repo(repo_root, env)
+    return f"{gitee_api_base(env)}/repos/{owner}/{repo}/{suffix.lstrip('/')}"
+
+
+def gitee_owner_url(repo_root: Path, env: Mapping[str, str], suffix: str) -> str:
+    owner, _repo = owner_repo(repo_root, env)
+    return f"{gitee_api_base(env)}/repos/{owner}/{suffix.lstrip('/')}"
+
+
+def request_json(
+    method: str,
+    url: str,
+    request_headers: Mapping[str, str],
+    payload: Mapping[str, object] | None = None,
+    api_name: str = "GitHub",
+):
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
     request = Request(url, data=body, method=method)
     for key, value in request_headers.items():
@@ -107,9 +142,26 @@ def request_json(method: str, url: str, request_headers: Mapping[str, str], payl
             text = response.read().decode("utf-8")
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise ValueError(f"GitHub API {exc.code}: {detail}") from exc
+        raise ValueError(f"{api_name} API {exc.code}: {detail}") from exc
     except URLError as exc:
-        raise ValueError(f"GitHub API request failed: {exc.reason}") from exc
+        raise ValueError(f"{api_name} API request failed: {exc.reason}") from exc
+    return json.loads(text) if text else {}
+
+
+def request_form_json(method: str, url: str, payload: Mapping[str, object], api_name: str = "Gitee"):
+    body = urlencode({key: str(value) for key, value in payload.items() if value is not None}).encode("utf-8")
+    request = Request(url, data=body, method=method)
+    request.add_header("Accept", "application/json")
+    request.add_header("Content-Type", "application/x-www-form-urlencoded")
+    request.add_header("User-Agent", "xflow-devctl")
+    try:
+        with urlopen(request, timeout=30) as response:
+            text = response.read().decode("utf-8")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise ValueError(f"{api_name} API {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise ValueError(f"{api_name} API request failed: {exc.reason}") from exc
     return json.loads(text) if text else {}
 
 
@@ -118,7 +170,119 @@ def ensure_github(repo_root: Path, env: Mapping[str, str]) -> None:
         raise ValueError("Python provider currently supports GitHub only")
 
 
+def gitee_query(env: Mapping[str, str], values: Mapping[str, object]) -> str:
+    payload = {"access_token": gitee_token(env)}
+    payload.update({key: value for key, value in values.items() if value not in ("", None)})
+    return urlencode(payload)
+
+
+def require_object(response: object, message: str) -> dict[str, object]:
+    if not isinstance(response, dict):
+        raise ValueError(message)
+    return response
+
+
+def create_gitee_issue(repo_root: Path, title: str, body: str, labels: str | None, env: Mapping[str, str]) -> IssueResult:
+    _owner, repo = owner_repo(repo_root, env)
+    response = request_form_json(
+        "POST",
+        gitee_owner_url(repo_root, env, "issues"),
+        {
+            "access_token": gitee_token(env),
+            "repo": repo,
+            "title": title,
+            "body": body,
+            "labels": labels or "",
+        },
+    )
+    item = require_object(response, "Gitee issue create response must be a JSON object")
+    if not item.get("number"):
+        raise ValueError("Gitee issue create response missing number")
+    return IssueResult(str(item.get("number")), str(item.get("html_url", "")))
+
+
+def list_gitee_issues(repo_root: Path, state: str, limit: int, env: Mapping[str, str]) -> list[dict[str, object]]:
+    values: dict[str, object] = {"per_page": str(limit), "sort": "updated"}
+    if state != "all":
+        values["state"] = state
+    response = request_json(
+        "GET",
+        f"{gitee_repo_url(repo_root, env, 'issues')}?{gitee_query(env, values)}",
+        gitee_headers(),
+        api_name="Gitee",
+    )
+    if not isinstance(response, list):
+        raise ValueError("Gitee issue list response must be a JSON array")
+    return [item for item in response if isinstance(item, dict)]
+
+
+def show_gitee_issue(repo_root: Path, number: str, env: Mapping[str, str]) -> dict[str, object]:
+    response = request_json(
+        "GET",
+        f"{gitee_repo_url(repo_root, env, f'issues/{number}')}?{gitee_query(env, {})}",
+        gitee_headers(),
+        api_name="Gitee",
+    )
+    return require_object(response, "Gitee issue show response must be a JSON object")
+
+
+def comment_gitee_issue(repo_root: Path, number: str, body: str, env: Mapping[str, str]) -> dict[str, object]:
+    response = request_form_json(
+        "POST",
+        gitee_repo_url(repo_root, env, f"issues/{number}/comments"),
+        {"access_token": gitee_token(env), "body": body},
+    )
+    return require_object(response, "Gitee issue comment response must be a JSON object")
+
+
+def close_gitee_issue(repo_root: Path, number: str, env: Mapping[str, str]) -> dict[str, object]:
+    _owner, repo = owner_repo(repo_root, env)
+    response = request_form_json(
+        "PATCH",
+        gitee_owner_url(repo_root, env, f"issues/{number}"),
+        {"access_token": gitee_token(env), "repo": repo, "state": "closed"},
+    )
+    return require_object(response, "Gitee issue close response must be a JSON object")
+
+
+def create_gitee_pull_request(
+    repo_root: Path,
+    title: str,
+    body: str,
+    head: str,
+    base: str,
+    env: Mapping[str, str],
+) -> PullRequestResult:
+    response = request_form_json(
+        "POST",
+        gitee_repo_url(repo_root, env, "pulls"),
+        {
+            "access_token": gitee_token(env),
+            "title": title,
+            "body": body,
+            "head": head,
+            "base": base,
+        },
+    )
+    item = require_object(response, "Gitee pull request create response must be a JSON object")
+    if not item.get("number"):
+        raise ValueError("Gitee pull request create response missing number")
+    return PullRequestResult(str(item.get("number")), str(item.get("html_url", "")))
+
+
+def get_gitee_pull_request(repo_root: Path, number: str, env: Mapping[str, str]) -> dict[str, object]:
+    response = request_json(
+        "GET",
+        f"{gitee_repo_url(repo_root, env, f'pulls/{number}')}?{gitee_query(env, {})}",
+        gitee_headers(),
+        api_name="Gitee",
+    )
+    return require_object(response, "Gitee pull request response must be a JSON object")
+
+
 def create_issue(repo_root: Path, title: str, body: str, labels: str | None, env: Mapping[str, str]) -> IssueResult:
+    if platform(repo_root, env) == "gitee":
+        return create_gitee_issue(repo_root, title, body, labels, env)
     ensure_github(repo_root, env)
     response = request_json("POST", api_url(repo_root, env, "issues"), headers(token(env)), {
         "title": title,
@@ -131,6 +295,8 @@ def create_issue(repo_root: Path, title: str, body: str, labels: str | None, env
 
 
 def list_issues(repo_root: Path, state: str, limit: int, env: Mapping[str, str]) -> list[dict[str, object]]:
+    if platform(repo_root, env) == "gitee":
+        return list_gitee_issues(repo_root, state, limit, env)
     ensure_github(repo_root, env)
     query = urlencode({"state": state, "per_page": str(limit), "sort": "updated"})
     response = request_json("GET", f"{api_url(repo_root, env, 'issues')}?{query}", headers(token(env)))
@@ -140,6 +306,8 @@ def list_issues(repo_root: Path, state: str, limit: int, env: Mapping[str, str])
 
 
 def show_issue(repo_root: Path, number: str, env: Mapping[str, str]) -> dict[str, object]:
+    if platform(repo_root, env) == "gitee":
+        return show_gitee_issue(repo_root, number, env)
     ensure_github(repo_root, env)
     response = request_json("GET", api_url(repo_root, env, f"issues/{number}"), headers(token(env)))
     if not isinstance(response, dict):
@@ -148,6 +316,8 @@ def show_issue(repo_root: Path, number: str, env: Mapping[str, str]) -> dict[str
 
 
 def comment_issue(repo_root: Path, number: str, body: str, env: Mapping[str, str]) -> dict[str, object]:
+    if platform(repo_root, env) == "gitee":
+        return comment_gitee_issue(repo_root, number, body, env)
     ensure_github(repo_root, env)
     response = request_json("POST", api_url(repo_root, env, f"issues/{number}/comments"), headers(token(env)), {"body": body})
     if not isinstance(response, dict):
@@ -156,6 +326,8 @@ def comment_issue(repo_root: Path, number: str, body: str, env: Mapping[str, str
 
 
 def close_issue(repo_root: Path, number: str, env: Mapping[str, str]) -> dict[str, object]:
+    if platform(repo_root, env) == "gitee":
+        return close_gitee_issue(repo_root, number, env)
     ensure_github(repo_root, env)
     response = request_json("PATCH", api_url(repo_root, env, f"issues/{number}"), headers(token(env)), {"state": "closed"})
     if not isinstance(response, dict):
@@ -164,6 +336,8 @@ def close_issue(repo_root: Path, number: str, env: Mapping[str, str]) -> dict[st
 
 
 def create_pull_request(repo_root: Path, title: str, body: str, head: str, base: str, env: Mapping[str, str]) -> PullRequestResult:
+    if platform(repo_root, env) == "gitee":
+        return create_gitee_pull_request(repo_root, title, body, head, base, env)
     ensure_github(repo_root, env)
     response = request_json("POST", api_url(repo_root, env, "pulls"), headers(token(env)), {
         "title": title,
@@ -177,6 +351,8 @@ def create_pull_request(repo_root: Path, title: str, body: str, head: str, base:
 
 
 def get_pull_request(repo_root: Path, number: str, env: Mapping[str, str]) -> dict[str, object]:
+    if platform(repo_root, env) == "gitee":
+        return get_gitee_pull_request(repo_root, number, env)
     ensure_github(repo_root, env)
     response = request_json("GET", api_url(repo_root, env, f"pulls/{number}"), headers(token(env)))
     if not isinstance(response, dict):
