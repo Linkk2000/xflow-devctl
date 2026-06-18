@@ -77,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     approval_prepare.add_argument("--action", required=True)
     approval_prepare.add_argument("--file", required=True, type=Path)
     approval_prepare.add_argument("--command", dest="suggested_command")
-    approval_prepare.add_argument("--reviewer", default="human reviewer")
+    approval_prepare.add_argument("--reviewer")
     approval_prepare.add_argument("--force", action="store_true")
 
     rules_parser = sub.add_parser("rules")

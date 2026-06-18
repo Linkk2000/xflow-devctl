@@ -28,6 +28,7 @@ Check:
 
 Approval:
   devctl approval prepare --issue draft|N --action ACTION --file F [--command CMD] [--reviewer NAME] [--force]
+  reviewer defaults to git config user.name/user.email when available
 
 AI rules:
   devctl rules list

@@ -27,6 +27,9 @@ devctl rules list
 devctl migrate inspect
 ```
 
+`devctl approval prepare` pre-fills the reviewer from `git config user.name`
+and `git config user.email` when available. Pass `--reviewer` to override it.
+
 PowerShell users should prefer `devctl.ps1`, which invokes the Python core and
 sets `PYTHONDONTWRITEBYTECODE=1` to avoid `__pycache__` byproducts.
 

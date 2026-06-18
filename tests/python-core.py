@@ -296,6 +296,7 @@ State: S6_PREPARE_COMMIT_AND_MR_DRAFT
         approval = repo / ".xflow" / "issues" / "issue-draft" / "approvals" / "local-review.md"
         text = approval.read_text(encoding="utf-8")
         digest = hashlib.sha256(issue_file.read_bytes()).hexdigest()
+        assert "Reviewer: Test User (test@example.com)" in text
         assert f"Approved SHA256: {digest}" in text
         run_devctl(repo, "check", "local-review", "--issue", "draft", "--file", str(issue_file), expect=1)
         approval.write_text(text.replace("Approved: no", "Approved: yes").replace(digest, digest.upper()), encoding="utf-8")

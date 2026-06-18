@@ -93,13 +93,36 @@ def suggested_command(action: str, approved_file: Path, issue: str) -> str:
     return f"devctl <remote-write-command> --body-file {path}"
 
 
+def git_config(repo_root: Path, key: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "config", "--get", key],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def default_reviewer(repo_root: Path) -> str:
+    name = git_config(repo_root, "user.name")
+    email = git_config(repo_root, "user.email")
+    if name and email:
+        return f"{name} ({email})"
+    if name:
+        return name
+    if email:
+        return email
+    return "human reviewer"
+
+
 def prepare(
     repo_root: Path,
     issue: str,
     action: str,
     approved_file: Path,
     command: str | None = None,
-    reviewer: str = "human reviewer",
+    reviewer: str | None = None,
     force: bool = False,
 ) -> Path:
     repo_root = repo_root.resolve()
@@ -116,6 +139,7 @@ def prepare(
     digest = sha256_file(approved_path).lower()
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     command = command or suggested_command(action, Path(relative_file), issue)
+    reviewer = reviewer or default_reviewer(repo_root)
     text = (
         "# Local Review Approval\n\n"
         f"Issue: {issue}\n"
