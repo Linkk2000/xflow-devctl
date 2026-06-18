@@ -27,7 +27,7 @@ from .checks import (
     write_pr_state_update_suggestion,
     load_academicforge_skill_names,
 )
-from .env import RuntimeContext, detect_python_runtime
+from .env import RuntimeContext, detect_python_runtime, load_env_files, token_status_lines
 from .migration import inspect_migration, write_v2_wrapper_files
 from .paths import default_issue_file
 from .providers import (
@@ -139,7 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
     approval_prepare.add_argument("--action", required=True)
     approval_prepare.add_argument("--file", required=True, type=Path)
     approval_prepare.add_argument("--command", dest="suggested_command")
-    approval_prepare.add_argument("--reviewer", default="<human reviewer>")
+    approval_prepare.add_argument("--reviewer")
     approval_prepare.add_argument("--force", action="store_true")
 
     migrate = sub.add_parser("migrate")
@@ -157,6 +157,14 @@ def run_preflight() -> int:
     print(f"tool_root: {context.tool_root}")
     print(f"repo_root: {context.repo_root}")
     print(f"product_line: {context.product_line or 'unset'}")
+    loaded_env_files = os.environ.get("XFLOW_LOADED_ENV_FILES", "")
+    if loaded_env_files:
+        for path in loaded_env_files.split(os.pathsep):
+            print(f"env_file: {path}")
+    else:
+        print("env_file: <none>")
+    for line in token_status_lines(os.environ):
+        print(line)
     return 0
 
 
@@ -553,6 +561,7 @@ def run_migrate(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_env_files(os.environ)
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "preflight":

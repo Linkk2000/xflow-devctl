@@ -10,11 +10,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from xflow.env import RuntimeContext, detect_python_runtime
+from xflow.env import RuntimeContext, detect_python_runtime, load_env_files
 from xflow.checks import (
     check_academic_issue,
     check_academic_mr,
@@ -81,7 +82,7 @@ def write_local_review(
 
         sha = hashlib.sha256(approved_file.read_bytes()).hexdigest()
     review = Path(repo_root) / ".xflow" / "issues" / f"issue-{issue}" / "approvals" / "local-review.md"
-    review.parent.mkdir(parents=True)
+    review.parent.mkdir(parents=True, exist_ok=True)
     text = (
         f"Issue: {issue}\n"
         "Reviewer: user\n"
@@ -129,6 +130,39 @@ class RuntimeTests(unittest.TestCase):
                     if not message.isascii():
                         offenders.append(f"{path.relative_to(ROOT)}:{line_number}: {message}")
         self.assertEqual(offenders, [])
+
+    def test_env_loading_keeps_platform_project_scoped(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            home = root / "home"
+            repo.mkdir()
+            global_env = home / ".xflow" / "env.local"
+            project_env = repo / ".xflow" / "local" / "env.local"
+            global_env.parent.mkdir(parents=True)
+            project_env.parent.mkdir(parents=True)
+            global_env.write_text(
+                "GITHUB_TOKEN=global-gh\nGITEE_TOKEN=global-ge\nXFLOW_PLATFORM=github\n",
+                encoding="utf-8",
+            )
+            project_env.write_text("XFLOW_PLATFORM=gitee\n", encoding="utf-8")
+
+            env = {"HOME": str(home), "USERPROFILE": str(home), "DEVCTL_REPO_ROOT": str(repo)}
+            loaded = load_env_files(env)
+
+            self.assertEqual(loaded, [global_env, project_env])
+            self.assertEqual(env["GITHUB_TOKEN"], "global-gh")
+            self.assertEqual(env["GITEE_TOKEN"], "global-ge")
+            self.assertEqual(env["XFLOW_PLATFORM"], "gitee")
+
+            project_env.unlink()
+            env = {"HOME": str(home), "USERPROFILE": str(home), "DEVCTL_REPO_ROOT": str(repo)}
+            loaded = load_env_files(env)
+
+            self.assertEqual(loaded, [global_env])
+            self.assertEqual(env["GITHUB_TOKEN"], "global-gh")
+            self.assertEqual(env["GITEE_TOKEN"], "global-ge")
+            self.assertNotIn("XFLOW_PLATFORM", env)
 
 
 class RuleSyncTests(unittest.TestCase):
@@ -1593,6 +1627,9 @@ class ApprovalTests(unittest.TestCase):
     def test_prepare_local_review_prefills_mechanical_fields_without_approving(self):
         with TemporaryDirectory() as tmp:
             repo = Path(tmp)
+            subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test User"], check=True)
+            subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
             artifact = repo / ".xflow" / "issues" / "issue-7" / "mr-draft.md"
             artifact.parent.mkdir(parents=True)
             artifact.write_text("MR body\n", encoding="utf-8")
@@ -1602,13 +1639,24 @@ class ApprovalTests(unittest.TestCase):
 
             self.assertIn("# Local Review Approval", text)
             self.assertIn("Issue: 7", text)
-            self.assertIn("Reviewer: <human reviewer>", text)
+            self.assertIn("Reviewer: Test User (test@example.com)", text)
             self.assertIn("Approved Action: git-mr", text)
             self.assertIn("Approved File: .xflow/issues/issue-7/mr-draft.md", text)
             self.assertIn(f"Approved SHA256: {sha256_file(artifact)}", text)
             self.assertIn("Approved: no", text)
             self.assertIn("Suggested Command:", text)
             self.assertTrue(parse_field(text, "Approved SHA256").islower())
+
+    def test_prepare_local_review_explicit_reviewer_overrides_git_config(self):
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            artifact = repo / ".xflow" / "issues" / "issue-7" / "mr-draft.md"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_text("MR body\n", encoding="utf-8")
+
+            review = prepare_local_review_file(repo, "7", "git-mr", artifact, reviewer="Dr Reviewer")
+
+            self.assertIn("Reviewer: Dr Reviewer", review.read_text(encoding="utf-8"))
 
     def test_prepare_local_review_cli_writes_active_approval_file(self):
         with TemporaryDirectory() as tmp:
@@ -1935,6 +1983,138 @@ class IssueProviderTests(unittest.TestCase):
                             "labels": ["academic", "tdd"],
                         },
                     )
+                finally:
+                    os.environ.clear()
+                    os.environ.update(original)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_issue_commands_use_gitee_provider_when_platform_is_gitee(self):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                parsed = urlparse(self.path)
+                query = parse_qs(parsed.query)
+                requests.append({"method": "GET", "path": parsed.path, "query": query})
+                if parsed.path.endswith("/issues/7"):
+                    payload = {
+                        "number": 7,
+                        "state": "open",
+                        "title": "Academic draft",
+                        "body": "Body text",
+                        "html_url": "https://gitee.example/issues/7",
+                    }
+                else:
+                    payload = [
+                        {"number": 7, "state": "open", "title": "Academic draft"},
+                    ]
+                encoded = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                form = parse_qs(self.rfile.read(length).decode("utf-8"))
+                requests.append({"method": "POST", "path": self.path, "form": form})
+                if self.path.endswith("/comments"):
+                    payload = {"html_url": "https://gitee.example/issues/7#comment"}
+                else:
+                    payload = {"number": 7, "html_url": "https://gitee.example/issues/7"}
+                encoded = json.dumps(payload).encode("utf-8")
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+            def do_PATCH(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                form = parse_qs(self.rfile.read(length).decode("utf-8"))
+                requests.append({"method": "PATCH", "path": self.path, "form": form})
+                payload = json.dumps(
+                    {"number": 7, "state": "closed", "html_url": "https://gitee.example/issues/7"}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, _format, *args):
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                draft = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
+                draft.parent.mkdir(parents=True)
+                draft.write_text("<!-- xflow: academic-issue-draft -->\n\n## Background\nBody text\n", encoding="utf-8")
+                write_local_review(repo, "draft", "issue-create", draft)
+                comment = repo / ".xflow" / "issues" / "issue-7" / "comment-draft.md"
+                comment.parent.mkdir(parents=True)
+                comment.write_text("Reviewed comment\n", encoding="utf-8")
+                write_local_review(repo, "7", "issue-comment", comment)
+                walkthrough = repo / ".xflow" / "issues" / "issue-7" / "walkthrough.md"
+                walkthrough.write_text("Ready to close\n", encoding="utf-8")
+
+                original = os.environ.copy()
+                try:
+                    os.environ.clear()
+                    os.environ.update(
+                        {
+                            "DEVCTL_REPO_ROOT": str(repo),
+                            "DEVCTL_PRODUCT_LINE": "academic",
+                            "XFLOW_PLATFORM": "gitee",
+                            "GITEE_API_BASE": f"http://127.0.0.1:{server.server_port}",
+                            "GITEE_TOKEN": "gitee-token",
+                            "DEVCTL_OWNER": "Linkk2000",
+                            "DEVCTL_REPO": "paper-demo",
+                        }
+                    )
+
+                    out = StringIO()
+                    with redirect_stdout(out):
+                        self.assertEqual(main(["issue", "create", "Academic draft", "--body-file", str(draft), "--labels", "academic,tdd"]), 0)
+                        self.assertEqual(main(["issue", "list", "--state", "open", "--limit", "5"]), 0)
+                        self.assertEqual(main(["issue", "show", "7"]), 0)
+                        self.assertEqual(main(["issue", "comment", "7", "--body-file", str(comment)]), 0)
+                        write_local_review(repo, "7", "issue-close", walkthrough)
+                        self.assertEqual(main(["issue", "close", "7"]), 0)
+
+                    self.assertIn("Issue #7 created", out.getvalue())
+                    self.assertIn("#7\t[open]\tAcademic draft", out.getvalue())
+                    self.assertIn("Comment posted on Issue #7", out.getvalue())
+                    self.assertIn("Issue #7 closed", out.getvalue())
+
+                    create_request = requests[0]
+                    self.assertEqual(create_request["path"], "/repos/Linkk2000/issues")
+                    self.assertEqual(create_request["form"]["access_token"], ["gitee-token"])
+                    self.assertEqual(create_request["form"]["repo"], ["paper-demo"])
+                    self.assertEqual(create_request["form"]["labels"], ["academic,tdd"])
+
+                    list_request = requests[1]
+                    self.assertEqual(list_request["path"], "/repos/Linkk2000/paper-demo/issues")
+                    self.assertEqual(list_request["query"]["access_token"], ["gitee-token"])
+                    self.assertEqual(list_request["query"]["state"], ["open"])
+                    self.assertEqual(list_request["query"]["per_page"], ["5"])
+
+                    comment_request = requests[3]
+                    self.assertEqual(comment_request["path"], "/repos/Linkk2000/paper-demo/issues/7/comments")
+                    self.assertEqual(comment_request["form"]["body"], ["Reviewed comment\n"])
+
+                    close_request = requests[4]
+                    self.assertEqual(close_request["path"], "/repos/Linkk2000/issues/7")
+                    self.assertEqual(close_request["form"]["repo"], ["paper-demo"])
+                    self.assertEqual(close_request["form"]["state"], ["closed"])
                 finally:
                     os.environ.clear()
                     os.environ.update(original)
@@ -2306,6 +2486,109 @@ class PullRequestProviderTests(unittest.TestCase):
                     self.assertIn("PR: 9", suggestion_text)
                     self.assertIn("State: S9_REMOTE_REVIEW_AND_CI", suggestion_text)
                     self.assertIn("No second local approval is required", suggestion_text)
+                finally:
+                    os.environ.clear()
+                    os.environ.update(original)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            server.server_close()
+
+    def test_git_mr_and_pr_get_use_gitee_provider_when_platform_is_gitee(self):
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                form = parse_qs(self.rfile.read(length).decode("utf-8"))
+                requests.append({"method": "POST", "path": self.path, "form": form})
+                payload = json.dumps({"number": 9, "html_url": "https://gitee.example/pulls/9"}).encode("utf-8")
+                self.send_response(201)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_GET(self):
+                parsed = urlparse(self.path)
+                requests.append({"method": "GET", "path": parsed.path, "query": parse_qs(parsed.query)})
+                payload = json.dumps(
+                    {
+                        "number": 9,
+                        "state": "open",
+                        "title": "Paper polish",
+                        "html_url": "https://gitee.example/pulls/9",
+                        "head": {"ref": "feature/1-polish"},
+                        "base": {"ref": "main"},
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, _format, *args):
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with TemporaryDirectory() as tmp:
+                repo = Path(tmp)
+                self.init_repo(repo)
+                mr = repo / ".xflow" / "issues" / "issue-1" / "mr-draft.md"
+                mr.parent.mkdir(parents=True)
+                mr.write_text("<!-- xflow: academic-mr-draft -->\n\nCloses #1\n\n## Summary\n- Ready\n", encoding="utf-8")
+                write_local_review(repo, "1", "git-mr", mr)
+
+                original = os.environ.copy()
+                try:
+                    os.environ.clear()
+                    os.environ.update(
+                        {
+                            "DEVCTL_REPO_ROOT": str(repo),
+                            "DEVCTL_PRODUCT_LINE": "academic",
+                            "DEVCTL_SKIP_PUSH": "1",
+                            "XFLOW_PLATFORM": "gitee",
+                            "GITEE_API_BASE": f"http://127.0.0.1:{server.server_port}",
+                            "GITEE_TOKEN": "gitee-token",
+                            "DEVCTL_OWNER": "Linkk2000",
+                            "DEVCTL_REPO": "paper-demo",
+                            "PATH": original.get("PATH", ""),
+                        }
+                    )
+                    out = StringIO()
+                    with redirect_stdout(out):
+                        self.assertEqual(
+                            main(
+                                [
+                                    "git",
+                                    "mr",
+                                    "--title",
+                                    "Paper polish",
+                                    "--body-file",
+                                    str(mr),
+                                    "--base",
+                                    "main",
+                                    "--issue",
+                                    "1",
+                                ]
+                            ),
+                            0,
+                        )
+                        self.assertEqual(main(["git", "pr-get", "9"]), 0)
+
+                    self.assertIn("PR #9 created", out.getvalue())
+                    self.assertIn("#9 [open] Paper polish", out.getvalue())
+                    self.assertEqual(requests[0]["path"], "/repos/Linkk2000/paper-demo/pulls")
+                    self.assertEqual(requests[0]["form"]["access_token"], ["gitee-token"])
+                    self.assertEqual(requests[0]["form"]["title"], ["Paper polish"])
+                    self.assertEqual(requests[0]["form"]["head"], ["feature/1-polish"])
+                    self.assertEqual(requests[0]["form"]["base"], ["main"])
+                    self.assertEqual(requests[1]["path"], "/repos/Linkk2000/paper-demo/pulls/9")
+                    self.assertEqual(requests[1]["query"]["access_token"], ["gitee-token"])
                 finally:
                     os.environ.clear()
                     os.environ.update(original)
