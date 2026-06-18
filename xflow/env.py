@@ -8,6 +8,7 @@ from typing import Mapping, MutableMapping
 
 
 TOKEN_NAMES = ("GITHUB_TOKEN", "GITHUB_ACCESS_TOKEN", "GITHUB_PRIVATE_TOKEN", "GITEE_TOKEN", "GITEE_ACCESS_TOKEN", "GITEE_PRIVATE_TOKEN")
+PROJECT_SCOPED_KEYS = {"XFLOW_PLATFORM"}
 
 
 @dataclass(frozen=True)
@@ -50,12 +51,29 @@ def parse_env_file(path: Path) -> dict[str, str]:
     return values
 
 
-def env_file_candidates(env: Mapping[str, str]) -> list[Path]:
-    home = Path.home()
-    candidates = [home / "gitee.env.local", home / ".xflow" / "env.local"]
+def home_from_env(env: Mapping[str, str]) -> Path:
+    for name in ("HOME", "USERPROFILE"):
+        value = env.get(name, "").strip()
+        if value:
+            return Path(value)
+    return Path.home()
+
+
+def repo_root_from_env(env: Mapping[str, str]) -> Path:
+    return Path(env.get("DEVCTL_REPO_ROOT", Path.cwd())).resolve()
+
+
+def env_file_candidates(env: Mapping[str, str]) -> list[tuple[Path, str]]:
+    home = home_from_env(env)
+    repo_root = repo_root_from_env(env)
+    candidates = [
+        (home / "gitee.env.local", "user"),
+        (home / ".xflow" / "env.local", "user"),
+        (repo_root / ".xflow" / "local" / "env.local", "project"),
+    ]
     explicit = env.get("XFLOW_ENV_FILE", "").strip()
     if explicit:
-        candidates.append(Path(explicit))
+        candidates.append((Path(explicit), "explicit"))
     return candidates
 
 
@@ -64,11 +82,14 @@ def load_env_files(env: MutableMapping[str, str]) -> list[Path]:
     merged: dict[str, str] = {}
     loaded: list[Path] = []
 
-    for path in env_file_candidates(env):
+    for path, scope in env_file_candidates(env):
         expanded = path.expanduser()
         if not expanded.is_file():
             continue
-        merged.update(parse_env_file(expanded))
+        values = parse_env_file(expanded)
+        if scope == "user":
+            values = {key: value for key, value in values.items() if key not in PROJECT_SCOPED_KEYS}
+        merged.update(values)
         loaded.append(expanded)
 
     for key, value in merged.items():

@@ -16,6 +16,7 @@ OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
 from xflow.checks import write_pr_state_update_suggestion
+from xflow.env import load_env_files
 from xflow.providers import (
     close_issue,
     comment_issue,
@@ -81,6 +82,28 @@ def write(path: Path, text: str) -> None:
 
 def git(repo_root: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(repo_root), *args], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def test_env_loading_policy(repo: Path) -> None:
+    fake_home = repo / "fake-home"
+    global_env = fake_home / ".xflow" / "env.local"
+    project_env = repo / ".xflow" / "local" / "env.local"
+    write(global_env, "GITHUB_TOKEN=global-gh\nGITEE_TOKEN=global-ge\nXFLOW_PLATFORM=github\n")
+    write(project_env, "XFLOW_PLATFORM=gitee\n")
+    env = {"USERPROFILE": str(fake_home), "HOME": str(fake_home), "DEVCTL_REPO_ROOT": str(repo)}
+    loaded = load_env_files(env)
+    assert global_env in loaded
+    assert project_env in loaded
+    assert env["GITHUB_TOKEN"] == "global-gh"
+    assert env["GITEE_TOKEN"] == "global-ge"
+    assert env["XFLOW_PLATFORM"] == "gitee"
+
+    project_env.unlink()
+    env = {"USERPROFILE": str(fake_home), "HOME": str(fake_home), "DEVCTL_REPO_ROOT": str(repo)}
+    load_env_files(env)
+    assert env["GITHUB_TOKEN"] == "global-gh"
+    assert env["GITEE_TOKEN"] == "global-ge"
+    assert "XFLOW_PLATFORM" not in env
 
 
 class RecordingApiHandler(BaseHTTPRequestHandler):
@@ -167,6 +190,7 @@ def main() -> None:
         git(repo, "config", "user.email", "test@example.com")
         git(repo, "config", "user.name", "Test User")
         git(repo, "remote", "add", "origin", "git@gitee.com:Linkk2000/paper-demo.git")
+        test_env_loading_policy(repo)
 
         issue_file = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
         write(

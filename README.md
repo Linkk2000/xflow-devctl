@@ -38,7 +38,6 @@ User-level parameters should live in `~/.xflow/env.local`:
 ```text
 GITHUB_TOKEN=...
 GITEE_TOKEN=...
-XFLOW_PLATFORM=github
 ```
 
 `XFLOW_ENV_FILE` may point at an explicit env file for one run. The legacy
@@ -47,6 +46,9 @@ prints which env files were loaded and whether tokens are set, but never prints
 token values.
 
 The Python provider supports GitHub and Gitee. `XFLOW_PLATFORM` may be set to
-`github` or `gitee`; otherwise devctl infers the platform from the `origin`
-remote URL. Gitee calls use the v5 OpenAPI shape and `GITEE_TOKEN`; set
-`GITEE_API_BASE` only for tests or custom hosts.
+`github` or `gitee` in the process environment, explicit `XFLOW_ENV_FILE`, or
+project-local `.xflow/local/env.local`; otherwise devctl infers the platform
+from the `origin` remote URL. Do not put `XFLOW_PLATFORM` in the user-level
+`~/.xflow/env.local` when working across both GitHub and Gitee projects. Gitee
+calls use the v5 OpenAPI shape and `GITEE_TOKEN`; set `GITEE_API_BASE` only for
+tests or custom hosts.

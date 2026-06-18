@@ -46,6 +46,7 @@ App:
 Config:
   XFLOW_ENV_FILE            explicit env file for one run
   ~/.xflow/env.local        preferred user-level env file
+  .xflow/local/env.local    project-level env file for platform overrides
   ~/gitee.env.local         legacy env file fallback
   GITHUB_TOKEN              GitHub personal access token
   GITEE_TOKEN               Gitee personal access token
