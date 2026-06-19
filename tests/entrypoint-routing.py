@@ -88,7 +88,16 @@ def quote_bash(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
+def assert_no_legacy_run_command() -> None:
+    entrypoint = (OPS_ROOT / "devctl").read_text(encoding="utf-8")
+    assert "\n    run)" not in entrypoint
+    assert 'run_script "$OPS/run.sh"' not in entrypoint
+    assert not (OPS_ROOT / "run.sh").exists()
+
+
 def main() -> None:
+    assert_no_legacy_run_command()
+
     with tempfile.TemporaryDirectory() as raw:
         repo = Path(raw)
         git(repo, "init", "-q")

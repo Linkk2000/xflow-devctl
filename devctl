@@ -86,10 +86,6 @@ main() {
         *) devctl_die "unknown app subcommand: $1 (devctl help)" ;;
       esac
       ;;
-    run)
-      shift
-      run_script "$OPS/run.sh" "$@"
-      ;;
     *)
       devctl_die "unknown command: $1 (devctl help)"
       ;;
