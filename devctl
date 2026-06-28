@@ -16,7 +16,7 @@ export DEVCTL_REPO_ROOT
 export DEVCTL_OPS_ROOT="$OPS"
 
 case "${1:-help}" in
-  -h|--help|help|check|git|issue|preflight|approval|rules|migrate)
+  -h|--help|help|check|git|issue|preflight|approval|attachment|rules|migrate)
     export DEVCTL_SKIP_PROVIDER_LOAD=1
     ;;
 esac
@@ -51,7 +51,7 @@ main() {
     -h|--help|help)
       usage
       ;;
-    preflight|approval|rules|migrate)
+    preflight|approval|attachment|rules|migrate)
       run_python "$@"
       ;;
     git)

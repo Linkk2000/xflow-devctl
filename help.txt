@@ -1,14 +1,20 @@
 Issue (GitHub/Gitee):
-  devctl issue create <title> [--body B] [--body-file F] [--labels a,b]
+  devctl issue create <title> [--body B] [--body-file F] [--labels a,b] [--attachments manifest.json]
   devctl issue list [--state open|closed|all] [--limit N]
   devctl issue show <number>
-  devctl issue comment <number> [--body B] [--body-file F]
+  devctl issue comment <number> [--body B] [--body-file F] [--attachments manifest.json]
   devctl issue close <number>
+
+Attachment:
+  devctl attachment add --issue draft|N --file PATH [--as auto|image|file] [--id ID] [--manifest manifest.json]
+  devctl attachment check --issue draft|N [--manifest manifest.json] [--body-file F] [--final]
+  devctl attachment publish --issue draft|N [--manifest manifest.json] --url ID=https://public.example/file.png
+  devctl attachment render --issue draft|N [--manifest manifest.json] --input draft.md --output final.md
 
 Git:
   devctl git start <slug> [--issue N]
   devctl git commit-msg [summary]
-  devctl git mr [--title T] [--body-file F] [--base BRANCH] [--issue N]
+  devctl git mr [--title T] [--body-file F] [--base BRANCH] [--issue N] [--attachments manifest.json]
   devctl git pr-get <number>
   devctl git status
   devctl git done
@@ -23,11 +29,11 @@ Check:
   devctl check issue-draft [--issue draft|N] [--file F]
   devctl check mr-draft --issue N [--file F]
   devctl check current-task [--issue N]
-  devctl check local-review --issue draft|N --file F --action issue-create|issue-comment|issue-close|git-mr
+  devctl check local-review --issue draft|N --file F --action issue-create|issue-comment|issue-close|git-mr [--attachments manifest.json]
   devctl check submodule-hygiene
 
 Approval:
-  devctl approval prepare --issue draft|N --action ACTION --file F [--command CMD] [--reviewer NAME] [--force]
+  devctl approval prepare --issue draft|N --action ACTION --file F [--attachments manifest.json] [--command CMD] [--reviewer NAME] [--force]
   reviewer defaults to git config user.name/user.email when available
 
 AI rules:

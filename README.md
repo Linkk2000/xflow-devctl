@@ -20,6 +20,10 @@ Useful commands:
 ```text
 devctl preflight
 devctl approval prepare --issue draft --action issue-create --file .xflow/issues/issue-draft/issue-draft.md
+devctl attachment add --issue draft --file screenshot.png --as image
+devctl attachment check --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json
+devctl attachment publish --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json --url att-001=https://example.test/screenshot.png
+devctl attachment render --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json --input .xflow/issues/issue-draft/issue-draft.md --output .xflow/issues/issue-draft/issue-draft.final.md
 devctl check current-task --issue 1
 devctl check local-review --issue draft --file .xflow/issues/issue-draft/issue-draft.md --action issue-create
 devctl check submodule-hygiene
@@ -29,6 +33,11 @@ devctl migrate inspect
 
 `devctl approval prepare` pre-fills the reviewer from `git config user.name`
 and `git config user.email` when available. Pass `--reviewer` to override it.
+When an issue, comment, or PR/MR body references pasted files or screenshots,
+prepare the attachment manifest first and pass `--attachments <manifest>` to
+`approval prepare`, `check local-review`, and the final remote-write command.
+Remote bodies are rejected if they still contain `xflow-attachment://`
+placeholders or local file paths.
 
 PowerShell users should prefer `devctl.ps1`, which invokes the Python core and
 sets `PYTHONDONTWRITEBYTECODE=1` to avoid `__pycache__` byproducts.

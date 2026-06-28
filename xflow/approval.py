@@ -80,16 +80,17 @@ def display_path(repo_root: Path, path: Path) -> str:
         return resolved.as_posix()
 
 
-def suggested_command(action: str, approved_file: Path, issue: str) -> str:
+def suggested_command(action: str, approved_file: Path, issue: str, attachment_manifest: Path | None = None) -> str:
     path = approved_file.as_posix()
+    attachments = f" --attachments {attachment_manifest.as_posix()}" if attachment_manifest else ""
     if action == "issue-create":
-        return f'devctl issue create "<title>" --body-file {path}'
+        return f'devctl issue create "<title>" --body-file {path}{attachments}'
     if action == "issue-comment":
-        return f"devctl issue comment {issue} --body-file {path}"
+        return f"devctl issue comment {issue} --body-file {path}{attachments}"
     if action == "issue-close":
         return f"devctl issue close {issue}"
     if action == "git-mr":
-        return f'devctl git mr --title "<title>" --body-file {path} --issue {issue}'
+        return f'devctl git mr --title "<title>" --body-file {path} --issue {issue}{attachments}'
     return f"devctl <remote-write-command> --body-file {path}"
 
 
@@ -124,6 +125,7 @@ def prepare(
     command: str | None = None,
     reviewer: str | None = None,
     force: bool = False,
+    attachment_manifest: Path | None = None,
 ) -> Path:
     repo_root = repo_root.resolve()
     approved_path = resolve_path(repo_root, approved_file)
@@ -137,8 +139,20 @@ def prepare(
 
     relative_file = display_path(repo_root, approved_path)
     digest = sha256_file(approved_path).lower()
+    attachment_text = ""
+    relative_manifest: str | None = None
+    if attachment_manifest is not None:
+        manifest_path = resolve_path(repo_root, attachment_manifest)
+        if not manifest_path.is_file():
+            raise ValueError(f"missing attachment manifest: {manifest_path}")
+        relative_manifest = display_path(repo_root, manifest_path)
+        manifest_digest = sha256_file(manifest_path).lower()
+        attachment_text = (
+            f"Attachment Manifest: {relative_manifest}\n"
+            f"Attachment Manifest SHA256: {manifest_digest}\n"
+        )
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
-    command = command or suggested_command(action, Path(relative_file), issue)
+    command = command or suggested_command(action, Path(relative_file), issue, Path(relative_manifest) if relative_manifest else None)
     reviewer = reviewer or default_reviewer(repo_root)
     text = (
         "# Local Review Approval\n\n"
@@ -147,7 +161,8 @@ def prepare(
         f"Approved At: {now}\n"
         f"Approved Action: {action}\n"
         f"Approved File: {relative_file}\n"
-        f"Approved SHA256: {digest}\n\n"
+        f"Approved SHA256: {digest}\n"
+        f"{attachment_text}\n"
         "## Decision\n"
         "Approved: no\n\n"
         "## Suggested Command\n"
@@ -161,7 +176,7 @@ def prepare(
     return review_file
 
 
-def check(repo_root: Path, issue: str, approved_file: Path) -> None:
+def check(repo_root: Path, issue: str, approved_file: Path, attachment_manifest: Path | None = None) -> None:
     repo_root = repo_root.resolve()
     review_file = default_approval_file(repo_root, issue)
     if not review_file.is_file():
@@ -185,8 +200,27 @@ def check(repo_root: Path, issue: str, approved_file: Path) -> None:
     if expected != actual_hash:
         raise ValueError(f"hash mismatch for {approved_file}: expected {expected}, actual {actual_hash}")
 
+    if attachment_manifest is not None:
+        declared_manifest = resolve_path(repo_root, Path(field(text, "Attachment Manifest")))
+        actual_manifest = resolve_path(repo_root, attachment_manifest)
+        if declared_manifest != actual_manifest:
+            raise ValueError(f"attachment manifest mismatch: expected {display_path(repo_root, actual_manifest)}")
+        expected_manifest = field(text, "Attachment Manifest SHA256").lower()
+        actual_manifest_hash = sha256_file(actual_manifest).lower()
+        if expected_manifest != actual_manifest_hash:
+            raise ValueError(
+                f"hash mismatch for attachment manifest {attachment_manifest}: "
+                f"expected {expected_manifest}, actual {actual_manifest_hash}"
+            )
 
-def require_remote(repo_root: Path, action: str, approved_file: Path, issue: str) -> None:
+
+def require_remote(
+    repo_root: Path,
+    action: str,
+    approved_file: Path,
+    issue: str,
+    attachment_manifest: Path | None = None,
+) -> None:
     review_file = default_approval_file(repo_root, issue)
     if not review_file.is_file():
         raise ValueError(f"local review approval required: {review_file}")
@@ -194,4 +228,4 @@ def require_remote(repo_root: Path, action: str, approved_file: Path, issue: str
     approved_action = field(text, "Approved Action")
     if approved_action != action and approved_action.lower() not in UMBRELLA_ACTIONS:
         raise ValueError(f"action mismatch: expected {action}, got {approved_action}")
-    check(repo_root, issue, approved_file)
+    check(repo_root, issue, approved_file, attachment_manifest)

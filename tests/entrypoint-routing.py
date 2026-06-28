@@ -168,6 +168,11 @@ Closes #1
         check_result = run_bash(repo, "check", "mr-draft", "--issue", "1")
         assert "mr-draft check passed" in check_result.stdout
 
+        pasted = repo / "route-image.png"
+        pasted.write_bytes(b"\x89PNG\r\n\x1a\nroute-test")
+        attachment_result = run_bash(repo, "attachment", "add", "--issue", "draft", "--file", str(pasted), "--as", "image")
+        assert "xflow-attachment://att-001" in attachment_result.stdout
+
     print("entrypoint routing ok")
 
 

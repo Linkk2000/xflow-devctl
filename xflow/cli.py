@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import approval, providers, rules
+from . import approval, attachment, providers, rules
 from .checks import (
     check_current_task,
     check_issue_draft,
@@ -36,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     local_review.add_argument("--issue", required=True)
     local_review.add_argument("--file", required=True, type=Path)
     local_review.add_argument("--action")
+    local_review.add_argument("--attachments", type=Path)
     check_sub.add_parser("submodule-hygiene")
     current_task = check_sub.add_parser("current-task")
     current_task.add_argument("--issue")
@@ -47,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     issue_create.add_argument("--body")
     issue_create.add_argument("--body-file", type=Path)
     issue_create.add_argument("--labels")
+    issue_create.add_argument("--attachments", type=Path)
     issue_list = issue_sub.add_parser("list")
     issue_list.add_argument("--state", choices=("open", "closed", "all"), default="open")
     issue_list.add_argument("--limit", type=int, default=20)
@@ -56,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     issue_comment.add_argument("number")
     issue_comment.add_argument("--body")
     issue_comment.add_argument("--body-file", type=Path)
+    issue_comment.add_argument("--attachments", type=Path)
     issue_close = issue_sub.add_parser("close")
     issue_close.add_argument("number")
 
@@ -67,6 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     git_mr.add_argument("--body-file", type=Path)
     git_mr.add_argument("--base")
     git_mr.add_argument("--issue")
+    git_mr.add_argument("--attachments", type=Path)
     pr_get = git_sub.add_parser("pr-get")
     pr_get.add_argument("number")
 
@@ -79,6 +83,30 @@ def build_parser() -> argparse.ArgumentParser:
     approval_prepare.add_argument("--command", dest="suggested_command")
     approval_prepare.add_argument("--reviewer")
     approval_prepare.add_argument("--force", action="store_true")
+    approval_prepare.add_argument("--attachments", type=Path)
+
+    attachment_parser = sub.add_parser("attachment")
+    attachment_sub = attachment_parser.add_subparsers(dest="attachment_command")
+    attachment_add = attachment_sub.add_parser("add")
+    attachment_add.add_argument("--issue", default="draft")
+    attachment_add.add_argument("--file", required=True, type=Path)
+    attachment_add.add_argument("--as", dest="attachment_kind", choices=("auto", "image", "file"), default="auto")
+    attachment_add.add_argument("--id")
+    attachment_add.add_argument("--manifest", type=Path)
+    attachment_check = attachment_sub.add_parser("check")
+    attachment_check.add_argument("--issue", default="draft")
+    attachment_check.add_argument("--manifest", type=Path)
+    attachment_check.add_argument("--body-file", type=Path)
+    attachment_check.add_argument("--final", action="store_true")
+    attachment_publish = attachment_sub.add_parser("publish")
+    attachment_publish.add_argument("--issue", default="draft")
+    attachment_publish.add_argument("--manifest", type=Path)
+    attachment_publish.add_argument("--url", action="append", default=[])
+    attachment_render = attachment_sub.add_parser("render")
+    attachment_render.add_argument("--issue", default="draft")
+    attachment_render.add_argument("--manifest", type=Path)
+    attachment_render.add_argument("--input", required=True, type=Path)
+    attachment_render.add_argument("--output", required=True, type=Path)
 
     rules_parser = sub.add_parser("rules")
     rules_sub = rules_parser.add_subparsers(dest="rules_command")
@@ -136,9 +164,9 @@ def run_check(args: argparse.Namespace) -> int:
     elif args.check_command == "local-review":
         path = args.file
         if args.action:
-            approval.require_remote(ctx.repo_root, args.action, path, args.issue)
+            approval.require_remote(ctx.repo_root, args.action, path, args.issue, args.attachments)
         else:
-            approval.check(ctx.repo_root, args.issue, path)
+            approval.check(ctx.repo_root, args.issue, path, args.attachments)
     elif args.check_command == "submodule-hygiene":
         path = ctx.repo_root
         check_submodule_hygiene(path)
@@ -182,7 +210,8 @@ def run_issue(args: argparse.Namespace) -> int:
         return 0
     if args.issue_command == "comment":
         body, file_path = body_from_file(args.body_file, args.body, "remote issue comments require --body-file for local review")
-        approval.require_remote(ctx.repo_root, "issue-comment", file_path, args.number)
+        attachment.ensure_publishable(ctx.repo_root, file_path, args.attachments, args.number if args.attachments else None)
+        approval.require_remote(ctx.repo_root, "issue-comment", file_path, args.number, args.attachments)
         if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
             print("[INFO] issue-comment gate passed; provider skipped")
             return 0
@@ -203,7 +232,8 @@ def run_issue(args: argparse.Namespace) -> int:
     if args.issue_command != "create":
         raise ValueError(f"unknown issue subcommand: {args.issue_command}")
     body, file_path = body_from_file(args.body_file, args.body, "remote issue creation requires --body-file for local review")
-    approval.require_remote(ctx.repo_root, "issue-create", file_path, "draft")
+    attachment.ensure_publishable(ctx.repo_root, file_path, args.attachments, "draft" if args.attachments else None)
+    approval.require_remote(ctx.repo_root, "issue-create", file_path, "draft", args.attachments)
     if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
         print("[INFO] issue-create gate passed; provider skipped")
         return 0
@@ -268,7 +298,8 @@ def run_git(args: argparse.Namespace) -> int:
     body_file = args.body_file or default_issue_file(ctx.repo_root, issue, "mr-draft.md")
     if not body_file.is_file():
         raise ValueError(f"body file does not exist: {body_file}")
-    approval.require_remote(ctx.repo_root, "git-mr", body_file, issue)
+    attachment.ensure_publishable(ctx.repo_root, body_file, args.attachments, issue if args.attachments else None)
+    approval.require_remote(ctx.repo_root, "git-mr", body_file, issue, args.attachments)
     branch = current_branch(ctx.repo_root)
     base = args.base or branch_meta(ctx.repo_root, "base") or default_base(ctx.repo_root)
     if branch == base:
@@ -295,9 +326,47 @@ def run_approval(args: argparse.Namespace) -> int:
     ctx = context()
     if args.approval_command != "prepare":
         raise ValueError(f"unknown approval subcommand: {args.approval_command}")
-    path = approval.prepare(ctx.repo_root, args.issue, args.action, args.file, args.suggested_command, args.reviewer, args.force)
+    path = approval.prepare(
+        ctx.repo_root,
+        args.issue,
+        args.action,
+        args.file,
+        args.suggested_command,
+        args.reviewer,
+        args.force,
+        args.attachments,
+    )
     print(f"[INFO] local review prepared: {path}")
     return 0
+
+
+def attachment_manifest_path(repo_root: Path, issue: str, manifest: Path | None) -> Path:
+    return manifest or attachment.default_manifest(repo_root, issue)
+
+
+def run_attachment(args: argparse.Namespace) -> int:
+    ctx = context()
+    issue = args.issue
+    manifest = attachment_manifest_path(ctx.repo_root, issue, getattr(args, "manifest", None))
+    if args.attachment_command == "add":
+        item, path = attachment.add_attachment(ctx.repo_root, issue, args.file, args.attachment_kind, args.id, manifest)
+        print(f"[INFO] attachment added: {item['id']}")
+        print(item["markdown"])
+        print(f"[INFO] manifest: {path}")
+        return 0
+    if args.attachment_command == "check":
+        attachment.check_attachment(ctx.repo_root, issue, manifest, args.body_file, args.final)
+        print(f"[INFO] attachment check passed: {manifest}")
+        return 0
+    if args.attachment_command == "publish":
+        path = attachment.publish_urls(ctx.repo_root, issue, manifest, args.url)
+        print(f"[INFO] attachment URLs recorded: {path}")
+        return 0
+    if args.attachment_command == "render":
+        output = attachment.render_body(ctx.repo_root, issue, manifest, args.input, args.output)
+        print(f"[INFO] rendered attachment body: {output}")
+        return 0
+    raise ValueError(f"unknown attachment subcommand: {args.attachment_command}")
 
 
 def run_rules(args: argparse.Namespace) -> int:
@@ -350,6 +419,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_git(args)
         if args.command == "approval":
             return run_approval(args)
+        if args.command == "attachment":
+            return run_attachment(args)
         if args.command == "rules":
             return run_rules(args)
         if args.command == "migrate":

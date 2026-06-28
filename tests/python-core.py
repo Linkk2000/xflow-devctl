@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -326,6 +327,59 @@ State: S6_PREPARE_COMMIT_AND_MR_DRAFT
         approval.write_text(text.replace("Approved: no", "Approved: yes").replace(digest, digest.upper()), encoding="utf-8")
         run_devctl(repo, "check", "local-review", "--issue", "draft", "--file", str(issue_file))
         run_devctl(repo, "issue", "create", "Review gate", "--body-file", str(issue_file))
+
+        pasted_image = repo / "pasted-image.png"
+        pasted_image.write_bytes(b"\x89PNG\r\n\x1a\nxflow-test-image")
+        added = run_devctl(repo, "attachment", "add", "--issue", "draft", "--file", str(pasted_image), "--as", "image")
+        assert "xflow-attachment://att-001" in added.stdout
+        manifest = repo / ".xflow" / "issues" / "issue-draft" / "attachments" / "manifest.json"
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        assert data["issue"] == "draft"
+        assert data["items"][0]["id"] == "att-001"
+        assert data["items"][0]["mime"] == "image/png"
+        assert data["items"][0]["markdown"] == "![pasted-image.png](xflow-attachment://att-001)"
+
+        attachment_body = repo / ".xflow" / "issues" / "issue-draft" / "issue-with-attachment.md"
+        attachment_body.write_text(
+            issue_file.read_text(encoding="utf-8")
+            + "\n## Attachments\n- ![pasted-image.png](xflow-attachment://att-001)\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        run_devctl(repo, "attachment", "check", "--issue", "draft", "--manifest", str(manifest), "--body-file", str(attachment_body))
+        run_devctl(repo, "issue", "create", "Attachment gate", "--body-file", str(attachment_body), "--attachments", str(manifest), expect=1)
+        run_devctl(repo, "attachment", "publish", "--issue", "draft", "--manifest", str(manifest), "--url", "att-001=https://example.test/pasted-image.png")
+        final_body = repo / ".xflow" / "issues" / "issue-draft" / "issue-with-attachment.final.md"
+        run_devctl(repo, "attachment", "render", "--issue", "draft", "--manifest", str(manifest), "--input", str(attachment_body), "--output", str(final_body))
+        final_text = final_body.read_text(encoding="utf-8")
+        assert "xflow-attachment://" not in final_text
+        assert "https://example.test/pasted-image.png" in final_text
+        run_devctl(repo, "attachment", "check", "--issue", "draft", "--manifest", str(manifest), "--body-file", str(final_body), "--final")
+
+        local_path_body = final_body.with_name("issue-with-local-path.md")
+        local_path_body.write_text(final_text + "\n![bad](C:\\temp\\bad.png)\n", encoding="utf-8", newline="\n")
+        run_devctl(repo, "attachment", "check", "--issue", "draft", "--manifest", str(manifest), "--body-file", str(local_path_body), "--final", expect=1)
+
+        run_devctl(
+            repo,
+            "approval",
+            "prepare",
+            "--issue",
+            "draft",
+            "--action",
+            "issue-create",
+            "--file",
+            str(final_body),
+            "--attachments",
+            str(manifest),
+            "--force",
+        )
+        approval_text = approval.read_text(encoding="utf-8")
+        manifest_digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        assert f"Attachment Manifest SHA256: {manifest_digest}" in approval_text
+        approval.write_text(approval_text.replace("Approved: no", "Approved: yes"), encoding="utf-8")
+        run_devctl(repo, "check", "local-review", "--issue", "draft", "--file", str(final_body), "--action", "issue-create", "--attachments", str(manifest))
+        run_devctl(repo, "issue", "create", "Attachment gate", "--body-file", str(final_body), "--attachments", str(manifest))
 
         templates = repo / ".xflow" / "ops" / "workflow" / "templates"
         write(
