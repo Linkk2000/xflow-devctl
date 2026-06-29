@@ -1,28 +1,59 @@
 Issue (GitHub/Gitee):
   devctl issue create <title> [--body B] [--body-file F] [--labels a,b] [--attachments manifest.json]
+                      [--attach-file file.png] [--upload-attachments github] [--no-local-review]
   devctl issue list [--state open|closed|all] [--limit N]
   devctl issue show <number>
   devctl issue comment <number> [--body B] [--body-file F] [--attachments manifest.json]
+                      [--attach-file file.png] [--upload-attachments github] [--no-local-review]
   devctl issue close <number>
+
+AI call recipes:
+  Plain unattended issue:
+    devctl issue create "<title>" --body-file issue.md --no-local-review
+
+  Plain unattended comment:
+    devctl issue comment <number> --body-file comment.md --no-local-review
+
+  Unattended GitHub attachment issue:
+    devctl issue create "<title>" --body-file issue.md --attach-file image.png --attach-file notes.txt --upload-attachments github --no-local-review
+
+  Unattended GitHub attachment comment:
+    devctl issue comment <number> --body-file comment.md --attach-file image.png --attach-file notes.txt --upload-attachments github --no-local-review
+
+  Reviewed issue with attachments:
+    devctl attachment add --issue draft --file image.png --as auto
+    devctl attachment publish --issue draft --backend github --body-file issue.md --output issue.final.md
+    devctl approval prepare --issue draft --action issue-create --file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
+    devctl check local-review --issue draft --file issue.final.md --action issue-create --attachments .xflow/issues/issue-draft/attachments/manifest.json
+    devctl issue create "<title>" --body-file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
+
+AI recipe notes:
+  --attach-file accepts any file; images render as Markdown images and other files render as links.
+  --upload-attachments github uploads to the xflow-attachments release by default and renders a final body file.
+  GITHUB_TOKEN is required for GitHub uploads and issue/comment remote writes.
+  --no-local-review is valid only when the current user explicitly authorized that exact unattended command.
 
 Attachment:
   devctl attachment add --issue draft|N --file PATH [--as auto|image|file] [--id ID] [--manifest manifest.json]
   devctl attachment check --issue draft|N [--manifest manifest.json] [--body-file F] [--final]
-  devctl attachment publish --issue draft|N [--manifest manifest.json] --url ID=https://public.example/file.png
+  devctl attachment publish --issue draft|N [--manifest manifest.json] [--backend github|manual]
+                            [--url ID=https://public.example/file.png] [--body-file draft.md] [--output final.md]
   devctl attachment render --issue draft|N [--manifest manifest.json] --input draft.md --output final.md
 
 Git:
-  devctl git start <slug> [--issue N]
-  devctl git commit-msg [summary]
+  devctl git start <slug> [--issue N] [--base BRANCH]
+  devctl git commit-msg [-a] [-c] [-m MESSAGE] [summary]
   devctl git mr [--title T] [--body-file F] [--base BRANCH] [--issue N] [--attachments manifest.json]
   devctl git pr-get <number>
   devctl git status
-  devctl git done
+  devctl git done [--base BRANCH] [--force]
 
 Core remote-write rule:
   Remote writes require local human review of the exact body/evidence file.
   Use --body-file for issue create/comment and git mr.
   Active approval file: .xflow/issues/issue-<id>/approvals/local-review.md
+  Use --no-local-review only when the current user explicitly authorizes an
+  unattended issue/comment command, with or without attachments.
 
 Check:
   devctl preflight
@@ -46,8 +77,17 @@ Migration:
 
 App:
   devctl app start-frontend [--port PORT] [--foreground]
-  devctl app stop-frontend
-  devctl app status
+  devctl app stop-frontend [--port PORT]
+  devctl app status [--port PORT]
+
+Runtime:
+  devctl.ps1 and generated project wrappers route normal commands to Python core.
+  On Windows, validate with Python commands such as:
+    python tests/python-core.py
+    python tests/entrypoint-routing.py
+  Do not run bare bash/Git-Bash/WSL for normal XFlow validation on Windows.
+  POSIX-only shell compatibility checks may use bash -n when a POSIX shell is
+  explicitly selected outside Windows.
 
 Config:
   XFLOW_ENV_FILE            explicit env file for one run
@@ -59,6 +99,7 @@ Config:
   XFLOW_PLATFORM            github|gitee
   GITHUB_API_BASE           GitHub API base override for tests or enterprise hosts
   GITEE_API_BASE            Gitee API v5 base override; default https://gitee.com/api/v5
+  XFLOW_GITHUB_ATTACHMENT_RELEASE_TAG  release tag for GitHub uploaded attachments; default xflow-attachments
   DEVCTL_BASE_BRANCH        default base branch
   DEVCTL_BRANCH_PREFIX      task branch prefix
   DEVCTL_REPO_ROOT          target repository root

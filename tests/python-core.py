@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -85,6 +86,16 @@ def git(repo_root: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(repo_root), *args], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
+def git_text(repo_root: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ).stdout.strip()
+
+
 def test_env_loading_policy(repo: Path) -> None:
     fake_home = repo / "fake-home"
     global_env = fake_home / ".xflow" / "env.local"
@@ -107,8 +118,97 @@ def test_env_loading_policy(repo: Path) -> None:
     assert "XFLOW_PLATFORM" not in env
 
 
+def test_python_core_rejects_inline_remote_bodies(repo: Path) -> None:
+    run_devctl(repo, "issue", "create", "Inline body", "--body", "simple status update", "--no-local-review", expect=1)
+    run_devctl(repo, "issue", "create", "Inline body", "--body", "line1\nline2", "--no-local-review", expect=1)
+    run_devctl(repo, "issue", "create", "Inline body", "--body", r"line1\nline2", "--no-local-review", expect=1)
+    run_devctl(repo, "issue", "create", "Inline body", "--body", "uses `code`", "--no-local-review", expect=1)
+    run_devctl(repo, "issue", "create", "Inline body", "--body", "uses $(cmd)", "--no-local-review", expect=1)
+
+
+def test_python_core_git_and_app_commands(parent: Path) -> None:
+    parent.mkdir(parents=True, exist_ok=True)
+    origin = parent / "origin.git"
+    seed = parent / "seed"
+    work = parent / "work"
+
+    git(parent, "init", "--bare", str(origin))
+    seed.mkdir()
+    git(seed, "init", "-q")
+    git(seed, "config", "user.email", "test@example.com")
+    git(seed, "config", "user.name", "Test User")
+    git(seed, "checkout", "-b", "main", "-q")
+    write(seed / "README.md", "# Demo\n")
+    git(seed, "add", "README.md")
+    git(seed, "commit", "-m", "init", "-q")
+    git(seed, "remote", "add", "origin", str(origin))
+    git(seed, "push", "-u", "origin", "main", "-q")
+
+    subprocess.run(["git", "clone", str(origin), str(work), "-q"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    git(work, "config", "user.email", "test@example.com")
+    git(work, "config", "user.name", "Test User")
+    git(work, "checkout", "main", "-q")
+
+    status = run_devctl(work, "git", "status").stdout
+    assert "branch:  main" in status
+    assert "worktree: clean" in status
+
+    run_devctl(work, "git", "start", "wsl-free", "--issue", "9", "--base", "main")
+    assert git_text(work, "branch", "--show-current") == "feat/9-wsl-free"
+
+    status = run_devctl(work, "git", "status").stdout
+    assert "branch:  feat/9-wsl-free" in status
+    assert "issue:   #9" in status
+
+    write(work / "feature.txt", "python core git command\n")
+    message = "Add Python core git commands"
+    msg = run_devctl(work, "git", "commit-msg", "-a", "-m", message).stdout
+    assert message in msg
+    run_devctl(work, "git", "commit-msg", "-a", "-c", "-m", message)
+    assert message in git_text(work, "log", "-1", "--pretty=%B")
+
+    run_devctl(work, "git", "done", "--force", "--base", "main")
+    assert git_text(work, "branch", "--show-current") == "main"
+    assert "feat/9-wsl-free" not in git_text(work, "branch", "--format=%(refname:short)")
+
+    app_status = run_devctl(work, "app", "status").stdout
+    assert "frontend process: not running" in app_status
+    assert "frontend HTTP: unavailable" in app_status
+    app_stop = run_devctl(work, "app", "stop-frontend").stdout
+    assert "no recorded frontend process" in app_stop
+
+
+def test_ai_call_guidance_is_visible(repo: Path) -> None:
+    issue_help = run_devctl(repo, "issue", "create", "--help").stdout
+    assert "AI call recipes" in issue_help
+    assert "Plain unattended issue" in issue_help
+    assert "Unattended GitHub attachment issue" in issue_help
+    assert "--attach-file accepts any file" in issue_help
+    assert "GITHUB_TOKEN is required for GitHub uploads" in issue_help
+
+    publish_help = run_devctl(repo, "attachment", "publish", "--help").stdout
+    assert "GitHub release asset upload" in publish_help
+    assert "writes publishedUrl" in publish_help
+
+    help_text = (OPS_ROOT / "help.txt").read_text(encoding="utf-8")
+    assert "AI call recipes" in help_text
+    assert "Plain unattended issue" in help_text
+    assert "Unattended GitHub attachment issue" in help_text
+    assert "Reviewed issue with attachments" in help_text
+    assert "Do not run bare bash/Git-Bash/WSL for normal XFlow validation on Windows" in help_text
+
+    readme_text = (OPS_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "AI Call Recipes" in readme_text
+    assert "Plain unattended issue" in readme_text
+    assert "Unattended GitHub attachment issue" in readme_text
+    assert "Reviewed issue with attachments" in readme_text
+    assert "Normal Git, Issue, Attachment, Approval, Rules, Migration, and App commands route" in readme_text
+    assert "do not run bare `bash`, Git Bash, or WSL for normal XFlow validation" in readme_text
+
+
 class RecordingApiHandler(BaseHTTPRequestHandler):
     requests: list[dict[str, object]] = []
+    release_created: bool = False
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -126,11 +226,28 @@ class RecordingApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_status(self, status: int) -> None:
+        self.send_response(status)
+        self.end_headers()
+
+    def read_body(self) -> bytes:
+        length = int(self.headers.get("Content-Length", "0"))
+        return self.rfile.read(length) if length else b""
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
         self.requests.append({"method": "GET", "path": parsed.path, "query": query})
-        if parsed.path.endswith("/issues/12"):
+        if parsed.path.endswith("/releases/tags/xflow-attachments"):
+            if type(self).release_created:
+                self.send_json(
+                    '{"id":77,"tag_name":"xflow-attachments",'
+                    f'"upload_url":"http://127.0.0.1:{self.server.server_port}/repos/Linkk2000/paper-demo/releases/77/assets{{?name,label}}"'  # type: ignore[attr-defined]
+                    "}"
+                )
+            else:
+                self.send_status(404)
+        elif parsed.path.endswith("/issues/12"):
             self.send_json('{"number":"12","state":"open","title":"Gitee Issue","body":"body","html_url":"https://gitee.test/issue/12"}')
         elif parsed.path.endswith("/issues"):
             self.send_json('[{"number":"12","state":"open","title":"Gitee Issue","body":"body","html_url":"https://gitee.test/issue/12"}]')
@@ -142,14 +259,48 @@ class RecordingApiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        form = self.read_form()
-        self.requests.append({"method": "POST", "path": parsed.path, "form": form})
-        if parsed.path.endswith("/Linkk2000/issues"):
+        query = {key: values[-1] for key, values in parse_qs(parsed.query).items()}
+        if parsed.path.endswith("/releases"):
+            payload = self.read_body().decode("utf-8")
+            type(self).release_created = True
+            self.requests.append({"method": "POST", "path": parsed.path, "json": payload})
+            self.send_json(
+                '{"id":77,"tag_name":"xflow-attachments",'
+                f'"upload_url":"http://127.0.0.1:{self.server.server_port}/repos/Linkk2000/paper-demo/releases/77/assets{{?name,label}}"'  # type: ignore[attr-defined]
+                "}"
+            )
+        elif parsed.path.endswith("/releases/77/assets"):
+            body = self.read_body()
+            self.requests.append(
+                {
+                    "method": "POST",
+                    "path": parsed.path,
+                    "query": query,
+                    "content_type": self.headers.get("Content-Type", ""),
+                    "body": body,
+                }
+            )
+            name = query.get("name", "asset.png")
+            self.send_json(
+                '{"id":88,"name":"%s","browser_download_url":"https://github.com/Linkk2000/paper-demo/releases/download/xflow-attachments/%s"}'
+                % (name, name)
+            )
+        elif parsed.path.endswith("/Linkk2000/issues"):
+            form = self.read_form()
+            self.requests.append({"method": "POST", "path": parsed.path, "form": form})
             self.send_json('{"number":"12","html_url":"https://gitee.test/issue/12"}')
         elif parsed.path.endswith("/issues/12/comments"):
+            form = self.read_form()
+            self.requests.append({"method": "POST", "path": parsed.path, "form": form})
             self.send_json('{"id":"99","body":"comment"}')
         elif parsed.path.endswith("/pulls"):
+            form = self.read_form()
+            self.requests.append({"method": "POST", "path": parsed.path, "form": form})
             self.send_json('{"number":"7","html_url":"https://gitee.test/pulls/7"}')
+        elif parsed.path.endswith("/issues"):
+            payload = self.read_body().decode("utf-8")
+            self.requests.append({"method": "POST", "path": parsed.path, "json": payload})
+            self.send_json('{"number":42,"html_url":"https://github.test/issue/42"}')
         else:
             self.send_response(404)
             self.end_headers()
@@ -168,6 +319,7 @@ class RecordingApiHandler(BaseHTTPRequestHandler):
 class RecordingApiServer:
     def __enter__(self) -> "RecordingApiServer":
         RecordingApiHandler.requests = []
+        RecordingApiHandler.release_created = False
         self.server = HTTPServer(("127.0.0.1", 0), RecordingApiHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -192,6 +344,9 @@ def main() -> None:
         git(repo, "config", "user.name", "Test User")
         git(repo, "remote", "add", "origin", "git@gitee.com:Linkk2000/paper-demo.git")
         test_env_loading_policy(repo)
+        test_python_core_rejects_inline_remote_bodies(repo)
+        test_python_core_git_and_app_commands(repo / "core-routing")
+        test_ai_call_guidance_is_visible(repo)
 
         issue_file = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
         write(
@@ -380,6 +535,125 @@ State: S6_PREPARE_COMMIT_AND_MR_DRAFT
         approval.write_text(approval_text.replace("Approved: no", "Approved: yes"), encoding="utf-8")
         run_devctl(repo, "check", "local-review", "--issue", "draft", "--file", str(final_body), "--action", "issue-create", "--attachments", str(manifest))
         run_devctl(repo, "issue", "create", "Attachment gate", "--body-file", str(final_body), "--attachments", str(manifest))
+        run_devctl(repo, "issue", "create", "Review required", "--body-file", str(auto_issue_body := issue_file.with_name("plain-issue.md")), expect=1)
+
+        write(
+            auto_issue_body,
+            """<!-- xflow: issue-draft -->
+
+## Background
+Need unattended plain issue creation.
+
+## Problem
+Some issues have no attachments.
+
+## Goal
+Create a plain issue without manual approval when explicitly requested.
+
+## Scope
+- Includes: no attachments.
+
+## Acceptance Criteria
+- [ ] Issue body is sent without attachment upload.
+
+## Verification Plan
+- python tests/python-core.py
+""",
+        )
+        with RecordingApiServer() as plain_server:
+            plain_env = {
+                "GITHUB_API_BASE": plain_server.base_url,
+                "GITHUB_TOKEN": "github-token",
+                "XFLOW_PLATFORM": "github",
+                "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+            }
+            plain_result = run_devctl_with_env(
+                repo,
+                plain_env,
+                "issue",
+                "create",
+                "Plain unattended issue",
+                "--body-file",
+                str(auto_issue_body),
+                "--no-local-review",
+            )
+            assert "Issue #42 created" in plain_result.stdout
+            plain_issue_requests = [item for item in plain_server.requests if item["method"] == "POST" and item["path"].endswith("/issues")]
+            assert plain_issue_requests
+            assert "Need unattended plain issue creation." in str(plain_issue_requests[-1]["json"])
+            assert not [item for item in plain_server.requests if item["path"].endswith("/releases/77/assets")]
+
+        auto_issue_body = repo / ".xflow" / "issues" / "issue-draft" / "auto-issue.md"
+        write(
+            auto_issue_body,
+            """<!-- xflow: issue-draft -->
+
+## Background
+Need automatic GitHub attachment upload.
+
+## Problem
+Manual attachment URLs slow down issue creation.
+
+## Goal
+Create an issue with uploaded attachment URLs.
+
+## Scope
+- Includes: one pasted image and one generic file.
+
+## Acceptance Criteria
+- [ ] Issue body contains GitHub release asset URLs.
+
+## Verification Plan
+- python tests/python-core.py
+""",
+        )
+        auto_image = repo / "auto-image.png"
+        auto_image.write_bytes(b"\x89PNG\r\n\x1a\nauto-github-image")
+        auto_file = repo / "notes.txt"
+        auto_file.write_text("generic attachment notes\n", encoding="utf-8", newline="\n")
+        with RecordingApiServer() as github_server:
+            github_env = {
+                "GITHUB_API_BASE": github_server.base_url,
+                "GITHUB_TOKEN": "github-token",
+                "XFLOW_PLATFORM": "github",
+                "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+            }
+            auto_result = run_devctl_with_env(
+                repo,
+                github_env,
+                "issue",
+                "create",
+                "Auto attachment issue",
+                "--body-file",
+                str(auto_issue_body),
+                "--attach-file",
+                str(auto_image),
+                "--attach-file",
+                str(auto_file),
+                "--upload-attachments",
+                "github",
+                "--no-local-review",
+            )
+            assert "Issue #42 created" in auto_result.stdout
+            auto_manifest = repo / ".xflow" / "issues" / "issue-draft" / "attachments" / "manifest.json"
+            auto_manifest_data = json.loads(auto_manifest.read_text(encoding="utf-8"))
+            auto_urls = [item["publishedUrl"] for item in auto_manifest_data["items"][-2:]]
+            assert all("github.com/Linkk2000/paper-demo/releases/download/xflow-attachments/" in url for url in auto_urls)
+            auto_final = repo / ".xflow" / "issues" / "issue-draft" / "auto-issue.final.md"
+            assert auto_final.is_file()
+            auto_final_text = auto_final.read_text(encoding="utf-8")
+            assert auto_urls[0] in auto_final_text
+            assert auto_urls[1] in auto_final_text
+            assert re.search(r"!\[auto-image\.png\]\(https://", auto_final_text)
+            assert re.search(r"\[notes\.txt\]\(https://", auto_final_text)
+            github_issue_requests = [item for item in github_server.requests if item["method"] == "POST" and item["path"].endswith("/issues")]
+            assert github_issue_requests
+            assert auto_urls[0] in str(github_issue_requests[-1]["json"])
+            assert auto_urls[1] in str(github_issue_requests[-1]["json"])
+            upload_requests = [item for item in github_server.requests if item["path"].endswith("/releases/77/assets")]
+            assert len(upload_requests) >= 2
+            assert upload_requests[0]["content_type"] == "image/png"
+            assert upload_requests[1]["content_type"] == "text/plain"
 
         templates = repo / ".xflow" / "ops" / "workflow" / "templates"
         write(

@@ -16,7 +16,7 @@ export DEVCTL_REPO_ROOT
 export DEVCTL_OPS_ROOT="$OPS"
 
 case "${1:-help}" in
-  -h|--help|help|check|git|issue|preflight|approval|attachment|rules|migrate)
+  -h|--help|help|check|git|issue|preflight|approval|attachment|rules|migrate|app)
     export DEVCTL_SKIP_PROVIDER_LOAD=1
     ;;
 esac
@@ -26,13 +26,6 @@ source "$OPS/lib/common.sh"
 
 usage() {
   cat "$OPS/help.txt"
-}
-
-run_script() {
-  local script="$1"
-  shift
-  [[ -x "$script" || -f "$script" ]] || devctl_die "missing script: $script"
-  exec bash "$script" "$@"
 }
 
 run_python() {
@@ -51,20 +44,13 @@ main() {
     -h|--help|help)
       usage
       ;;
-    preflight|approval|attachment|rules|migrate)
+    preflight|approval|attachment|rules|migrate|app)
       run_python "$@"
       ;;
     git)
       shift
       [[ $# -ge 1 ]] || { usage; exit 1; }
-      case "$1" in
-        start)      shift; run_script "$OPS/git/start.sh" "$@" ;;
-        commit-msg) shift; run_script "$OPS/git/commit-msg.sh" "$@" ;;
-        mr|pr-get)  run_python git "$@" ;;
-        done)       shift; run_script "$OPS/git/done.sh" "$@" ;;
-        status)     shift; run_script "$OPS/git/status.sh" "$@" ;;
-        *) devctl_die "unknown git subcommand: $1 (devctl help)" ;;
-      esac
+      run_python git "$@"
       ;;
     issue)
       shift
@@ -75,16 +61,6 @@ main() {
       shift
       [[ $# -ge 1 ]] || { usage; exit 1; }
       run_python check "$@"
-      ;;
-    app)
-      shift
-      [[ $# -ge 1 ]] || { usage; exit 1; }
-      case "$1" in
-        start-frontend) shift; run_script "$OPS/app/start-frontend.sh" "$@" ;;
-        stop-frontend)  shift; run_script "$OPS/app/stop-frontend.sh" "$@" ;;
-        status)         shift; run_script "$OPS/app/status.sh" "$@" ;;
-        *) devctl_die "unknown app subcommand: $1 (devctl help)" ;;
-      esac
       ;;
     *)
       devctl_die "unknown command: $1 (devctl help)"

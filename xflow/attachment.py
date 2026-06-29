@@ -6,8 +6,10 @@ import mimetypes
 import re
 import shutil
 from pathlib import Path
+from typing import Mapping
 from urllib.parse import urlparse
 
+from . import providers
 from .io import read_text
 
 
@@ -297,6 +299,81 @@ def publish_urls(repo_root: Path, issue: str, manifest_path: Path, urls: list[st
         by_id[item_id]["publishedUrl"] = url
     write_manifest(manifest_path, data)
     return manifest_path
+
+
+def safe_asset_component(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-")
+    return cleaned or "attachment"
+
+
+def github_asset_name(issue: str, item: dict[str, object]) -> str:
+    item_id = safe_asset_component(str(item["id"]))
+    digest = str(item["sha256"])[:12]
+    filename = safe_asset_component(str(item["filename"]))
+    return f"xflow-{safe_asset_component(normalized_issue(issue))}-{item_id}-{digest}-{filename}"
+
+
+def publish_github_release(
+    repo_root: Path,
+    issue: str,
+    manifest_path: Path,
+    env: Mapping[str, str],
+    release_tag: str = "xflow-attachments",
+) -> Path:
+    repo_root = repo_root.resolve()
+    manifest_path = resolve_repo_path(repo_root, manifest_path)
+    data = validate_manifest(repo_root, manifest_path, issue=issue)
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        raise ValueError("attachment manifest has no items to publish")
+
+    release = providers.ensure_github_release(repo_root, release_tag, env)
+    upload_url = str(release.get("upload_url", ""))
+    if not upload_url:
+        raise ValueError("GitHub release response missing upload_url")
+
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("publishedUrl"):
+            continue
+        local_path = resolve_repo_path(repo_root, Path(str(raw["localPath"])))
+        asset_name = github_asset_name(issue, raw)
+        response = providers.upload_github_release_asset(
+            repo_root,
+            upload_url,
+            asset_name,
+            str(raw["filename"]),
+            str(raw["mime"]),
+            local_path.read_bytes(),
+            env,
+        )
+        published_url = str(response.get("browser_download_url", ""))
+        if not published_url:
+            raise ValueError(f"GitHub release asset response missing browser_download_url for {raw['id']}")
+        raw["publishedUrl"] = published_url
+        raw["backend"] = "github-release"
+        raw["githubReleaseTag"] = release_tag
+        raw["githubAssetName"] = asset_name
+        if response.get("id") is not None:
+            raw["githubAssetId"] = str(response.get("id"))
+    write_manifest(manifest_path, data)
+    return manifest_path
+
+
+def append_markdown_to_body(repo_root: Path, body_file: Path, markdown_items: list[str], output_path: Path) -> Path:
+    body_path = resolve_repo_path(repo_root, body_file)
+    text = read_text(body_path).rstrip()
+    additions = [item for item in markdown_items if item and item not in text]
+    output = resolve_repo_path(repo_root, output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if additions:
+        bullet_lines = "\n".join(f"- {item}" for item in additions)
+        text = f"{text}\n\n## Attachments\n{bullet_lines}\n"
+    else:
+        text = f"{text}\n"
+    output.write_text(text, encoding="utf-8", newline="\n")
+    return output
 
 
 def render_body(repo_root: Path, issue: str, manifest_path: Path, input_path: Path, output_path: Path) -> Path:

@@ -148,6 +148,49 @@ def request_json(
     return json.loads(text) if text else {}
 
 
+def request_json_or_none_on_404(
+    method: str,
+    url: str,
+    request_headers: Mapping[str, str],
+    payload: Mapping[str, object] | None = None,
+    api_name: str = "GitHub",
+):
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = Request(url, data=body, method=method)
+    for key, value in request_headers.items():
+        request.add_header(key, value)
+    if payload is not None:
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urlopen(request, timeout=30) as response:
+            text = response.read().decode("utf-8")
+    except HTTPError as exc:
+        if exc.code == 404:
+            return None
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise ValueError(f"{api_name} API {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise ValueError(f"{api_name} API request failed: {exc.reason}") from exc
+    return json.loads(text) if text else {}
+
+
+def request_binary_json(method: str, url: str, request_headers: Mapping[str, str], body: bytes, content_type: str):
+    request = Request(url, data=body, method=method)
+    for key, value in request_headers.items():
+        request.add_header(key, value)
+    request.add_header("Content-Type", content_type)
+    request.add_header("Content-Length", str(len(body)))
+    try:
+        with urlopen(request, timeout=60) as response:
+            text = response.read().decode("utf-8")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise ValueError(f"GitHub upload API {exc.code}: {detail}") from exc
+    except URLError as exc:
+        raise ValueError(f"GitHub upload API request failed: {exc.reason}") from exc
+    return json.loads(text) if text else {}
+
+
 def request_form_json(method: str, url: str, payload: Mapping[str, object], api_name: str = "Gitee"):
     body = urlencode({key: str(value) for key, value in payload.items() if value is not None}).encode("utf-8")
     request = Request(url, data=body, method=method)
@@ -168,6 +211,52 @@ def request_form_json(method: str, url: str, payload: Mapping[str, object], api_
 def ensure_github(repo_root: Path, env: Mapping[str, str]) -> None:
     if platform(repo_root, env) != "github":
         raise ValueError("Python provider currently supports GitHub only")
+
+
+def github_release_by_tag(repo_root: Path, tag: str, env: Mapping[str, str]) -> dict[str, object] | None:
+    ensure_github(repo_root, env)
+    response = request_json_or_none_on_404("GET", api_url(repo_root, env, f"releases/tags/{tag}"), headers(token(env)))
+    if response is None:
+        return None
+    return require_object(response, "GitHub release response must be a JSON object")
+
+
+def create_github_release(repo_root: Path, tag: str, env: Mapping[str, str]) -> dict[str, object]:
+    ensure_github(repo_root, env)
+    response = request_json(
+        "POST",
+        api_url(repo_root, env, "releases"),
+        headers(token(env)),
+        {
+            "tag_name": tag,
+            "name": tag,
+            "body": "XFlow uploaded issue and review attachments.",
+            "draft": False,
+            "prerelease": False,
+        },
+    )
+    return require_object(response, "GitHub release create response must be a JSON object")
+
+
+def ensure_github_release(repo_root: Path, tag: str, env: Mapping[str, str]) -> dict[str, object]:
+    release = github_release_by_tag(repo_root, tag, env)
+    return release if release is not None else create_github_release(repo_root, tag, env)
+
+
+def upload_github_release_asset(
+    repo_root: Path,
+    upload_url: str,
+    name: str,
+    label: str,
+    content_type: str,
+    body: bytes,
+    env: Mapping[str, str],
+) -> dict[str, object]:
+    base = upload_url.split("{", 1)[0]
+    separator = "&" if "?" in base else "?"
+    url = f"{base}{separator}{urlencode({'name': name, 'label': label})}"
+    response = request_binary_json("POST", url, headers(token(env)), body, content_type)
+    return require_object(response, "GitHub release asset upload response must be a JSON object")
 
 
 def gitee_query(env: Mapping[str, str], values: Mapping[str, object]) -> str:

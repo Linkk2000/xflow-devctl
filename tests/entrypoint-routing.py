@@ -9,7 +9,6 @@ from pathlib import Path
 
 
 OPS_ROOT = Path(__file__).resolve().parents[1]
-GIT_BASH = Path(os.environ.get("GIT_BASH", r"D:\program\Git\bin\bash.exe"))
 
 
 def git(repo_root: Path, *args: str) -> None:
@@ -41,37 +40,16 @@ Approved: yes
     )
 
 
-def run_bash(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def run_devctl(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["DEVCTL_REPO_ROOT"] = str(repo_root)
     env["DEVCTL_SKIP_PROVIDER_LOAD"] = "1"
     env["DEVCTL_SKIP_PUSH"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["PYTHONPATH"] = str(OPS_ROOT)
-    ops_posix = subprocess.run(
-        [str(GIT_BASH), "-lc", f"cd '{OPS_ROOT.as_posix()}' && pwd"],
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    ).stdout.strip()
-    repo_posix = subprocess.run(
-        [str(GIT_BASH), "-lc", f"cd '{repo_root.as_posix()}' && pwd"],
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    ).stdout.strip()
-    command = " ".join([
-        "DEVCTL_REPO_ROOT=" + quote_bash(repo_posix),
-        "DEVCTL_SKIP_PROVIDER_LOAD=1",
-        "DEVCTL_SKIP_PUSH=1",
-        "./devctl",
-        *map(quote_bash, args),
-    ])
     result = subprocess.run(
-        [str(GIT_BASH), "-lc", f"cd {quote_bash(ops_posix)} && {command}"],
-        cwd=OPS_ROOT,
+        [sys.executable, "-m", "xflow", *args],
+        cwd=repo_root,
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -84,14 +62,17 @@ def run_bash(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return result
 
 
-def quote_bash(value: str) -> str:
-    return "'" + value.replace("'", "'\"'\"'") + "'"
-
-
 def assert_no_legacy_run_command() -> None:
     entrypoint = (OPS_ROOT / "devctl").read_text(encoding="utf-8")
     assert "\n    run)" not in entrypoint
     assert 'run_script "$OPS/run.sh"' not in entrypoint
+    assert 'run_script "$OPS/git/start.sh"' not in entrypoint
+    assert 'run_script "$OPS/git/commit-msg.sh"' not in entrypoint
+    assert 'run_script "$OPS/git/done.sh"' not in entrypoint
+    assert 'run_script "$OPS/git/status.sh"' not in entrypoint
+    assert 'run_script "$OPS/app/start-frontend.sh"' not in entrypoint
+    assert 'run_script "$OPS/app/stop-frontend.sh"' not in entrypoint
+    assert 'run_script "$OPS/app/status.sh"' not in entrypoint
     assert not (OPS_ROOT / "run.sh").exists()
 
 
@@ -159,18 +140,18 @@ Closes #1
         )
         approval(repo, "1", "git-mr", mr_file)
 
-        issue_result = run_bash(repo, "issue", "create", "Python routing", "--body-file", str(issue_file))
+        issue_result = run_devctl(repo, "issue", "create", "Python routing", "--body-file", str(issue_file))
         assert "issue-create gate passed; provider skipped" in issue_result.stdout
 
-        mr_result = run_bash(repo, "git", "mr", "--body-file", str(mr_file), "--issue", "1", "--base", "main")
+        mr_result = run_devctl(repo, "git", "mr", "--body-file", str(mr_file), "--issue", "1", "--base", "main")
         assert "git-mr gate passed; provider skipped" in mr_result.stdout
 
-        check_result = run_bash(repo, "check", "mr-draft", "--issue", "1")
+        check_result = run_devctl(repo, "check", "mr-draft", "--issue", "1")
         assert "mr-draft check passed" in check_result.stdout
 
         pasted = repo / "route-image.png"
         pasted.write_bytes(b"\x89PNG\r\n\x1a\nroute-test")
-        attachment_result = run_bash(repo, "attachment", "add", "--issue", "draft", "--file", str(pasted), "--as", "image")
+        attachment_result = run_devctl(repo, "attachment", "add", "--issue", "draft", "--file", str(pasted), "--as", "image")
         assert "xflow-attachment://att-001" in attachment_result.stdout
 
     print("entrypoint routing ok")

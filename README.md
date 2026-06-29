@@ -22,14 +22,61 @@ devctl preflight
 devctl approval prepare --issue draft --action issue-create --file .xflow/issues/issue-draft/issue-draft.md
 devctl attachment add --issue draft --file screenshot.png --as image
 devctl attachment check --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json
-devctl attachment publish --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json --url att-001=https://example.test/screenshot.png
+devctl attachment publish --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json --backend github
 devctl attachment render --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json --input .xflow/issues/issue-draft/issue-draft.md --output .xflow/issues/issue-draft/issue-draft.final.md
+devctl issue create "Title" --body-file .xflow/issues/issue-draft/issue-draft.md --no-local-review
+devctl issue create "Title" --body-file .xflow/issues/issue-draft/issue-draft.md --attach-file screenshot.png --attach-file notes.txt --upload-attachments github --no-local-review
 devctl check current-task --issue 1
 devctl check local-review --issue draft --file .xflow/issues/issue-draft/issue-draft.md --action issue-create
 devctl check submodule-hygiene
 devctl rules list
 devctl migrate inspect
 ```
+
+## AI Call Recipes
+
+Use these recipes instead of probing random flag combinations.
+
+Plain unattended issue:
+
+```text
+devctl issue create "Title" --body-file issue.md --no-local-review
+```
+
+Plain unattended comment:
+
+```text
+devctl issue comment 123 --body-file comment.md --no-local-review
+```
+
+Unattended GitHub attachment issue:
+
+```text
+devctl issue create "Title" --body-file issue.md --attach-file screenshot.png --attach-file notes.txt --upload-attachments github --no-local-review
+```
+
+Unattended GitHub attachment comment:
+
+```text
+devctl issue comment 123 --body-file comment.md --attach-file screenshot.png --attach-file notes.txt --upload-attachments github --no-local-review
+```
+
+Reviewed issue with attachments:
+
+```text
+devctl attachment add --issue draft --file screenshot.png --as auto
+devctl attachment publish --issue draft --backend github --body-file issue.md --output issue.final.md
+devctl approval prepare --issue draft --action issue-create --file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
+devctl check local-review --issue draft --file issue.final.md --action issue-create --attachments .xflow/issues/issue-draft/attachments/manifest.json
+devctl issue create "Title" --body-file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
+```
+
+`--attach-file` accepts any file. Image MIME types render as Markdown images;
+other files render as links. `--upload-attachments github` uploads files to
+the `xflow-attachments` GitHub release by default and writes a rendered final
+body file next to the input body unless `--rendered-body-file` is provided.
+`GITHUB_TOKEN` is required for GitHub uploads and issue/comment remote writes.
+If there are no attachments, omit all attachment flags.
 
 `devctl approval prepare` pre-fills the reviewer from `git config user.name`
 and `git config user.email` when available. Pass `--reviewer` to override it.
@@ -39,14 +86,35 @@ prepare the attachment manifest first and pass `--attachments <manifest>` to
 Remote bodies are rejected if they still contain `xflow-attachment://`
 placeholders or local file paths.
 
+For GitHub repositories, `devctl attachment publish --backend github` uploads
+files as release assets on the `xflow-attachments` release by default and writes
+the returned GitHub URL into the manifest. Images are treated as attachments
+whose MIME type renders with Markdown image syntax. The convenience
+issue/comment flow can also do this in one step with `--attach-file` and
+`--upload-attachments github`. If there are no attachments, the same issue or
+comment command still works without `--attach-file`. Use `--no-local-review`
+only when the user explicitly authorized an unattended remote write for that
+command.
+
 PowerShell users should prefer `devctl.ps1`, which invokes the Python core and
-sets `PYTHONDONTWRITEBYTECODE=1` to avoid `__pycache__` byproducts.
+sets `PYTHONDONTWRITEBYTECODE=1` to avoid `__pycache__` byproducts. Normal
+Git, Issue, Attachment, Approval, Rules, Migration, and App commands route
+through Python core. On Windows, validate with Python commands such as
+`python tests/python-core.py` and `python tests/entrypoint-routing.py`; do not
+run bare `bash`, Git Bash, or WSL for normal XFlow validation. POSIX-only shell
+compatibility checks may use `bash -n` only when an explicit POSIX shell is
+selected outside Windows.
+
+Search anchor: Normal Git, Issue, Attachment, Approval, Rules, Migration, and App commands route through Python core.
+Search anchor: Do not run bare bash/Git-Bash/WSL for normal XFlow validation on Windows.
+Search anchor: do not run bare `bash`, Git Bash, or WSL for normal XFlow validation.
 
 User-level parameters should live in `~/.xflow/env.local`:
 
 ```text
 GITHUB_TOKEN=...
 GITEE_TOKEN=...
+XFLOW_GITHUB_ATTACHMENT_RELEASE_TAG=xflow-attachments
 ```
 
 `XFLOW_ENV_FILE` may point at an explicit env file for one run. The legacy

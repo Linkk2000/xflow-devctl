@@ -49,7 +49,7 @@ run_dir="$local_dir/run"
 mkdir -p "$run_dir"
 pid_file="$run_dir/frontend.pid"
 log_file="$run_dir/frontend.log"
-config_file="$local_dir/vite.xflow.wsl.config.mjs"
+config_file="$local_dir/vite.xflow.config.mjs"
 url="http://localhost:${frontend_port}"
 
 cat >"$config_file" <<'EOF'
