@@ -89,6 +89,8 @@ def suggested_command(action: str, approved_file: Path, issue: str, attachment_m
         return f"devctl issue comment {issue} --body-file {path}{attachments}"
     if action == "issue-close":
         return f"devctl issue close {issue}"
+    if action == "git-push":
+        return f"devctl git push --issue {issue} --file {path}"
     if action == "git-mr":
         return f'devctl git mr --title "<title>" --body-file {path} --issue {issue}{attachments}'
     if action == "git-pr-merge":

@@ -1,10 +1,10 @@
 Issue (GitHub/Gitee):
   devctl issue create <title> [--body B] [--body-file F] [--labels a,b] [--attachments manifest.json]
-                      [--attach-file file.png] [--upload-attachments github] [--no-local-review]
+                      [--attach-file file] [--upload-attachments github] [--no-local-review]
   devctl issue list [--state open|closed|all] [--limit N]
   devctl issue show <number>
   devctl issue comment <number> [--body B] [--body-file F] [--attachments manifest.json]
-                      [--attach-file file.png] [--upload-attachments github] [--no-local-review]
+                      [--attach-file file] [--upload-attachments github] [--no-local-review]
   devctl issue close <number>
 
 AI call recipes:
@@ -14,23 +14,19 @@ AI call recipes:
   Plain unattended comment:
     devctl issue comment <number> --body-file comment.md --no-local-review
 
-  Unattended GitHub attachment issue:
-    devctl issue create "<title>" --body-file issue.md --attach-file image.png --attach-file notes.txt --upload-attachments github --no-local-review
-
-  Unattended GitHub attachment comment:
-    devctl issue comment <number> --body-file comment.md --attach-file image.png --attach-file notes.txt --upload-attachments github --no-local-review
-
-  Reviewed issue with attachments:
-    devctl attachment add --issue draft --file image.png --as auto
-    devctl attachment publish --issue draft --backend github --body-file issue.md --output issue.final.md
+  Reviewed non-image attachment issue:
+    devctl attachment add --issue draft --file notes.txt --as file
+    devctl attachment publish --issue draft --backend manual --url att-001=https://public.example/notes.txt --body-file issue.md --output issue.final.md
     devctl approval prepare --issue draft --action issue-create --file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
     devctl check local-review --issue draft --file issue.final.md --action issue-create --attachments .xflow/issues/issue-draft/attachments/manifest.json
     devctl issue create "<title>" --body-file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
 
 AI recipe notes:
-  --attach-file accepts any file; images render as Markdown images and other files render as links.
-  --upload-attachments github uploads to the xflow-attachments release by default and renders a final body file.
-  GITHUB_TOKEN is required for GitHub uploads and issue/comment remote writes.
+  Issue/comment image attachments are disabled.
+  Do not use GitHub release assets as an issue image store.
+  --attach-file with an image MIME type or Markdown image attachment fails before remote writes.
+  For non-image files, use a reviewed manifest and an approved URL backend.
+  GITHUB_TOKEN is required for issue/comment remote writes.
   --no-local-review is valid only when the current user explicitly authorized that exact unattended command.
 
 Attachment:
@@ -39,10 +35,12 @@ Attachment:
   devctl attachment publish --issue draft|N [--manifest manifest.json] [--backend github|manual]
                             [--url ID=https://public.example/file.png] [--body-file draft.md] [--output final.md]
   devctl attachment render --issue draft|N [--manifest manifest.json] --input draft.md --output final.md
+  GitHub publishing rejects image attachments; do not use release assets as issue/comment image storage.
 
 Git:
   devctl git start <slug> [--issue N] [--base BRANCH]
   devctl git commit-msg [-a] [-c] [-m MESSAGE] [summary]
+  devctl git push [--issue N] [--file evidence.md]
   devctl git mr [--title T] [--body-file F] [--base BRANCH] [--issue N] [--attachments manifest.json]
   devctl git pr-get <number>
   devctl git pr-merge <number> [--method merge|squash|rebase] [--issue N] [--file F] [--commit-title T] [--commit-message M]
@@ -54,7 +52,12 @@ Core remote-write rule:
   Use --body-file for issue create/comment and git mr.
   Active approval file: .xflow/issues/issue-<id>/approvals/local-review.md
   Use --no-local-review only when the current user explicitly authorizes an
-  unattended issue/comment command, with or without attachments.
+  unattended issue/comment command. Issue/comment image attachments are disabled.
+  Push and MR are separate gates: devctl git push --issue N only publishes the
+  current branch, while devctl git mr only creates the PR/MR after the branch
+  already has an upstream and no unpushed commits.
+  After PR/MR creation, devctl writes a state backfill commit containing XFlow
+  PR number/URL state and pushes that metadata-only commit to the same branch.
 
 Check:
   devctl preflight
@@ -100,7 +103,7 @@ Config:
   XFLOW_PLATFORM            github|gitee
   GITHUB_API_BASE           GitHub API base override for tests or enterprise hosts
   GITEE_API_BASE            Gitee API v5 base override; default https://gitee.com/api/v5
-  XFLOW_GITHUB_ATTACHMENT_RELEASE_TAG  release tag for GitHub uploaded attachments; default xflow-attachments
+  XFLOW_GITHUB_ATTACHMENT_RELEASE_TAG  legacy release tag for GitHub attachment publishing; default xflow-attachments
   DEVCTL_BASE_BRANCH        default base branch
   DEVCTL_BRANCH_PREFIX      task branch prefix
   DEVCTL_REPO_ROOT          target repository root

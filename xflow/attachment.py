@@ -264,6 +264,24 @@ def check_attachment(
     return manifest
 
 
+def reject_issue_image_attachments(repo_root: Path, manifest_path: Path, issue: str) -> None:
+    manifest = validate_manifest(repo_root, manifest_path, issue=issue, require_published=False)
+    images: list[str] = []
+    for raw in manifest.get("items", []):
+        if not isinstance(raw, dict):
+            continue
+        mime = str(raw.get("mime", "")).lower()
+        markdown = str(raw.get("markdown", "")).lstrip()
+        if mime.startswith("image/") or markdown.startswith("!["):
+            images.append(str(raw.get("filename") or raw.get("id") or "image"))
+    if images:
+        raise ValueError(
+            "issue/comment image attachments are disabled; "
+            "keep images as local evidence until a supported GitHub issue-native attachment API is available: "
+            + ", ".join(images)
+        )
+
+
 def parse_url_mapping(raw: str, single_id: str | None = None) -> tuple[str, str]:
     if "=" in raw:
         item_id, url = raw.split("=", 1)

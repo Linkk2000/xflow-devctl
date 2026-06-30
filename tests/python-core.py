@@ -37,12 +37,14 @@ def run_devctl(repo_root: Path, *args: str, expect: int = 0) -> subprocess.Compl
     env["DEVCTL_OPS_ROOT"] = str(OPS_ROOT)
     env["PYTHONPATH"] = str(OPS_ROOT)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     env.setdefault("DEVCTL_SKIP_PROVIDER_LOAD", "1")
     result = subprocess.run(
         [sys.executable, "-m", "xflow", *args],
         cwd=repo_root,
         env=env,
         text=True,
+        encoding="utf-8",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -61,12 +63,14 @@ def run_devctl_with_env(repo_root: Path, extra_env: dict[str, str], *args: str, 
     env["DEVCTL_OPS_ROOT"] = str(OPS_ROOT)
     env["PYTHONPATH"] = str(OPS_ROOT)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     env.setdefault("DEVCTL_SKIP_PROVIDER_LOAD", "1")
     result = subprocess.run(
         [sys.executable, "-m", "xflow", *args],
         cwd=repo_root,
         env=env,
         text=True,
+        encoding="utf-8",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -91,6 +95,8 @@ def git_text(repo_root: Path, *args: str) -> str:
         ["git", "-C", str(repo_root), *args],
         check=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     ).stdout.strip()
@@ -178,30 +184,177 @@ def test_python_core_git_and_app_commands(parent: Path) -> None:
     assert "no recorded frontend process" in app_stop
 
 
+def test_git_push_and_mr_are_separate_with_state_backfill(parent: Path) -> None:
+    parent.mkdir(parents=True, exist_ok=True)
+    origin = parent / "origin.git"
+    seed = parent / "seed"
+    work = parent / "work"
+
+    git(parent, "init", "--bare", str(origin))
+    seed.mkdir()
+    git(seed, "init", "-q")
+    git(seed, "config", "user.email", "test@example.com")
+    git(seed, "config", "user.name", "Test User")
+    git(seed, "checkout", "-b", "main", "-q")
+    write(seed / "README.md", "# Demo\n")
+    git(seed, "add", "README.md")
+    git(seed, "commit", "-m", "初始化仓库", "-q")
+    git(seed, "remote", "add", "origin", str(origin))
+    git(seed, "push", "-u", "origin", "main", "-q")
+
+    subprocess.run(["git", "clone", str(origin), str(work), "-q"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    git(work, "config", "user.email", "test@example.com")
+    git(work, "config", "user.name", "Test User")
+    git(work, "checkout", "main", "-q")
+
+    run_devctl(work, "git", "start", "pr-state", "--issue", "8", "--base", "main")
+    branch = "feat/8-pr-state"
+    write(
+        work / ".xflow" / "current-task.md",
+        """# XFlow Current Task
+
+Issue: 8
+State: G5_APPROVE_MR_CREATE
+
+## Allowed Actions
+- Create the approved PR after branch publication.
+
+## Forbidden Actions
+- Push code changes after PR creation without XFlow metadata-only scope.
+""",
+    )
+    walkthrough = work / ".xflow" / "issues" / "issue-8" / "walkthrough.md"
+    write(
+        walkthrough,
+        """# Walkthrough
+
+Issue: 8
+
+## Verification
+- python tests/python-core.py
+""",
+    )
+    mr_file = work / ".xflow" / "issues" / "issue-8" / "mr-draft.md"
+    write(
+        mr_file,
+        """<!-- xflow: mr-draft -->
+
+Closes #8
+
+## Summary
+- Add a task branch change.
+
+## Test Plan
+- python tests/python-core.py
+
+## Risk
+- Low.
+
+## Review Request
+- Please review local artifacts before remote write.
+""",
+    )
+    write(work / "feature.txt", "task branch content\n")
+    git(work, "add", ".")
+    git(work, "commit", "-m", "feat(xflow): 添加任务分支内容", "-q")
+
+    run_devctl(work, "approval", "prepare", "--issue", "8", "--action", "git-mr", "--file", str(mr_file), "--force")
+    approval = work / ".xflow" / "issues" / "issue-8" / "approvals" / "local-review.md"
+    approval.write_text(approval.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"), encoding="utf-8")
+
+    mr_before_push = run_devctl(
+        work,
+        "git",
+        "mr",
+        "--title",
+        "PR state backfill",
+        "--body-file",
+        str(mr_file),
+        "--issue",
+        "8",
+        expect=1,
+    )
+    assert "devctl git push" in mr_before_push.stderr
+    assert branch not in git_text(origin, "branch", "--format=%(refname:short)")
+
+    run_devctl(work, "approval", "prepare", "--issue", "8", "--action", "git-push", "--file", str(walkthrough), "--force")
+    approval.write_text(approval.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"), encoding="utf-8")
+    push_result = run_devctl(work, "git", "push", "--issue", "8", "--file", str(walkthrough))
+    assert f"pushed {branch}" in push_result.stdout
+    assert branch in git_text(origin, "branch", "--format=%(refname:short)")
+
+    run_devctl(work, "approval", "prepare", "--issue", "8", "--action", "git-mr", "--file", str(mr_file), "--force")
+    approval.write_text(approval.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"), encoding="utf-8")
+    with RecordingApiServer() as github_server:
+        env = {
+            "DEVCTL_OWNER": "Linkk2000",
+            "DEVCTL_REPO": "paper-demo",
+            "GITHUB_API_BASE": github_server.base_url,
+            "GITHUB_TOKEN": "github-token",
+            "XFLOW_PLATFORM": "github",
+            "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+        }
+        mr_result = run_devctl_with_env(
+            work,
+            env,
+            "git",
+            "mr",
+            "--title",
+            "PR state backfill",
+            "--body-file",
+            str(mr_file),
+            "--issue",
+            "8",
+        )
+        assert "PR #42 created" in mr_result.stdout
+        assert "state backfill pushed" in mr_result.stdout
+        pr_requests = [item for item in github_server.requests if item["method"] == "POST" and item["path"].endswith("/pulls")]
+        assert pr_requests
+
+    latest_remote_subject = git_text(origin, "log", f"refs/heads/{branch}", "-1", "--pretty=%s")
+    assert latest_remote_subject == "chore(xflow): 回填 PR #42 状态"
+    remote_task = git_text(origin, "show", f"refs/heads/{branch}:.xflow/current-task.md")
+    assert "State: S9_REMOTE_REVIEW_AND_CI" in remote_task
+    assert "PR: 42" in remote_task
+    assert "PR URL: https://github.test/pulls/42" in remote_task
+    remote_suggestion = git_text(origin, "show", f"refs/heads/{branch}:.xflow/issues/issue-8/state-update-suggestion.md")
+    assert "PR: 42" in remote_suggestion
+
+
 def test_ai_call_guidance_is_visible(repo: Path) -> None:
     issue_help = run_devctl(repo, "issue", "create", "--help").stdout
     assert "AI call recipes" in issue_help
     assert "Plain unattended issue" in issue_help
-    assert "Unattended GitHub attachment issue" in issue_help
-    assert "--attach-file accepts any file" in issue_help
-    assert "GITHUB_TOKEN is required for GitHub uploads" in issue_help
+    assert "Issue/comment image attachments are disabled" in issue_help
+    assert "Do not use GitHub release assets as an issue image store" in issue_help
+    assert "For non-image files, use a reviewed manifest" in issue_help
 
     publish_help = run_devctl(repo, "attachment", "publish", "--help").stdout
-    assert "GitHub release asset upload" in publish_help
+    assert "Attachment publishing" in publish_help
     assert "writes publishedUrl" in publish_help
+    assert "Do not use this backend as issue/comment image storage" in publish_help
+
+    git_help = run_devctl(repo, "git", "--help").stdout
+    assert "push" in git_help
+    assert "mr" in git_help
 
     help_text = (OPS_ROOT / "help.txt").read_text(encoding="utf-8")
     assert "AI call recipes" in help_text
     assert "Plain unattended issue" in help_text
-    assert "Unattended GitHub attachment issue" in help_text
-    assert "Reviewed issue with attachments" in help_text
+    assert "Issue/comment image attachments are disabled" in help_text
+    assert "Do not use GitHub release assets as an issue image store" in help_text
+    assert "devctl git push --issue" in help_text
+    assert "state backfill commit" in help_text
     assert "Do not run bare bash/Git-Bash/WSL for normal XFlow validation on Windows" in help_text
 
     readme_text = (OPS_ROOT / "README.md").read_text(encoding="utf-8")
     assert "AI Call Recipes" in readme_text
     assert "Plain unattended issue" in readme_text
-    assert "Unattended GitHub attachment issue" in readme_text
-    assert "Reviewed issue with attachments" in readme_text
+    assert "Issue/comment image attachments are disabled" in readme_text
+    assert "GitHub release assets" in readme_text
+    assert "issue image store" in readme_text
+    assert "devctl git push --issue" in readme_text
+    assert "state backfill commit" in readme_text
     assert "Normal Git, Issue, Attachment, Approval, Rules, Migration, and App commands route" in readme_text
     assert "do not run bare `bash`, Git Bash, or WSL for normal XFlow validation" in readme_text
 
@@ -294,9 +447,14 @@ class RecordingApiHandler(BaseHTTPRequestHandler):
             self.requests.append({"method": "POST", "path": parsed.path, "form": form})
             self.send_json('{"id":"99","body":"comment"}')
         elif parsed.path.endswith("/pulls"):
-            form = self.read_form()
-            self.requests.append({"method": "POST", "path": parsed.path, "form": form})
-            self.send_json('{"number":"7","html_url":"https://gitee.test/pulls/7"}')
+            payload = self.read_body().decode("utf-8")
+            if "application/json" in self.headers.get("Content-Type", ""):
+                self.requests.append({"method": "POST", "path": parsed.path, "json": payload})
+                self.send_json('{"number":42,"html_url":"https://github.test/pulls/42"}')
+            else:
+                form = {key: values[-1] for key, values in parse_qs(payload).items()}
+                self.requests.append({"method": "POST", "path": parsed.path, "form": form})
+                self.send_json('{"number":"7","html_url":"https://gitee.test/pulls/7"}')
         elif parsed.path.endswith("/issues"):
             payload = self.read_body().decode("utf-8")
             self.requests.append({"method": "POST", "path": parsed.path, "json": payload})
@@ -356,6 +514,7 @@ def main() -> None:
         test_env_loading_policy(repo)
         test_python_core_rejects_inline_remote_bodies(repo)
         test_python_core_git_and_app_commands(repo / "core-routing")
+        test_git_push_and_mr_are_separate_with_state_backfill(repo / "push-mr-state")
         test_ai_call_guidance_is_visible(repo)
 
         issue_file = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
@@ -513,6 +672,19 @@ State: S6_PREPARE_COMMIT_AND_MR_DRAFT
         )
         run_devctl(repo, "attachment", "check", "--issue", "draft", "--manifest", str(manifest), "--body-file", str(attachment_body))
         run_devctl(repo, "issue", "create", "Attachment gate", "--body-file", str(attachment_body), "--attachments", str(manifest), expect=1)
+        github_publish_result = run_devctl(
+            repo,
+            "attachment",
+            "publish",
+            "--issue",
+            "draft",
+            "--manifest",
+            str(manifest),
+            "--backend",
+            "github",
+            expect=1,
+        )
+        assert "issue/comment image attachments are disabled" in github_publish_result.stderr
         run_devctl(repo, "attachment", "publish", "--issue", "draft", "--manifest", str(manifest), "--url", "att-001=https://example.test/pasted-image.png")
         final_body = repo / ".xflow" / "issues" / "issue-draft" / "issue-with-attachment.final.md"
         run_devctl(repo, "attachment", "render", "--issue", "draft", "--manifest", str(manifest), "--input", str(attachment_body), "--output", str(final_body))
@@ -544,7 +716,29 @@ State: S6_PREPARE_COMMIT_AND_MR_DRAFT
         assert f"Attachment Manifest SHA256: {manifest_digest}" in approval_text
         approval.write_text(approval_text.replace("Approved: no", "Approved: yes"), encoding="utf-8")
         run_devctl(repo, "check", "local-review", "--issue", "draft", "--file", str(final_body), "--action", "issue-create", "--attachments", str(manifest))
-        run_devctl(repo, "issue", "create", "Attachment gate", "--body-file", str(final_body), "--attachments", str(manifest))
+        run_devctl(repo, "issue", "create", "Attachment gate", "--body-file", str(final_body), "--attachments", str(manifest), expect=1)
+        comment_body = repo / ".xflow" / "issues" / "issue-1" / "comment-with-image.md"
+        write(
+            comment_body,
+            """<!-- xflow: issue-comment -->
+
+Image evidence is attached locally.
+""",
+        )
+        run_devctl(repo, "attachment", "add", "--issue", "1", "--file", str(pasted_image), "--as", "image")
+        comment_manifest = repo / ".xflow" / "issues" / "issue-1" / "attachments" / "manifest.json"
+        comment_result = run_devctl(
+            repo,
+            "issue",
+            "comment",
+            "1",
+            "--body-file",
+            str(comment_body),
+            "--attachments",
+            str(comment_manifest),
+            expect=1,
+        )
+        assert "issue/comment image attachments are disabled" in comment_result.stderr
         run_devctl(repo, "issue", "create", "Review required", "--body-file", str(auto_issue_body := issue_file.with_name("plain-issue.md")), expect=1)
 
         write(
@@ -639,19 +833,19 @@ Create a plain issue without manual approval when explicitly requested.
             """<!-- xflow: issue-draft -->
 
 ## Background
-Need automatic GitHub attachment upload.
+Need to prevent unsupported issue image upload.
 
 ## Problem
-Manual attachment URLs slow down issue creation.
+GitHub release assets are not approved as an issue image store.
 
 ## Goal
-Create an issue with uploaded attachment URLs.
+Fail before remote writes when an issue body includes an image attachment.
 
 ## Scope
 - Includes: one pasted image and one generic file.
 
 ## Acceptance Criteria
-- [ ] Issue body contains GitHub release asset URLs.
+- [ ] Issue creation stops before GitHub issue or release upload requests.
 
 ## Verification Plan
 - python tests/python-core.py
@@ -683,27 +877,16 @@ Create an issue with uploaded attachment URLs.
                 "--upload-attachments",
                 "github",
                 "--no-local-review",
+                expect=1,
             )
-            assert "Issue #42 created" in auto_result.stdout
+            assert "issue/comment image attachments are disabled" in auto_result.stderr
             auto_manifest = repo / ".xflow" / "issues" / "issue-draft" / "attachments" / "manifest.json"
             auto_manifest_data = json.loads(auto_manifest.read_text(encoding="utf-8"))
-            auto_urls = [item["publishedUrl"] for item in auto_manifest_data["items"][-2:]]
-            assert all("github.com/Linkk2000/paper-demo/releases/download/xflow-attachments/" in url for url in auto_urls)
-            auto_final = repo / ".xflow" / "issues" / "issue-draft" / "auto-issue.final.md"
-            assert auto_final.is_file()
-            auto_final_text = auto_final.read_text(encoding="utf-8")
-            assert auto_urls[0] in auto_final_text
-            assert auto_urls[1] in auto_final_text
-            assert re.search(r"!\[auto-image\.png\]\(https://", auto_final_text)
-            assert re.search(r"\[notes\.txt\]\(https://", auto_final_text)
+            assert any(item["mime"] == "image/png" for item in auto_manifest_data["items"])
             github_issue_requests = [item for item in github_server.requests if item["method"] == "POST" and item["path"].endswith("/issues")]
-            assert github_issue_requests
-            assert auto_urls[0] in str(github_issue_requests[-1]["json"])
-            assert auto_urls[1] in str(github_issue_requests[-1]["json"])
+            assert not github_issue_requests
             upload_requests = [item for item in github_server.requests if item["path"].endswith("/releases/77/assets")]
-            assert len(upload_requests) >= 2
-            assert upload_requests[0]["content_type"] == "image/png"
-            assert upload_requests[1]["content_type"] == "text/plain"
+            assert not upload_requests
 
         templates = repo / ".xflow" / "ops" / "workflow" / "templates"
         write(

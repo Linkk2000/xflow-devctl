@@ -44,14 +44,15 @@ def run_devctl(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["DEVCTL_REPO_ROOT"] = str(repo_root)
     env["DEVCTL_SKIP_PROVIDER_LOAD"] = "1"
-    env["DEVCTL_SKIP_PUSH"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONPATH"] = str(OPS_ROOT)
     result = subprocess.run(
         [sys.executable, "-m", "xflow", *args],
         cwd=repo_root,
         env=env,
         text=True,
+        encoding="utf-8",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -80,7 +81,11 @@ def main() -> None:
     assert_no_legacy_run_command()
 
     with tempfile.TemporaryDirectory() as raw:
-        repo = Path(raw)
+        root = Path(raw)
+        repo = root / "work"
+        repo.mkdir()
+        origin = root / "origin.git"
+        subprocess.run(["git", "init", "--bare", str(origin)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         git(repo, "init", "-q")
         git(repo, "config", "user.email", "test@example.com")
         git(repo, "config", "user.name", "Test User")
@@ -88,6 +93,8 @@ def main() -> None:
         write(repo / "README.md", "# Demo\n")
         git(repo, "add", "README.md")
         git(repo, "commit", "-m", "init", "-q")
+        git(repo, "remote", "add", "origin", str(origin))
+        git(repo, "push", "-u", "origin", "main", "-q")
         git(repo, "checkout", "-b", "feature/1-python-entrypoint", "-q")
         git(repo, "config", "--local", "devctl.issue", "1")
         git(repo, "config", "--local", "devctl.base", "main")
@@ -118,6 +125,24 @@ Route remote-write commands through Python core.
         )
         approval(repo, "draft", "issue-create", issue_file)
 
+        current_task = repo / ".xflow" / "current-task.md"
+        write(
+            current_task,
+            """# XFlow Current Task
+
+Issue: 1
+State: G5_APPROVE_MR_CREATE
+
+## Allowed Actions
+- Verify entrypoint routing.
+
+## Forbidden Actions
+- Create PR before push approval.
+""",
+        )
+        walkthrough = repo / ".xflow" / "issues" / "issue-1" / "walkthrough.md"
+        write(walkthrough, "# Walkthrough\n\n- python tests/entrypoint-routing.py\n")
+
         mr_file = repo / ".xflow" / "issues" / "issue-1" / "mr-draft.md"
         write(
             mr_file,
@@ -138,11 +163,17 @@ Closes #1
 - Please review routing behavior.
 """,
         )
-        approval(repo, "1", "git-mr", mr_file)
+        git(repo, "add", ".")
+        git(repo, "commit", "-m", "test: add routing task artifacts", "-q")
 
         issue_result = run_devctl(repo, "issue", "create", "Python routing", "--body-file", str(issue_file))
         assert "issue-create gate passed; provider skipped" in issue_result.stdout
 
+        approval(repo, "1", "git-push", walkthrough)
+        push_result = run_devctl(repo, "git", "push", "--issue", "1", "--file", str(walkthrough))
+        assert "pushed feature/1-python-entrypoint" in push_result.stdout
+
+        approval(repo, "1", "git-mr", mr_file)
         mr_result = run_devctl(repo, "git", "mr", "--body-file", str(mr_file), "--issue", "1", "--base", "main")
         assert "git-mr gate passed; provider skipped" in mr_result.stdout
 

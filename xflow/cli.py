@@ -27,20 +27,18 @@ ISSUE_CREATE_EPILOG = """AI call recipes:
   Plain unattended issue:
     devctl issue create "<title>" --body-file issue.md --no-local-review
 
-  Unattended GitHub attachment issue:
-    devctl issue create "<title>" --body-file issue.md --attach-file image.png --attach-file notes.txt --upload-attachments github --no-local-review
-
-  Reviewed issue with attachments:
-    devctl attachment add --issue draft --file image.png --as auto
-    devctl attachment publish --issue draft --backend github --body-file issue.md --output issue.final.md
+  Reviewed non-image attachment issue:
+    devctl attachment add --issue draft --file notes.txt --as file
+    devctl attachment publish --issue draft --backend manual --url att-001=https://public.example/notes.txt --body-file issue.md --output issue.final.md
     devctl approval prepare --issue draft --action issue-create --file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
     devctl check local-review --issue draft --file issue.final.md --action issue-create --attachments .xflow/issues/issue-draft/attachments/manifest.json
     devctl issue create "<title>" --body-file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
 
 Notes:
-  --attach-file accepts any file. Image MIME types render as Markdown images; other files render as links.
-  --upload-attachments github uploads to the xflow-attachments release by default and renders a final body file.
-  GITHUB_TOKEN is required for GitHub uploads and issue creation.
+  Issue/comment image attachments are disabled. Do not use GitHub release assets as an issue image store.
+  --attach-file with an image MIME type or Markdown image attachment fails before remote writes.
+  For non-image files, use a reviewed manifest and an approved URL backend.
+  GITHUB_TOKEN is required for issue creation.
   --no-local-review is only valid when the current user explicitly authorized that exact unattended command.
 """
 
@@ -49,30 +47,30 @@ ISSUE_COMMENT_EPILOG = """AI call recipes:
   Plain unattended comment:
     devctl issue comment <number> --body-file comment.md --no-local-review
 
-  Unattended GitHub attachment comment:
-    devctl issue comment <number> --body-file comment.md --attach-file image.png --attach-file notes.txt --upload-attachments github --no-local-review
-
-  Reviewed comment with attachments:
-    devctl attachment add --issue <number> --file image.png --as auto
-    devctl attachment publish --issue <number> --backend github --body-file comment.md --output comment.final.md
+  Reviewed non-image attachment comment:
+    devctl attachment add --issue <number> --file notes.txt --as file
+    devctl attachment publish --issue <number> --backend manual --url att-001=https://public.example/notes.txt --body-file comment.md --output comment.final.md
     devctl approval prepare --issue <number> --action issue-comment --file comment.final.md --attachments .xflow/issues/issue-<number>/attachments/manifest.json
     devctl check local-review --issue <number> --file comment.final.md --action issue-comment --attachments .xflow/issues/issue-<number>/attachments/manifest.json
     devctl issue comment <number> --body-file comment.final.md --attachments .xflow/issues/issue-<number>/attachments/manifest.json
 
 Notes:
-  --attach-file accepts any file. Image MIME types render as Markdown images; other files render as links.
-  --upload-attachments github uploads to the xflow-attachments release by default and renders a final body file.
-  GITHUB_TOKEN is required for GitHub uploads and issue comments.
+  Issue/comment image attachments are disabled. Do not use GitHub release assets as an issue image store.
+  --attach-file with an image MIME type or Markdown image attachment fails before remote writes.
+  For non-image files, use a reviewed manifest and an approved URL backend.
+  GITHUB_TOKEN is required for issue comments.
   --no-local-review is only valid when the current user explicitly authorized that exact unattended command.
 """
 
 
-ATTACHMENT_PUBLISH_EPILOG = """GitHub release asset upload:
+ATTACHMENT_PUBLISH_EPILOG = """Attachment publishing:
   devctl attachment publish --issue draft --backend github --body-file issue.md --output issue.final.md
 
 This creates or reuses the xflow-attachments release, uploads manifest files as
 release assets, writes publishedUrl values into the manifest, and optionally
 renders the final body file with public GitHub URLs.
+Do not use this backend as issue/comment image storage. GitHub publishing and
+issue/comment commands reject image attachments before remote writes.
 
 Manual URL mode:
   devctl attachment publish --issue draft --backend manual --url att-001=https://public.example/file.png
@@ -153,6 +151,9 @@ def build_parser() -> argparse.ArgumentParser:
     git_commit_msg.add_argument("-c", "--commit", action="store_true")
     git_commit_msg.add_argument("-m", "--message")
     git_commit_msg.add_argument("summary", nargs="?")
+    git_push = git_sub.add_parser("push")
+    git_push.add_argument("--issue")
+    git_push.add_argument("--file", type=Path)
     git_mr = git_sub.add_parser("mr")
     git_mr.add_argument("--title")
     git_mr.add_argument("--body")
@@ -351,6 +352,9 @@ def prepare_attachment_body(
             generated_body_path(current_body, ".attachments"),
         )
 
+    if manifest_path is not None:
+        attachment.reject_issue_image_attachments(repo_root, manifest_path, issue)
+
     if upload_backend:
         if manifest_path is None:
             raise ValueError("--upload-attachments requires --attachments or --attach-file")
@@ -424,12 +428,28 @@ def run_issue(args: argparse.Namespace) -> int:
 
 
 def git_output(repo_root: Path, args: list[str]) -> str:
-    result = subprocess.run(["git", "-C", str(repo_root), *args], check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        check=False,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
 def git_run(repo_root: Path, args: list[str]) -> str:
-    result = subprocess.run(["git", "-C", str(repo_root), *args], check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        check=False,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
     if result.returncode != 0:
         raise ValueError(f"git {' '.join(args)} failed: {result.stderr.strip() or result.stdout.strip()}")
     return result.stdout.strip()
@@ -557,9 +577,82 @@ def push_branch(repo_root: Path, branch: str) -> None:
         return
     upstream = git_output(repo_root, ["rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}"])
     command = ["push", "origin", branch] if upstream else ["push", "-u", "origin", branch]
-    result = subprocess.run(["git", "-C", str(repo_root), *command], check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), *command],
+        check=False,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
     if result.returncode != 0:
         raise ValueError(f"git push failed: {result.stderr.strip() or result.stdout.strip()}")
+
+
+def require_branch_ready_for_mr(repo_root: Path, branch: str) -> None:
+    upstream = git_output(repo_root, ["rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}"])
+    if not upstream:
+        raise ValueError("task branch has no upstream; run devctl git push before devctl git mr")
+    ahead = int(git_output(repo_root, ["rev-list", "--count", f"{upstream}..HEAD"]) or "0")
+    if ahead:
+        raise ValueError(f"task branch has {ahead} unpushed commit(s); run devctl git push before devctl git mr")
+
+
+def update_current_task_for_pr(repo_root: Path, issue: str, pr_number: str, pr_url: str | None) -> list[Path]:
+    path = repo_root / ".xflow" / "current-task.md"
+    if not path.is_file():
+        return []
+    text = path.read_text(encoding="utf-8")
+    lines = []
+    state_updated = False
+    for line in text.splitlines():
+        if line.startswith("State:"):
+            lines.append("State: S9_REMOTE_REVIEW_AND_CI")
+            state_updated = True
+        else:
+            lines.append(line)
+    if not state_updated:
+        lines.insert(0, "State: S9_REMOTE_REVIEW_AND_CI")
+    updated = "\n".join(lines).rstrip() + "\n"
+    if "## Remote Review" not in updated:
+        url_line = f"PR URL: {pr_url}\n" if pr_url else ""
+        updated += f"\n## Remote Review\nPR: {pr_number}\n{url_line}"
+    if updated != text:
+        path.write_text(updated, encoding="utf-8", newline="\n")
+        return [path]
+    return []
+
+
+def commit_and_push_pr_backfill(repo_root: Path, branch: str, paths: list[Path], pr_number: str) -> bool:
+    if not paths:
+        return False
+    for path in paths:
+        if path.exists():
+            git_run(repo_root, ["add", "--", str(path.relative_to(repo_root))])
+    if subprocess.run(["git", "-C", str(repo_root), "diff", "--cached", "--quiet"], check=False).returncode == 0:
+        return False
+    git_run(repo_root, ["commit", "-m", f"chore(xflow): 回填 PR #{pr_number} 状态"])
+    push_branch(repo_root, branch)
+    return True
+
+
+def run_git_push(ctx: RuntimeContext, args: argparse.Namespace) -> int:
+    issue = args.issue or branch_meta(ctx.repo_root, "issue")
+    if not issue:
+        raise ValueError("devctl git push requires --issue or branch issue metadata")
+    approved_file = args.file or default_issue_file(ctx.repo_root, issue, "walkthrough.md")
+    if not approved_file.is_file():
+        raise ValueError(f"approved file does not exist: {approved_file}")
+    approval.require_remote(ctx.repo_root, "git-push", approved_file, issue)
+    check_current_task(ctx.repo_root, issue)
+    branch = current_branch(ctx.repo_root)
+    base = branch_meta(ctx.repo_root, "base") or default_base(ctx.repo_root)
+    if branch == base:
+        raise ValueError(f"current branch is {base}; start a task branch before pushing")
+    push_branch(ctx.repo_root, branch)
+    print(f"[INFO] pushed {branch}")
+    return 0
 
 
 def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
@@ -665,6 +758,8 @@ def run_git(args: argparse.Namespace) -> int:
         return run_git_status(ctx)
     if args.git_command == "commit-msg":
         return run_git_commit_msg(ctx, args)
+    if args.git_command == "push":
+        return run_git_push(ctx, args)
     if args.git_command == "done":
         return run_git_done(ctx, args)
     if args.git_command == "pr-get":
@@ -715,7 +810,7 @@ def run_git(args: argparse.Namespace) -> int:
     base = args.base or branch_meta(ctx.repo_root, "base") or default_base(ctx.repo_root)
     if branch == base:
         raise ValueError(f"current branch is {base}; start a task branch before creating an MR")
-    push_branch(ctx.repo_root, branch)
+    require_branch_ready_for_mr(ctx.repo_root, branch)
     title = args.title or f"[#{issue}] {branch.replace('-', ' ')}"
     if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
         print("[INFO] git-mr gate passed; provider skipped")
@@ -725,10 +820,14 @@ def run_git(args: argparse.Namespace) -> int:
     if result.html_url:
         subprocess.run(["git", "-C", str(ctx.repo_root), "config", "--local", "devctl.pr-url", result.html_url], check=False)
     suggestion = write_pr_state_update_suggestion(ctx.repo_root, issue, result.number, result.html_url)
+    backfill_paths = [suggestion, *update_current_task_for_pr(ctx.repo_root, issue, result.number, result.html_url)]
+    backfill_pushed = commit_and_push_pr_backfill(ctx.repo_root, branch, backfill_paths, result.number)
     print(f"[INFO] PR #{result.number} created")
     if result.html_url:
         print(f"[INFO] {result.html_url}")
     print(f"[INFO] state update suggestion: {suggestion}")
+    if backfill_pushed:
+        print("[INFO] state backfill pushed")
     print(result.number)
     return 0
 
@@ -775,6 +874,7 @@ def run_attachment(args: argparse.Namespace) -> int:
             path = attachment.publish_urls(ctx.repo_root, issue, manifest, args.url)
             print(f"[INFO] attachment URLs recorded: {path}")
         elif backend in {"github", "github-release"}:
+            attachment.reject_issue_image_attachments(ctx.repo_root, manifest, issue)
             path = attachment.publish_github_release(ctx.repo_root, issue, manifest, os.environ, args.release_tag)
             print(f"[INFO] GitHub attachment assets uploaded: {path}")
         else:

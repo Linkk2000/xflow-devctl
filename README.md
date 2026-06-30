@@ -20,14 +20,15 @@ Useful commands:
 ```text
 devctl preflight
 devctl approval prepare --issue draft --action issue-create --file .xflow/issues/issue-draft/issue-draft.md
-devctl attachment add --issue draft --file screenshot.png --as image
+devctl attachment add --issue draft --file notes.txt --as file
 devctl attachment check --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json
-devctl attachment publish --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json --backend github
+devctl attachment publish --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json --backend manual --url att-001=https://public.example/notes.txt
 devctl attachment render --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json --input .xflow/issues/issue-draft/issue-draft.md --output .xflow/issues/issue-draft/issue-draft.final.md
 devctl issue create "Title" --body-file .xflow/issues/issue-draft/issue-draft.md --no-local-review
-devctl issue create "Title" --body-file .xflow/issues/issue-draft/issue-draft.md --attach-file screenshot.png --attach-file notes.txt --upload-attachments github --no-local-review
 devctl check current-task --issue 1
 devctl check local-review --issue draft --file .xflow/issues/issue-draft/issue-draft.md --action issue-create
+devctl git push --issue 1 --file .xflow/issues/issue-1/walkthrough.md
+devctl git mr --title "Title" --body-file .xflow/issues/issue-1/mr-draft.md --issue 1
 devctl check submodule-hygiene
 devctl rules list
 devctl migrate inspect
@@ -49,52 +50,44 @@ Plain unattended comment:
 devctl issue comment 123 --body-file comment.md --no-local-review
 ```
 
-Unattended GitHub attachment issue:
+Reviewed non-image attachment issue:
 
 ```text
-devctl issue create "Title" --body-file issue.md --attach-file screenshot.png --attach-file notes.txt --upload-attachments github --no-local-review
-```
-
-Unattended GitHub attachment comment:
-
-```text
-devctl issue comment 123 --body-file comment.md --attach-file screenshot.png --attach-file notes.txt --upload-attachments github --no-local-review
-```
-
-Reviewed issue with attachments:
-
-```text
-devctl attachment add --issue draft --file screenshot.png --as auto
-devctl attachment publish --issue draft --backend github --body-file issue.md --output issue.final.md
+devctl attachment add --issue draft --file notes.txt --as file
+devctl attachment publish --issue draft --backend manual --url att-001=https://public.example/notes.txt --body-file issue.md --output issue.final.md
 devctl approval prepare --issue draft --action issue-create --file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
 devctl check local-review --issue draft --file issue.final.md --action issue-create --attachments .xflow/issues/issue-draft/attachments/manifest.json
 devctl issue create "Title" --body-file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
 ```
 
-`--attach-file` accepts any file. Image MIME types render as Markdown images;
-other files render as links. `--upload-attachments github` uploads files to
-the `xflow-attachments` GitHub release by default and writes a rendered final
-body file next to the input body unless `--rendered-body-file` is provided.
-`GITHUB_TOKEN` is required for GitHub uploads and issue/comment remote writes.
+Issue/comment image attachments are disabled. Do not use GitHub release assets
+as an issue image store. `devctl issue create` and `devctl issue comment` fail
+before remote writes when an attachment manifest contains an image MIME type or
+Markdown image attachment. If images are needed, keep them as local evidence
+until a supported GitHub issue-native attachment API and policy are approved.
 If there are no attachments, omit all attachment flags.
 
 `devctl approval prepare` pre-fills the reviewer from `git config user.name`
 and `git config user.email` when available. Pass `--reviewer` to override it.
-When an issue, comment, or PR/MR body references pasted files or screenshots,
+When an issue, comment, or PR/MR body references approved non-image files,
 prepare the attachment manifest first and pass `--attachments <manifest>` to
 `approval prepare`, `check local-review`, and the final remote-write command.
 Remote bodies are rejected if they still contain `xflow-attachment://`
 placeholders or local file paths.
 
-For GitHub repositories, `devctl attachment publish --backend github` uploads
-files as release assets on the `xflow-attachments` release by default and writes
-the returned GitHub URL into the manifest. Images are treated as attachments
-whose MIME type renders with Markdown image syntax. The convenience
-issue/comment flow can also do this in one step with `--attach-file` and
-`--upload-attachments github`. If there are no attachments, the same issue or
-comment command still works without `--attach-file`. Use `--no-local-review`
-only when the user explicitly authorized an unattended remote write for that
-command.
+`devctl attachment publish --backend github` is a legacy release-asset backend.
+It rejects image attachments and must not be used as issue/comment image
+storage. Use `--no-local-review` only when the user explicitly authorized an
+unattended remote write for that exact command.
+
+Push and MR/PR creation are separate Git gates. `devctl git push --issue <id>`
+only publishes the current task branch after `Approved Action: git-push`.
+`devctl git mr` no longer pushes task code implicitly; it requires the branch
+to already have an upstream and no unpushed commits. After the PR/MR is created,
+devctl records the returned PR number and URL in XFlow state files, creates a
+metadata-only state backfill commit, and pushes that commit to the same branch.
+That post-MR push is covered by the `git-mr` approval and must not include
+business code changes.
 
 PowerShell users should prefer `devctl.ps1`, which invokes the Python core and
 sets `PYTHONDONTWRITEBYTECODE=1` to avoid `__pycache__` byproducts. Normal
