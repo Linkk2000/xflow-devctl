@@ -171,10 +171,10 @@ def test_python_core_git_and_app_commands(parent: Path) -> None:
     assert git_text(work, "branch", "--show-current") == "main"
     assert "feat/9-wsl-free" not in git_text(work, "branch", "--format=%(refname:short)")
 
-    app_status = run_devctl(work, "app", "status").stdout
+    app_status = run_devctl(work, "app", "status", "--port", "65534").stdout
     assert "frontend process: not running" in app_status
     assert "frontend HTTP: unavailable" in app_status
-    app_stop = run_devctl(work, "app", "stop-frontend").stdout
+    app_stop = run_devctl(work, "app", "stop-frontend", "--port", "65534").stdout
     assert "no recorded frontend process" in app_stop
 
 
@@ -301,6 +301,16 @@ class RecordingApiHandler(BaseHTTPRequestHandler):
             payload = self.read_body().decode("utf-8")
             self.requests.append({"method": "POST", "path": parsed.path, "json": payload})
             self.send_json('{"number":42,"html_url":"https://github.test/issue/42"}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_PUT(self) -> None:
+        parsed = urlparse(self.path)
+        payload = self.read_body().decode("utf-8")
+        self.requests.append({"method": "PUT", "path": parsed.path, "json": payload})
+        if parsed.path.endswith("/pulls/42/merge"):
+            self.send_json('{"sha":"abc123","merged":true,"message":"Pull Request successfully merged"}')
         else:
             self.send_response(404)
             self.end_headers()
@@ -582,6 +592,46 @@ Create a plain issue without manual approval when explicitly requested.
             assert plain_issue_requests
             assert "Need unattended plain issue creation." in str(plain_issue_requests[-1]["json"])
             assert not [item for item in plain_server.requests if item["path"].endswith("/releases/77/assets")]
+
+        with RecordingApiServer() as merge_server:
+            merge_env = {
+                "GITHUB_API_BASE": merge_server.base_url,
+                "GITHUB_TOKEN": "github-token",
+                "XFLOW_PLATFORM": "github",
+                "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+            }
+            run_devctl(
+                repo,
+                "approval",
+                "prepare",
+                "--issue",
+                "1",
+                "--action",
+                "git-pr-merge",
+                "--file",
+                str(mr_file),
+                "--force",
+            )
+            approval = repo / ".xflow" / "issues" / "issue-1" / "approvals" / "local-review.md"
+            approval.write_text(approval.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"), encoding="utf-8")
+            merge_result = run_devctl_with_env(
+                repo,
+                merge_env,
+                "git",
+                "pr-merge",
+                "42",
+                "--method",
+                "squash",
+                "--issue",
+                "1",
+                "--file",
+                str(mr_file),
+            )
+            assert "PR #42 merged" in merge_result.stdout
+            merge_requests = [item for item in merge_server.requests if item["method"] == "PUT"]
+            assert merge_requests
+            assert merge_requests[-1]["path"] == "/repos/Linkk2000/paper-demo/pulls/42/merge"
+            assert '"merge_method": "squash"' in str(merge_requests[-1]["json"])
 
         auto_issue_body = repo / ".xflow" / "issues" / "issue-draft" / "auto-issue.md"
         write(

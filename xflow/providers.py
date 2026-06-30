@@ -447,3 +447,27 @@ def get_pull_request(repo_root: Path, number: str, env: Mapping[str, str]) -> di
     if not isinstance(response, dict):
         raise ValueError("GitHub pull request response must be a JSON object")
     return response
+
+
+def merge_pull_request(
+    repo_root: Path,
+    number: str,
+    method: str,
+    commit_title: str | None,
+    commit_message: str | None,
+    env: Mapping[str, str],
+) -> dict[str, object]:
+    if platform(repo_root, env) == "gitee":
+        raise ValueError("Gitee pull request merge is not supported by devctl yet")
+    ensure_github(repo_root, env)
+    payload: dict[str, object] = {"merge_method": method}
+    if commit_title:
+        payload["commit_title"] = commit_title
+    if commit_message:
+        payload["commit_message"] = commit_message
+    response = request_json("PUT", api_url(repo_root, env, f"pulls/{number}/merge"), headers(token(env)), payload)
+    if not isinstance(response, dict):
+        raise ValueError("GitHub pull request merge response must be a JSON object")
+    if response.get("merged") is not True:
+        raise ValueError(f"GitHub pull request merge failed: {response.get('message', response)}")
+    return response

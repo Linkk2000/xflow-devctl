@@ -91,6 +91,8 @@ def suggested_command(action: str, approved_file: Path, issue: str, attachment_m
         return f"devctl issue close {issue}"
     if action == "git-mr":
         return f'devctl git mr --title "<title>" --body-file {path} --issue {issue}{attachments}'
+    if action == "git-pr-merge":
+        return f"devctl git pr-merge <number> --issue {issue} --file {path}"
     return f"devctl <remote-write-command> --body-file {path}"
 
 

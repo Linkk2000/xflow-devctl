@@ -162,6 +162,13 @@ def build_parser() -> argparse.ArgumentParser:
     git_mr.add_argument("--attachments", type=Path)
     pr_get = git_sub.add_parser("pr-get")
     pr_get.add_argument("number")
+    pr_merge = git_sub.add_parser("pr-merge")
+    pr_merge.add_argument("number")
+    pr_merge.add_argument("--method", choices=("merge", "squash", "rebase"), default="squash")
+    pr_merge.add_argument("--commit-title")
+    pr_merge.add_argument("--commit-message")
+    pr_merge.add_argument("--issue")
+    pr_merge.add_argument("--file", type=Path)
     git_sub.add_parser("status")
     git_done = git_sub.add_parser("done")
     git_done.add_argument("--base")
@@ -666,6 +673,31 @@ def run_git(args: argparse.Namespace) -> int:
         if pr.get("html_url"):
             print()
             print(pr["html_url"])
+        return 0
+    if args.git_command == "pr-merge":
+        issue = args.issue or branch_meta(ctx.repo_root, "issue")
+        if not issue:
+            raise ValueError("devctl git pr-merge requires --issue or branch issue metadata")
+        approved_file = args.file or default_issue_file(ctx.repo_root, issue, "mr-draft.md")
+        if not approved_file.is_file():
+            raise ValueError(f"approved file does not exist: {approved_file}")
+        approval.require_remote(ctx.repo_root, "git-pr-merge", approved_file, issue)
+        if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
+            print("[INFO] git-pr-merge gate passed; provider skipped")
+            return 0
+        result = providers.merge_pull_request(
+            ctx.repo_root,
+            args.number,
+            args.method,
+            args.commit_title,
+            args.commit_message,
+            os.environ,
+        )
+        print(f"[INFO] PR #{args.number} merged")
+        if result.get("sha"):
+            print(f"[INFO] merge sha: {result['sha']}")
+        if result.get("message"):
+            print(f"[INFO] {result['message']}")
         return 0
     if args.git_command != "mr":
         raise ValueError(f"unknown git subcommand: {args.git_command}")

@@ -45,6 +45,7 @@ Git:
   devctl git commit-msg [-a] [-c] [-m MESSAGE] [summary]
   devctl git mr [--title T] [--body-file F] [--base BRANCH] [--issue N] [--attachments manifest.json]
   devctl git pr-get <number>
+  devctl git pr-merge <number> [--method merge|squash|rebase] [--issue N] [--file F] [--commit-title T] [--commit-message M]
   devctl git status
   devctl git done [--base BRANCH] [--force]
 
