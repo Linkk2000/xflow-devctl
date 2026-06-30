@@ -89,9 +89,10 @@ metadata-only state backfill commit, and pushes that commit to the same branch.
 That post-MR push is covered by the `git-mr` approval and must not include
 business code changes.
 
-PowerShell users should prefer `devctl.ps1`, which invokes the Python core and
-sets `PYTHONDONTWRITEBYTECODE=1` to avoid `__pycache__` byproducts. Normal
-Git, Issue, Attachment, Approval, Rules, Migration, and App commands route
+PowerShell users should prefer the repository-local `devctl.ps1`, which invokes
+the Python core and sets `PYTHONDONTWRITEBYTECODE=1` to avoid `__pycache__`
+byproducts. Do not rely on a user-level PATH devctl shim for repository work.
+Normal Git, Issue, Attachment, Approval, Rules, Migration, and App commands route
 through Python core. On Windows, validate with Python commands such as
 `python tests/python-core.py` and `python tests/entrypoint-routing.py`; do not
 run bare `bash`, Git Bash, or WSL for normal XFlow validation. POSIX-only shell

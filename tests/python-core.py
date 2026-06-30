@@ -356,6 +356,7 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "devctl git push --issue" in readme_text
     assert "state backfill commit" in readme_text
     assert "Normal Git, Issue, Attachment, Approval, Rules, Migration, and App commands route" in readme_text
+    assert "repository-local `devctl.ps1`" in readme_text
     assert "do not run bare `bash`, Git Bash, or WSL for normal XFlow validation" in readme_text
 
 

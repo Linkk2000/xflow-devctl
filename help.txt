@@ -85,7 +85,8 @@ App:
   devctl app status [--port PORT]
 
 Runtime:
-  devctl.ps1 and generated project wrappers route normal commands to Python core.
+  Repository-local devctl.ps1 and generated project wrappers route normal commands to Python core.
+  Do not rely on a user-level PATH devctl shim for repository work.
   On Windows, validate with Python commands such as:
     python tests/python-core.py
     python tests/entrypoint-routing.py
