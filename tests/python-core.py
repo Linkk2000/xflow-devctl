@@ -327,12 +327,15 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "Plain unattended issue" in issue_help
     assert "Issue/comment image attachments are disabled" in issue_help
     assert "Do not use GitHub release assets as an issue image store" in issue_help
+    assert "aliyun-oss" in issue_help
     assert "For non-image files, use a reviewed manifest" in issue_help
 
     publish_help = run_devctl(repo, "attachment", "publish", "--help").stdout
     assert "Attachment publishing" in publish_help
     assert "writes publishedUrl" in publish_help
     assert "Do not use this backend as issue/comment image storage" in publish_help
+    assert "Aliyun OSS mode" in publish_help
+    assert "ALIYUN_OSS_ACCESS_KEY_SECRET" in publish_help
 
     git_help = run_devctl(repo, "git", "--help").stdout
     assert "push" in git_help
@@ -343,6 +346,8 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "Plain unattended issue" in help_text
     assert "Issue/comment image attachments are disabled" in help_text
     assert "Do not use GitHub release assets as an issue image store" in help_text
+    assert "devctl attachment publish --issue draft --backend aliyun-oss" in help_text
+    assert "%USERPROFILE%\\.xflow\\env.local" in help_text
     assert "devctl git push --issue" in help_text
     assert "state backfill commit" in help_text
     assert "Do not run bare bash/Git-Bash/WSL for normal XFlow validation on Windows" in help_text
@@ -353,6 +358,9 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "Issue/comment image attachments are disabled" in readme_text
     assert "GitHub release assets" in readme_text
     assert "issue image store" in readme_text
+    assert "Aliyun OSS attachment backend" in readme_text
+    assert "ALIYUN_OSS_ACCESS_KEY_SECRET" in readme_text
+    assert "must not be written to attachment manifests" in readme_text
     assert "devctl git push --issue" in readme_text
     assert "state backfill commit" in readme_text
     assert "Normal Git, Issue, Attachment, Approval, Rules, Migration, and App commands route" in readme_text
@@ -503,6 +511,47 @@ class RecordingApiServer:
     @property
     def requests(self) -> list[dict[str, object]]:
         return RecordingApiHandler.requests
+
+
+class RecordingOssHandler(BaseHTTPRequestHandler):
+    requests: list[dict[str, object]] = []
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+    def do_PUT(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) if length else b""
+        self.requests.append(
+            {
+                "method": "PUT",
+                "path": self.path,
+                "authorization": self.headers.get("Authorization", ""),
+                "content_type": self.headers.get("Content-Type", ""),
+                "body": body,
+            }
+        )
+        self.send_response(200)
+        self.end_headers()
+
+
+class RecordingOssServer:
+    def __enter__(self) -> "RecordingOssServer":
+        RecordingOssHandler.requests = []
+        self.server = HTTPServer(("127.0.0.1", 0), RecordingOssHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.server.shutdown()
+        self.thread.join(timeout=5)
+        self.server.server_close()
+
+    @property
+    def requests(self) -> list[dict[str, object]]:
+        return RecordingOssHandler.requests
 
 
 def main() -> None:
@@ -740,6 +789,81 @@ Image evidence is attached locally.
             expect=1,
         )
         assert "issue/comment image attachments are disabled" in comment_result.stderr
+
+        oss_body = repo / ".xflow" / "issues" / "issue-draft" / "issue-with-oss-image.md"
+        write(
+            oss_body,
+            issue_file.read_text(encoding="utf-8")
+            + "\n## Attachments\n- ![pasted-image.png](xflow-attachment://att-001)\n",
+        )
+        with RecordingOssServer() as oss_server:
+            oss_env = {
+                "ALIYUN_OSS_ACCESS_KEY_ID": "test-access-key-id",
+                "ALIYUN_OSS_ACCESS_KEY_SECRET": "test-access-key-secret",
+                "ALIYUN_OSS_BUCKET": "pictbed",
+                "ALIYUN_OSS_REGION": "oss-cn-chengdu",
+                "ALIYUN_OSS_ENDPOINT": oss_server.base_url,
+                "ALIYUN_OSS_PUBLIC_BASE_URL": "https://img.example.test",
+                "ALIYUN_OSS_PREFIX": "xflow/issues",
+            }
+            run_devctl_with_env(
+                repo,
+                oss_env,
+                "attachment",
+                "publish",
+                "--issue",
+                "draft",
+                "--manifest",
+                str(manifest),
+                "--backend",
+                "aliyun-oss",
+            )
+            assert len(oss_server.requests) == 1
+            oss_request = oss_server.requests[0]
+            assert oss_request["method"] == "PUT"
+            assert str(oss_request["path"]).startswith("/pictbed/xflow/issues/issue-draft/attachments/")
+            assert str(oss_request["path"]).endswith("pasted-image.png")
+            assert str(oss_request["authorization"]).startswith("OSS test-access-key-id:")
+            assert "test-access-key-secret" not in str(oss_request["authorization"])
+            assert oss_request["content_type"] == "image/png"
+            assert oss_request["body"] == b"\x89PNG\r\n\x1a\nxflow-test-image"
+
+        oss_manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+        oss_item = oss_manifest_data["items"][0]
+        assert oss_item["backend"] == "aliyun-oss"
+        assert oss_item["provider"] == "aliyun-oss"
+        assert oss_item["bucket"] == "pictbed"
+        assert oss_item["objectKey"].startswith("xflow/issues/issue-draft/attachments/")
+        assert oss_item["publishedUrl"].startswith("https://img.example.test/xflow/issues/issue-draft/attachments/")
+        manifest_text = manifest.read_text(encoding="utf-8")
+        assert "test-access-key-id" not in manifest_text
+        assert "test-access-key-secret" not in manifest_text
+
+        oss_final_body = repo / ".xflow" / "issues" / "issue-draft" / "issue-with-oss-image.final.md"
+        run_devctl(repo, "attachment", "render", "--issue", "draft", "--manifest", str(manifest), "--input", str(oss_body), "--output", str(oss_final_body))
+        oss_final_text = oss_final_body.read_text(encoding="utf-8")
+        assert "xflow-attachment://" not in oss_final_text
+        assert "https://img.example.test/xflow/issues/issue-draft/attachments/" in oss_final_text
+
+        run_devctl(
+            repo,
+            "approval",
+            "prepare",
+            "--issue",
+            "draft",
+            "--action",
+            "issue-create",
+            "--file",
+            str(oss_final_body),
+            "--attachments",
+            str(manifest),
+            "--force",
+        )
+        approval_text = approval.read_text(encoding="utf-8")
+        approval.write_text(approval_text.replace("Approved: no", "Approved: yes"), encoding="utf-8")
+        run_devctl(repo, "check", "local-review", "--issue", "draft", "--file", str(oss_final_body), "--action", "issue-create", "--attachments", str(manifest))
+        run_devctl(repo, "issue", "create", "OSS image gate", "--body-file", str(oss_final_body), "--attachments", str(manifest))
+
         run_devctl(repo, "issue", "create", "Review required", "--body-file", str(auto_issue_body := issue_file.with_name("plain-issue.md")), expect=1)
 
         write(

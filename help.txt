@@ -21,10 +21,19 @@ AI call recipes:
     devctl check local-review --issue draft --file issue.final.md --action issue-create --attachments .xflow/issues/issue-draft/attachments/manifest.json
     devctl issue create "<title>" --body-file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
 
+  Reviewed Aliyun OSS image issue:
+    devctl attachment add --issue draft --file screenshot.png --as image
+    devctl attachment publish --issue draft --backend aliyun-oss --manifest .xflow/issues/issue-draft/attachments/manifest.json
+    devctl attachment render --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json --input issue.md --output issue.final.md
+    devctl approval prepare --issue draft --action issue-create --file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
+    devctl check local-review --issue draft --file issue.final.md --action issue-create --attachments .xflow/issues/issue-draft/attachments/manifest.json
+    devctl issue create "<title>" --body-file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
+
 AI recipe notes:
   Issue/comment image attachments are disabled.
   Do not use GitHub release assets as an issue image store.
   --attach-file with an image MIME type or Markdown image attachment fails before remote writes.
+  Images may be published only after devctl attachment publish --backend aliyun-oss records reviewed URLs.
   For non-image files, use a reviewed manifest and an approved URL backend.
   GITHUB_TOKEN is required for issue/comment remote writes.
   --no-local-review is valid only when the current user explicitly authorized that exact unattended command.
@@ -32,10 +41,12 @@ AI recipe notes:
 Attachment:
   devctl attachment add --issue draft|N --file PATH [--as auto|image|file] [--id ID] [--manifest manifest.json]
   devctl attachment check --issue draft|N [--manifest manifest.json] [--body-file F] [--final]
-  devctl attachment publish --issue draft|N [--manifest manifest.json] [--backend github|manual]
+  devctl attachment publish --issue draft|N [--manifest manifest.json] [--backend github|manual|aliyun-oss|object]
                             [--url ID=https://public.example/file.png] [--body-file draft.md] [--output final.md]
   devctl attachment render --issue draft|N [--manifest manifest.json] --input draft.md --output final.md
   GitHub publishing rejects image attachments; do not use release assets as issue/comment image storage.
+  Aliyun OSS reads ALIYUN_OSS_* values from %USERPROFILE%\.xflow\env.local, ~/.xflow/env.local, or .xflow/local/env.local.
+  ALIYUN_OSS_ACCESS_KEY_SECRET must never be written to manifests, issues, comments, commits, or Markdown guides.
 
 Git:
   devctl git start <slug> [--issue N] [--base BRANCH]

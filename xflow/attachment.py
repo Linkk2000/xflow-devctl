@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlparse
 
-from . import providers
+from . import object_storage, providers
 from .io import read_text
 
 
@@ -169,6 +169,16 @@ def require_url(url: str) -> None:
         raise ValueError(f"published attachment URL must be http(s): {url}")
 
 
+def is_image_item(item: dict[str, object]) -> bool:
+    mime = str(item.get("mime", "")).lower()
+    markdown = str(item.get("markdown", "")).lstrip()
+    return mime.startswith("image/") or markdown.startswith("![")
+
+
+def is_issue_image_publishable(item: dict[str, object]) -> bool:
+    return item.get("backend") == "aliyun-oss" and bool(item.get("publishedUrl"))
+
+
 def validate_manifest(
     repo_root: Path,
     manifest_path: Path,
@@ -270,9 +280,7 @@ def reject_issue_image_attachments(repo_root: Path, manifest_path: Path, issue: 
     for raw in manifest.get("items", []):
         if not isinstance(raw, dict):
             continue
-        mime = str(raw.get("mime", "")).lower()
-        markdown = str(raw.get("markdown", "")).lstrip()
-        if mime.startswith("image/") or markdown.startswith("!["):
+        if is_image_item(raw) and not is_issue_image_publishable(raw):
             images.append(str(raw.get("filename") or raw.get("id") or "image"))
     if images:
         raise ValueError(
@@ -375,6 +383,37 @@ def publish_github_release(
         raw["githubAssetName"] = asset_name
         if response.get("id") is not None:
             raw["githubAssetId"] = str(response.get("id"))
+    write_manifest(manifest_path, data)
+    return manifest_path
+
+
+def publish_aliyun_oss(
+    repo_root: Path,
+    issue: str,
+    manifest_path: Path,
+    env: Mapping[str, str],
+) -> Path:
+    repo_root = repo_root.resolve()
+    manifest_path = resolve_repo_path(repo_root, manifest_path)
+    data = validate_manifest(repo_root, manifest_path, issue=issue)
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        raise ValueError("attachment manifest has no items to publish")
+
+    prefix = env.get("ALIYUN_OSS_PREFIX", "xflow/issues")
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        if raw.get("publishedUrl") and raw.get("backend") == "aliyun-oss":
+            continue
+        local_path = resolve_repo_path(repo_root, Path(str(raw["localPath"])))
+        key = object_storage.object_key(prefix, normalized_issue(issue), raw)
+        url, bucket = object_storage.upload_aliyun_oss(local_path, key, str(raw["mime"]), env)
+        raw["publishedUrl"] = url
+        raw["backend"] = "aliyun-oss"
+        raw["provider"] = "aliyun-oss"
+        raw["bucket"] = bucket
+        raw["objectKey"] = key
     write_manifest(manifest_path, data)
     return manifest_path
 

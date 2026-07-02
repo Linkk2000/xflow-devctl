@@ -60,11 +60,42 @@ devctl check local-review --issue draft --file issue.final.md --action issue-cre
 devctl issue create "Title" --body-file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
 ```
 
+Aliyun OSS attachment backend:
+
+```text
+devctl attachment add --issue draft --file screenshot.png --as image
+devctl attachment publish --issue draft --backend aliyun-oss --manifest .xflow/issues/issue-draft/attachments/manifest.json
+devctl attachment render --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json --input issue.md --output issue.final.md
+devctl approval prepare --issue draft --action issue-create --file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
+devctl check local-review --issue draft --file issue.final.md --action issue-create --attachments .xflow/issues/issue-draft/attachments/manifest.json
+devctl issue create "Title" --body-file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
+```
+
+Aliyun OSS credentials are loaded from env files. Put shared user-level values
+in `%USERPROFILE%\.xflow\env.local` on Windows or `~/.xflow/env.local` on
+POSIX, and project overrides in `.xflow/local/env.local`.
+
+```text
+XFLOW_ATTACHMENT_BACKEND=aliyun-oss
+ALIYUN_OSS_BUCKET=pictbed
+ALIYUN_OSS_REGION=oss-cn-chengdu
+ALIYUN_OSS_ENDPOINT=https://oss-cn-chengdu.aliyuncs.com
+ALIYUN_OSS_PUBLIC_BASE_URL=https://pictbed.oss-cn-chengdu.aliyuncs.com
+ALIYUN_OSS_PREFIX=xflow/issues
+ALIYUN_OSS_ACCESS_KEY_ID=<secret>
+ALIYUN_OSS_ACCESS_KEY_SECRET=<secret>
+```
+
+`ALIYUN_OSS_ACCESS_KEY_ID` and `ALIYUN_OSS_ACCESS_KEY_SECRET` must not be written to attachment manifests.
+They also must not appear in issue bodies, comments, commits, or Markdown
+guides. Manifests record only the backend, bucket, object key, file hashes, and
+published URL.
+
 Issue/comment image attachments are disabled. Do not use GitHub release assets
 as an issue image store. `devctl issue create` and `devctl issue comment` fail
 before remote writes when an attachment manifest contains an image MIME type or
-Markdown image attachment. If images are needed, keep them as local evidence
-until a supported GitHub issue-native attachment API and policy are approved.
+Markdown image attachment unless it has already been published by an approved
+backend such as `aliyun-oss`.
 If there are no attachments, omit all attachment flags.
 
 `devctl approval prepare` pre-fills the reviewer from `git config user.name`

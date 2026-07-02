@@ -37,6 +37,7 @@ ISSUE_CREATE_EPILOG = """AI call recipes:
 Notes:
   Issue/comment image attachments are disabled. Do not use GitHub release assets as an issue image store.
   --attach-file with an image MIME type or Markdown image attachment fails before remote writes.
+  Aliyun OSS image attachments must be published first with attachment publish --backend aliyun-oss.
   For non-image files, use a reviewed manifest and an approved URL backend.
   GITHUB_TOKEN is required for issue creation.
   --no-local-review is only valid when the current user explicitly authorized that exact unattended command.
@@ -57,6 +58,7 @@ ISSUE_COMMENT_EPILOG = """AI call recipes:
 Notes:
   Issue/comment image attachments are disabled. Do not use GitHub release assets as an issue image store.
   --attach-file with an image MIME type or Markdown image attachment fails before remote writes.
+  Aliyun OSS image attachments must be published first with attachment publish --backend aliyun-oss.
   For non-image files, use a reviewed manifest and an approved URL backend.
   GITHUB_TOKEN is required for issue comments.
   --no-local-review is only valid when the current user explicitly authorized that exact unattended command.
@@ -74,6 +76,15 @@ issue/comment commands reject image attachments before remote writes.
 
 Manual URL mode:
   devctl attachment publish --issue draft --backend manual --url att-001=https://public.example/file.png
+
+Aliyun OSS mode:
+  devctl attachment publish --issue draft --backend aliyun-oss
+
+Reads ALIYUN_OSS_BUCKET, ALIYUN_OSS_REGION, ALIYUN_OSS_ACCESS_KEY_ID,
+ALIYUN_OSS_ACCESS_KEY_SECRET, optional ALIYUN_OSS_ENDPOINT,
+ALIYUN_OSS_PUBLIC_BASE_URL, and ALIYUN_OSS_PREFIX from loaded env files.
+Secrets must live in ~/.xflow/env.local or .xflow/local/env.local and are not
+written to attachment manifests.
 """
 
 
@@ -216,7 +227,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     attachment_publish.add_argument("--issue", default="draft")
     attachment_publish.add_argument("--manifest", type=Path)
-    attachment_publish.add_argument("--backend", choices=("manual", "github", "github-release"))
+    attachment_publish.add_argument("--backend", choices=("manual", "github", "github-release", "aliyun-oss", "object"))
     attachment_publish.add_argument("--release-tag", default=os.environ.get("XFLOW_GITHUB_ATTACHMENT_RELEASE_TAG", "xflow-attachments"))
     attachment_publish.add_argument("--url", action="append", default=[])
     attachment_publish.add_argument("--body-file", type=Path)
@@ -870,6 +881,10 @@ def run_attachment(args: argparse.Namespace) -> int:
         return 0
     if args.attachment_command == "publish":
         backend = args.backend or ("manual" if args.url else "github")
+        if backend == "object":
+            backend = os.environ.get("XFLOW_ATTACHMENT_BACKEND", "").strip()
+            if not backend:
+                raise ValueError("attachment publish --backend object requires XFLOW_ATTACHMENT_BACKEND")
         if backend == "manual":
             path = attachment.publish_urls(ctx.repo_root, issue, manifest, args.url)
             print(f"[INFO] attachment URLs recorded: {path}")
@@ -877,6 +892,9 @@ def run_attachment(args: argparse.Namespace) -> int:
             attachment.reject_issue_image_attachments(ctx.repo_root, manifest, issue)
             path = attachment.publish_github_release(ctx.repo_root, issue, manifest, os.environ, args.release_tag)
             print(f"[INFO] GitHub attachment assets uploaded: {path}")
+        elif backend == "aliyun-oss":
+            path = attachment.publish_aliyun_oss(ctx.repo_root, issue, manifest, os.environ)
+            print(f"[INFO] Aliyun OSS attachments uploaded: {path}")
         else:
             raise ValueError(f"unsupported attachment backend: {backend}")
         if args.body_file:
