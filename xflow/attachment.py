@@ -36,6 +36,23 @@ def default_manifest(repo_root: Path, issue: str) -> Path:
     return attachment_dir(repo_root, issue) / "manifest.json"
 
 
+def publish_dir(repo_root: Path, issue: str) -> Path:
+    return repo_root / ".xflow" / "publish" / "issues" / f"issue-{normalized_issue(issue)}"
+
+
+def publish_attachment_dir(repo_root: Path, issue: str) -> Path:
+    return publish_dir(repo_root, issue) / "attachments"
+
+
+def published_manifest_path(repo_root: Path, issue: str, manifest_path: Path) -> Path:
+    return publish_attachment_dir(repo_root, issue) / manifest_path.name
+
+
+def default_rendered_body(repo_root: Path, issue: str, body_file: Path) -> Path:
+    extension = body_file.suffix or ".md"
+    return publish_dir(repo_root, issue) / f"{body_file.stem}.final{extension}"
+
+
 def resolve_repo_path(repo_root: Path, path: Path) -> Path:
     return path.resolve() if path.is_absolute() else (repo_root / path).resolve()
 
@@ -75,6 +92,12 @@ def load_manifest(path: Path, issue: str | None = None) -> dict[str, object]:
 def write_manifest(path: Path, data: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+
+
+def write_published_manifest(repo_root: Path, issue: str, source_manifest: Path, data: dict[str, object]) -> Path:
+    output = published_manifest_path(repo_root, issue, source_manifest)
+    write_manifest(output, data)
+    return output
 
 
 def next_attachment_id(items: list[dict[str, object]]) -> str:
@@ -323,8 +346,7 @@ def publish_urls(repo_root: Path, issue: str, manifest_path: Path, urls: list[st
         if item_id not in by_id:
             raise ValueError(f"unknown attachment id in --url: {item_id}")
         by_id[item_id]["publishedUrl"] = url
-    write_manifest(manifest_path, data)
-    return manifest_path
+    return write_published_manifest(repo_root, issue, manifest_path, data)
 
 
 def safe_asset_component(value: str) -> str:
@@ -383,8 +405,7 @@ def publish_github_release(
         raw["githubAssetName"] = asset_name
         if response.get("id") is not None:
             raw["githubAssetId"] = str(response.get("id"))
-    write_manifest(manifest_path, data)
-    return manifest_path
+    return write_published_manifest(repo_root, issue, manifest_path, data)
 
 
 def publish_aliyun_oss(
@@ -414,8 +435,7 @@ def publish_aliyun_oss(
         raw["provider"] = "aliyun-oss"
         raw["bucket"] = bucket
         raw["objectKey"] = key
-    write_manifest(manifest_path, data)
-    return manifest_path
+    return write_published_manifest(repo_root, issue, manifest_path, data)
 
 
 def append_markdown_to_body(repo_root: Path, body_file: Path, markdown_items: list[str], output_path: Path) -> Path:
@@ -444,6 +464,12 @@ def render_body(repo_root: Path, issue: str, manifest_path: Path, input_path: Pa
         text = text.replace(str(raw["placeholder"]), str(raw["publishedUrl"]))
     reject_publication_body(text)
     output = resolve_repo_path(repo_root, output_path)
+    try:
+        output.relative_to(issue_dir(repo_root, issue).resolve())
+    except ValueError:
+        pass
+    else:
+        raise ValueError("rendered remote bodies must stay outside .xflow/issues; use .xflow/publish/issues/issue-<id>")
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(text, encoding="utf-8", newline="\n")
     return output

@@ -68,6 +68,11 @@ SUBTASK_CONCLUSIONS = {"success", "blocked", "superseded-by-human"}
 SUBTASK_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 SUBTASK_NAME_RE = re.compile(r"subtask-(\d{3})")
 REMOTE_EVIDENCE_RE = re.compile(r"(?i)(https?://|oss://|cos://|aliyuncs\.com|myqcloud\.com|qcloudcos|cos\.)")
+ISSUE_WORKSPACE_REMOTE_RE = re.compile(
+    r"(?i)(oss://|cos://|aliyuncs\.com|myqcloud\.com|qcloudcos|/xflow/issues/issue-[^\s)\"']+/attachments/)"
+)
+PUBLISHED_URL_RE = re.compile(r'"publishedUrl"\s*:\s*"[^"]+"')
+ISSUE_WORKSPACE_TEXT_SUFFIXES = {".md", ".txt", ".json", ".yaml", ".yml", ".log"}
 
 
 def reject_publish_heading(path: Path, headings: tuple[str, ...]) -> None:
@@ -266,6 +271,27 @@ def check_subtask(repo_root: Path, issue: str, subtask_path: Path | None = None)
     if not match or match.group(1).lower() not in SUBTASK_CONCLUSIONS:
         raise ValueError("subtask Conclusion must be success, blocked, or superseded-by-human with a reason")
     return path
+
+
+def check_issue_evidence(repo_root: Path, issue: str, publish_root: Path | None = None) -> Path:
+    repo_root = repo_root.resolve()
+    current_issue_dir = issue_dir(repo_root, issue).resolve()
+    if not current_issue_dir.is_dir():
+        raise ValueError(f"missing issue workspace: {current_issue_dir}")
+    if publish_root is not None:
+        publish_path = resolve_repo_path(repo_root, publish_root)
+        expected_publish_root = repo_root / ".xflow" / "publish" / "issues" / f"issue-{normalized_issue(issue)}"
+        require_inside(publish_path, expected_publish_root, "publish files must stay under .xflow/publish/issues/issue-<id>")
+
+    for file_path in current_issue_dir.rglob("*"):
+        if not file_path.is_file() or file_path.suffix.lower() not in ISSUE_WORKSPACE_TEXT_SUFFIXES:
+            continue
+        text = read_text(file_path)
+        if ISSUE_WORKSPACE_REMOTE_RE.search(text):
+            raise ValueError(f"issue workspace must not contain COS/OSS/published attachment URLs: {file_path}")
+        if PUBLISHED_URL_RE.search(text):
+            raise ValueError(f"issue workspace must not contain publishedUrl values: {file_path}")
+    return current_issue_dir
 
 
 def write_pr_state_update_suggestion(repo_root: Path, issue: str, pr_number: str, pr_url: str | None = None) -> Path:

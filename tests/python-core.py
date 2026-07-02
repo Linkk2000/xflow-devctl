@@ -352,6 +352,8 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "state backfill commit" in help_text
     assert "Do not run bare bash/Git-Bash/WSL for normal XFlow validation on Windows" in help_text
     assert "devctl check subtask --issue" in help_text
+    assert "devctl check issue-evidence --issue" in help_text
+    assert ".xflow/publish/issues" in help_text
     assert "subtask-001" in help_text
     assert "subtask evidence/ directory" in help_text
 
@@ -370,6 +372,8 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "repository-local `devctl.ps1`" in readme_text
     assert "do not run bare `bash`, Git Bash, or WSL for normal XFlow validation" in readme_text
     assert "devctl check subtask --issue" in readme_text
+    assert "devctl check issue-evidence --issue" in readme_text
+    assert ".xflow/publish/issues" in readme_text
     assert "Subtask evidence must stay in the repository" in readme_text
     assert "subtask `evidence/` directory" in readme_text
 
@@ -773,6 +777,29 @@ success: implemented and verified locally.
         write(root_evidence / "README.md", (subtask / "README.md").read_text(encoding="utf-8").replace("evidence/screenshot.png", "notes.txt"))
         run_devctl(repo, "check", "subtask", "--issue", "1", "--path", str(root_evidence), expect=1)
 
+        simple_issue = repo / ".xflow" / "issues" / "issue-2"
+        write(simple_issue / "evidence" / "note.txt", "local issue evidence")
+        write(simple_issue / "walkthrough.md", "# Walkthrough\n\n- [local note](evidence/note.txt)\n")
+        run_devctl(repo, "check", "issue-evidence", "--issue", "2")
+
+        write(simple_issue / "walkthrough.md", "# Walkthrough\n\nhttps://example.test/reference\n")
+        run_devctl(repo, "check", "issue-evidence", "--issue", "2")
+
+        write(simple_issue / "walkthrough.md", "# Walkthrough\n\n![remote](https://img.example.test/xflow/issues/issue-2/attachments/att-001.png)\n")
+        run_devctl(repo, "check", "issue-evidence", "--issue", "2", expect=1)
+
+        write(simple_issue / "walkthrough.md", "# Walkthrough\n\noss://bucket/xflow/issues/issue-2/attachments/att-001.png\n")
+        run_devctl(repo, "check", "issue-evidence", "--issue", "2", expect=1)
+
+        write(simple_issue / "attachments" / "manifest.json", '{"items":[{"publishedUrl":"https://img.example.test/xflow/issues/issue-2/attachments/att-001.png"}]}\n')
+        run_devctl(repo, "check", "issue-evidence", "--issue", "2", expect=1)
+
+        write(simple_issue / "walkthrough.md", "# Walkthrough\n\n- [local note](evidence/note.txt)\n")
+        write(simple_issue / "attachments" / "manifest.json", '{"items":[{"publishedUrl":null}]}\n')
+        publish_body = repo / ".xflow" / "publish" / "issues" / "issue-2" / "issue.final.md"
+        write(publish_body, "# Remote Body\n\n![remote](https://img.example.test/xflow/issues/issue-2/attachments/att-001.png)\n")
+        run_devctl(repo, "check", "issue-evidence", "--issue", "2", "--publish-root", str(publish_body.parent))
+
         bad_issue = issue_file.with_name("bad-issue.md")
         shutil.copyfile(issue_file, bad_issue)
         bad_issue.write_text("# Issue Draft\n" + bad_issue.read_text(encoding="utf-8"), encoding="utf-8")
@@ -823,16 +850,22 @@ success: implemented and verified locally.
         )
         assert "issue/comment image attachments are disabled" in github_publish_result.stderr
         run_devctl(repo, "attachment", "publish", "--issue", "draft", "--manifest", str(manifest), "--url", "att-001=https://example.test/pasted-image.png")
-        final_body = repo / ".xflow" / "issues" / "issue-draft" / "issue-with-attachment.final.md"
-        run_devctl(repo, "attachment", "render", "--issue", "draft", "--manifest", str(manifest), "--input", str(attachment_body), "--output", str(final_body))
+        published_manifest = repo / ".xflow" / "publish" / "issues" / "issue-draft" / "attachments" / "manifest.json"
+        assert published_manifest.is_file()
+        assert "publishedUrl" in published_manifest.read_text(encoding="utf-8")
+        assert '"publishedUrl": null' in manifest.read_text(encoding="utf-8")
+        final_body = repo / ".xflow" / "publish" / "issues" / "issue-draft" / "issue-with-attachment.final.md"
+        run_devctl(repo, "attachment", "render", "--issue", "draft", "--manifest", str(published_manifest), "--input", str(attachment_body), "--output", str(final_body))
         final_text = final_body.read_text(encoding="utf-8")
         assert "xflow-attachment://" not in final_text
         assert "https://example.test/pasted-image.png" in final_text
-        run_devctl(repo, "attachment", "check", "--issue", "draft", "--manifest", str(manifest), "--body-file", str(final_body), "--final")
+        run_devctl(repo, "attachment", "check", "--issue", "draft", "--manifest", str(published_manifest), "--body-file", str(final_body), "--final")
+        issue_dir_final_body = repo / ".xflow" / "issues" / "issue-draft" / "issue-with-attachment.final.md"
+        run_devctl(repo, "attachment", "render", "--issue", "draft", "--manifest", str(published_manifest), "--input", str(attachment_body), "--output", str(issue_dir_final_body), expect=1)
 
         local_path_body = final_body.with_name("issue-with-local-path.md")
         local_path_body.write_text(final_text + "\n![bad](C:\\temp\\bad.png)\n", encoding="utf-8", newline="\n")
-        run_devctl(repo, "attachment", "check", "--issue", "draft", "--manifest", str(manifest), "--body-file", str(local_path_body), "--final", expect=1)
+        run_devctl(repo, "attachment", "check", "--issue", "draft", "--manifest", str(published_manifest), "--body-file", str(local_path_body), "--final", expect=1)
 
         run_devctl(
             repo,
@@ -845,15 +878,15 @@ success: implemented and verified locally.
             "--file",
             str(final_body),
             "--attachments",
-            str(manifest),
+            str(published_manifest),
             "--force",
         )
         approval_text = approval.read_text(encoding="utf-8")
-        manifest_digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        manifest_digest = hashlib.sha256(published_manifest.read_bytes()).hexdigest()
         assert f"Attachment Manifest SHA256: {manifest_digest}" in approval_text
         approval.write_text(approval_text.replace("Approved: no", "Approved: yes"), encoding="utf-8")
-        run_devctl(repo, "check", "local-review", "--issue", "draft", "--file", str(final_body), "--action", "issue-create", "--attachments", str(manifest))
-        run_devctl(repo, "issue", "create", "Attachment gate", "--body-file", str(final_body), "--attachments", str(manifest), expect=1)
+        run_devctl(repo, "check", "local-review", "--issue", "draft", "--file", str(final_body), "--action", "issue-create", "--attachments", str(published_manifest))
+        run_devctl(repo, "issue", "create", "Attachment gate", "--body-file", str(final_body), "--attachments", str(published_manifest), expect=1)
         comment_body = repo / ".xflow" / "issues" / "issue-1" / "comment-with-image.md"
         write(
             comment_body,
@@ -915,19 +948,22 @@ Image evidence is attached locally.
             assert oss_request["content_type"] == "image/png"
             assert oss_request["body"] == b"\x89PNG\r\n\x1a\nxflow-test-image"
 
-        oss_manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+        oss_published_manifest = repo / ".xflow" / "publish" / "issues" / "issue-draft" / "attachments" / "manifest.json"
+        oss_manifest_data = json.loads(oss_published_manifest.read_text(encoding="utf-8"))
         oss_item = oss_manifest_data["items"][0]
         assert oss_item["backend"] == "aliyun-oss"
         assert oss_item["provider"] == "aliyun-oss"
         assert oss_item["bucket"] == "pictbed"
         assert oss_item["objectKey"].startswith("xflow/issues/issue-draft/attachments/")
         assert oss_item["publishedUrl"].startswith("https://img.example.test/xflow/issues/issue-draft/attachments/")
-        manifest_text = manifest.read_text(encoding="utf-8")
+        manifest_text = oss_published_manifest.read_text(encoding="utf-8")
         assert "test-access-key-id" not in manifest_text
         assert "test-access-key-secret" not in manifest_text
+        assert '"publishedUrl": null' in manifest.read_text(encoding="utf-8")
+        run_devctl(repo, "check", "issue-evidence", "--issue", "draft")
 
-        oss_final_body = repo / ".xflow" / "issues" / "issue-draft" / "issue-with-oss-image.final.md"
-        run_devctl(repo, "attachment", "render", "--issue", "draft", "--manifest", str(manifest), "--input", str(oss_body), "--output", str(oss_final_body))
+        oss_final_body = repo / ".xflow" / "publish" / "issues" / "issue-draft" / "issue-with-oss-image.final.md"
+        run_devctl(repo, "attachment", "render", "--issue", "draft", "--manifest", str(oss_published_manifest), "--input", str(oss_body), "--output", str(oss_final_body))
         oss_final_text = oss_final_body.read_text(encoding="utf-8")
         assert "xflow-attachment://" not in oss_final_text
         assert "https://img.example.test/xflow/issues/issue-draft/attachments/" in oss_final_text
@@ -943,13 +979,13 @@ Image evidence is attached locally.
             "--file",
             str(oss_final_body),
             "--attachments",
-            str(manifest),
+            str(oss_published_manifest),
             "--force",
         )
         approval_text = approval.read_text(encoding="utf-8")
         approval.write_text(approval_text.replace("Approved: no", "Approved: yes"), encoding="utf-8")
-        run_devctl(repo, "check", "local-review", "--issue", "draft", "--file", str(oss_final_body), "--action", "issue-create", "--attachments", str(manifest))
-        run_devctl(repo, "issue", "create", "OSS image gate", "--body-file", str(oss_final_body), "--attachments", str(manifest))
+        run_devctl(repo, "check", "local-review", "--issue", "draft", "--file", str(oss_final_body), "--action", "issue-create", "--attachments", str(oss_published_manifest))
+        run_devctl(repo, "issue", "create", "OSS image gate", "--body-file", str(oss_final_body), "--attachments", str(oss_published_manifest))
 
         run_devctl(repo, "issue", "create", "Review required", "--body-file", str(auto_issue_body := issue_file.with_name("plain-issue.md")), expect=1)
 

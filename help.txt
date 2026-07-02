@@ -16,18 +16,18 @@ AI call recipes:
 
   Reviewed non-image attachment issue:
     devctl attachment add --issue draft --file notes.txt --as file
-    devctl attachment publish --issue draft --backend manual --url att-001=https://public.example/notes.txt --body-file issue.md --output issue.final.md
-    devctl approval prepare --issue draft --action issue-create --file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
-    devctl check local-review --issue draft --file issue.final.md --action issue-create --attachments .xflow/issues/issue-draft/attachments/manifest.json
-    devctl issue create "<title>" --body-file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
+    devctl attachment publish --issue draft --backend manual --url att-001=https://public.example/notes.txt --body-file issue.md --output .xflow/publish/issues/issue-draft/issue.final.md
+    devctl approval prepare --issue draft --action issue-create --file .xflow/publish/issues/issue-draft/issue.final.md --attachments .xflow/publish/issues/issue-draft/attachments/manifest.json
+    devctl check local-review --issue draft --file .xflow/publish/issues/issue-draft/issue.final.md --action issue-create --attachments .xflow/publish/issues/issue-draft/attachments/manifest.json
+    devctl issue create "<title>" --body-file .xflow/publish/issues/issue-draft/issue.final.md --attachments .xflow/publish/issues/issue-draft/attachments/manifest.json
 
   Reviewed Aliyun OSS image issue:
     devctl attachment add --issue draft --file screenshot.png --as image
     devctl attachment publish --issue draft --backend aliyun-oss --manifest .xflow/issues/issue-draft/attachments/manifest.json
-    devctl attachment render --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json --input issue.md --output issue.final.md
-    devctl approval prepare --issue draft --action issue-create --file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
-    devctl check local-review --issue draft --file issue.final.md --action issue-create --attachments .xflow/issues/issue-draft/attachments/manifest.json
-    devctl issue create "<title>" --body-file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
+    devctl attachment render --issue draft --manifest .xflow/publish/issues/issue-draft/attachments/manifest.json --input issue.md --output .xflow/publish/issues/issue-draft/issue.final.md
+    devctl approval prepare --issue draft --action issue-create --file .xflow/publish/issues/issue-draft/issue.final.md --attachments .xflow/publish/issues/issue-draft/attachments/manifest.json
+    devctl check local-review --issue draft --file .xflow/publish/issues/issue-draft/issue.final.md --action issue-create --attachments .xflow/publish/issues/issue-draft/attachments/manifest.json
+    devctl issue create "<title>" --body-file .xflow/publish/issues/issue-draft/issue.final.md --attachments .xflow/publish/issues/issue-draft/attachments/manifest.json
 
 AI recipe notes:
   Issue/comment image attachments are disabled.
@@ -75,9 +75,16 @@ Check:
   devctl check issue-draft [--issue draft|N] [--file F]
   devctl check mr-draft --issue N [--file F]
   devctl check current-task [--issue N]
+  devctl check issue-evidence --issue N [--publish-root .xflow/publish/issues/issue-N]
   devctl check subtask --issue N [--path .xflow/issues/issue-N/subtask-001]
   devctl check local-review --issue draft|N --file F --action issue-create|issue-comment|issue-close|git-mr [--attachments manifest.json]
   devctl check submodule-hygiene
+
+Issue evidence:
+  .xflow/issues/issue-N is local evidence and approval state only.
+  Do not store COS/OSS published URLs or non-null publishedUrl values there.
+  Rendered remote bodies and published manifests belong under
+  .xflow/publish/issues/issue-N.
 
 Subtask:
   Large issues may be split into local subtask directories such as

@@ -23,9 +23,10 @@ devctl approval prepare --issue draft --action issue-create --file .xflow/issues
 devctl attachment add --issue draft --file notes.txt --as file
 devctl attachment check --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json
 devctl attachment publish --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json --backend manual --url att-001=https://public.example/notes.txt
-devctl attachment render --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json --input .xflow/issues/issue-draft/issue-draft.md --output .xflow/issues/issue-draft/issue-draft.final.md
+devctl attachment render --issue draft --manifest .xflow/publish/issues/issue-draft/attachments/manifest.json --input .xflow/issues/issue-draft/issue-draft.md --output .xflow/publish/issues/issue-draft/issue-draft.final.md
 devctl issue create "Title" --body-file .xflow/issues/issue-draft/issue-draft.md --no-local-review
 devctl check current-task --issue 1
+devctl check issue-evidence --issue 1
 devctl check subtask --issue 1 --path .xflow/issues/issue-1/subtask-001
 devctl check local-review --issue draft --file .xflow/issues/issue-draft/issue-draft.md --action issue-create
 devctl git push --issue 1 --file .xflow/issues/issue-1/walkthrough.md
@@ -55,10 +56,10 @@ Reviewed non-image attachment issue:
 
 ```text
 devctl attachment add --issue draft --file notes.txt --as file
-devctl attachment publish --issue draft --backend manual --url att-001=https://public.example/notes.txt --body-file issue.md --output issue.final.md
-devctl approval prepare --issue draft --action issue-create --file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
-devctl check local-review --issue draft --file issue.final.md --action issue-create --attachments .xflow/issues/issue-draft/attachments/manifest.json
-devctl issue create "Title" --body-file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
+devctl attachment publish --issue draft --backend manual --url att-001=https://public.example/notes.txt --body-file issue.md --output .xflow/publish/issues/issue-draft/issue.final.md
+devctl approval prepare --issue draft --action issue-create --file .xflow/publish/issues/issue-draft/issue.final.md --attachments .xflow/publish/issues/issue-draft/attachments/manifest.json
+devctl check local-review --issue draft --file .xflow/publish/issues/issue-draft/issue.final.md --action issue-create --attachments .xflow/publish/issues/issue-draft/attachments/manifest.json
+devctl issue create "Title" --body-file .xflow/publish/issues/issue-draft/issue.final.md --attachments .xflow/publish/issues/issue-draft/attachments/manifest.json
 ```
 
 Aliyun OSS attachment backend:
@@ -66,10 +67,10 @@ Aliyun OSS attachment backend:
 ```text
 devctl attachment add --issue draft --file screenshot.png --as image
 devctl attachment publish --issue draft --backend aliyun-oss --manifest .xflow/issues/issue-draft/attachments/manifest.json
-devctl attachment render --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json --input issue.md --output issue.final.md
-devctl approval prepare --issue draft --action issue-create --file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
-devctl check local-review --issue draft --file issue.final.md --action issue-create --attachments .xflow/issues/issue-draft/attachments/manifest.json
-devctl issue create "Title" --body-file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
+devctl attachment render --issue draft --manifest .xflow/publish/issues/issue-draft/attachments/manifest.json --input issue.md --output .xflow/publish/issues/issue-draft/issue.final.md
+devctl approval prepare --issue draft --action issue-create --file .xflow/publish/issues/issue-draft/issue.final.md --attachments .xflow/publish/issues/issue-draft/attachments/manifest.json
+devctl check local-review --issue draft --file .xflow/publish/issues/issue-draft/issue.final.md --action issue-create --attachments .xflow/publish/issues/issue-draft/attachments/manifest.json
+devctl issue create "Title" --body-file .xflow/publish/issues/issue-draft/issue.final.md --attachments .xflow/publish/issues/issue-draft/attachments/manifest.json
 ```
 
 Aliyun OSS credentials are loaded from env files. Put shared user-level values
@@ -106,6 +107,13 @@ prepare the attachment manifest first and pass `--attachments <manifest>` to
 `approval prepare`, `check local-review`, and the final remote-write command.
 Remote bodies are rejected if they still contain `xflow-attachment://`
 placeholders or local file paths.
+
+`.xflow/issues/` is the local evidence and approval workspace. Do not store
+COS/OSS published URLs or non-null `publishedUrl` values there. Put rendered
+remote bodies and published attachment manifests under
+`.xflow/publish/issues/issue-<id>/`, then run
+`devctl check issue-evidence --issue <id>` before treating the issue workspace
+as local evidence.
 
 Large issues may be split into local subtask directories named
 `.xflow/issues/issue-<id>/subtask-001`, `subtask-002`, and so on. Each subtask

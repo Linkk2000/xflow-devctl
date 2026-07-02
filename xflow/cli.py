@@ -13,6 +13,7 @@ from pathlib import Path
 from . import approval, attachment, providers, rules
 from .checks import (
     check_current_task,
+    check_issue_evidence,
     check_issue_draft,
     check_mr_draft,
     check_subtask,
@@ -30,10 +31,10 @@ ISSUE_CREATE_EPILOG = """AI call recipes:
 
   Reviewed non-image attachment issue:
     devctl attachment add --issue draft --file notes.txt --as file
-    devctl attachment publish --issue draft --backend manual --url att-001=https://public.example/notes.txt --body-file issue.md --output issue.final.md
-    devctl approval prepare --issue draft --action issue-create --file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
-    devctl check local-review --issue draft --file issue.final.md --action issue-create --attachments .xflow/issues/issue-draft/attachments/manifest.json
-    devctl issue create "<title>" --body-file issue.final.md --attachments .xflow/issues/issue-draft/attachments/manifest.json
+    devctl attachment publish --issue draft --backend manual --url att-001=https://public.example/notes.txt --body-file issue.md --output .xflow/publish/issues/issue-draft/issue.final.md
+    devctl approval prepare --issue draft --action issue-create --file .xflow/publish/issues/issue-draft/issue.final.md --attachments .xflow/publish/issues/issue-draft/attachments/manifest.json
+    devctl check local-review --issue draft --file .xflow/publish/issues/issue-draft/issue.final.md --action issue-create --attachments .xflow/publish/issues/issue-draft/attachments/manifest.json
+    devctl issue create "<title>" --body-file .xflow/publish/issues/issue-draft/issue.final.md --attachments .xflow/publish/issues/issue-draft/attachments/manifest.json
 
 Notes:
   Issue/comment image attachments are disabled. Do not use GitHub release assets as an issue image store.
@@ -51,10 +52,10 @@ ISSUE_COMMENT_EPILOG = """AI call recipes:
 
   Reviewed non-image attachment comment:
     devctl attachment add --issue <number> --file notes.txt --as file
-    devctl attachment publish --issue <number> --backend manual --url att-001=https://public.example/notes.txt --body-file comment.md --output comment.final.md
-    devctl approval prepare --issue <number> --action issue-comment --file comment.final.md --attachments .xflow/issues/issue-<number>/attachments/manifest.json
-    devctl check local-review --issue <number> --file comment.final.md --action issue-comment --attachments .xflow/issues/issue-<number>/attachments/manifest.json
-    devctl issue comment <number> --body-file comment.final.md --attachments .xflow/issues/issue-<number>/attachments/manifest.json
+    devctl attachment publish --issue <number> --backend manual --url att-001=https://public.example/notes.txt --body-file comment.md --output .xflow/publish/issues/issue-<number>/comment.final.md
+    devctl approval prepare --issue <number> --action issue-comment --file .xflow/publish/issues/issue-<number>/comment.final.md --attachments .xflow/publish/issues/issue-<number>/attachments/manifest.json
+    devctl check local-review --issue <number> --file .xflow/publish/issues/issue-<number>/comment.final.md --action issue-comment --attachments .xflow/publish/issues/issue-<number>/attachments/manifest.json
+    devctl issue comment <number> --body-file .xflow/publish/issues/issue-<number>/comment.final.md --attachments .xflow/publish/issues/issue-<number>/attachments/manifest.json
 
 Notes:
   Issue/comment image attachments are disabled. Do not use GitHub release assets as an issue image store.
@@ -67,11 +68,12 @@ Notes:
 
 
 ATTACHMENT_PUBLISH_EPILOG = """Attachment publishing:
-  devctl attachment publish --issue draft --backend github --body-file issue.md --output issue.final.md
+  devctl attachment publish --issue draft --backend github --body-file issue.md --output .xflow/publish/issues/issue-draft/issue.final.md
 
 This creates or reuses the xflow-attachments release, uploads manifest files as
-release assets, writes publishedUrl values into the manifest, and optionally
-renders the final body file with public GitHub URLs.
+release assets, writes publishedUrl values into a publish manifest under
+.xflow/publish/issues, and optionally renders the final body file with public
+GitHub URLs.
 Do not use this backend as issue/comment image storage. GitHub publishing and
 issue/comment commands reject image attachments before remote writes.
 
@@ -110,6 +112,9 @@ def build_parser() -> argparse.ArgumentParser:
     check_sub.add_parser("submodule-hygiene")
     current_task = check_sub.add_parser("current-task")
     current_task.add_argument("--issue")
+    issue_evidence = check_sub.add_parser("issue-evidence")
+    issue_evidence.add_argument("--issue", required=True)
+    issue_evidence.add_argument("--publish-root", type=Path)
     subtask = check_sub.add_parser("subtask")
     subtask.add_argument("--issue", required=True)
     subtask.add_argument("--path", type=Path)
@@ -306,6 +311,8 @@ def run_check(args: argparse.Namespace) -> int:
         check_submodule_hygiene(path)
     elif args.check_command == "subtask":
         path = check_subtask(ctx.repo_root, args.issue, args.path)
+    elif args.check_command == "issue-evidence":
+        path = check_issue_evidence(ctx.repo_root, args.issue, args.publish_root)
     elif args.check_command == "current-task":
         path = ctx.repo_root / ".xflow" / "current-task.md"
         check_current_task(ctx.repo_root, args.issue)
@@ -377,8 +384,8 @@ def prepare_attachment_body(
             raise ValueError("--upload-attachments requires --attachments or --attach-file")
         if upload_backend not in {"github", "github-release"}:
             raise ValueError(f"unsupported attachment upload backend: {upload_backend}")
-        attachment.publish_github_release(repo_root, issue, manifest_path, os.environ, release_tag(args))
-        output = getattr(args, "rendered_body_file", None) or generated_body_path(original_body, ".final")
+        manifest_path = attachment.publish_github_release(repo_root, issue, manifest_path, os.environ, release_tag(args))
+        output = getattr(args, "rendered_body_file", None) or attachment.default_rendered_body(repo_root, issue, original_body)
         current_body = attachment.render_body(repo_root, issue, manifest_path, current_body, output)
     else:
         attachment.ensure_publishable(repo_root, current_body, manifest_path, issue if manifest_path else None)
@@ -904,8 +911,8 @@ def run_attachment(args: argparse.Namespace) -> int:
         else:
             raise ValueError(f"unsupported attachment backend: {backend}")
         if args.body_file:
-            output = args.output or generated_body_path(args.body_file, ".final")
-            rendered = attachment.render_body(ctx.repo_root, issue, manifest, args.body_file, output)
+            output = args.output or attachment.default_rendered_body(ctx.repo_root, issue, args.body_file)
+            rendered = attachment.render_body(ctx.repo_root, issue, path, args.body_file, output)
             print(f"[INFO] rendered attachment body: {rendered}")
         return 0
     if args.attachment_command == "render":
