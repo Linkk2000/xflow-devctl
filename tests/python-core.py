@@ -351,6 +351,9 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "devctl git push --issue" in help_text
     assert "state backfill commit" in help_text
     assert "Do not run bare bash/Git-Bash/WSL for normal XFlow validation on Windows" in help_text
+    assert "devctl check subtask --issue" in help_text
+    assert "subtask-001" in help_text
+    assert "subtask evidence/ directory" in help_text
 
     readme_text = (OPS_ROOT / "README.md").read_text(encoding="utf-8")
     assert "AI Call Recipes" in readme_text
@@ -366,6 +369,9 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "Normal Git, Issue, Attachment, Approval, Rules, Migration, and App commands route" in readme_text
     assert "repository-local `devctl.ps1`" in readme_text
     assert "do not run bare `bash`, Git Bash, or WSL for normal XFlow validation" in readme_text
+    assert "devctl check subtask --issue" in readme_text
+    assert "Subtask evidence must stay in the repository" in readme_text
+    assert "subtask `evidence/` directory" in readme_text
 
 
 class RecordingApiHandler(BaseHTTPRequestHandler):
@@ -685,6 +691,87 @@ State: S6_PREPARE_COMMIT_AND_MR_DRAFT
         suggestion = write_pr_state_update_suggestion(repo, "1", "9", "https://example.test/pull/9")
         assert suggestion.is_file()
         assert "Suggested State: S9_REMOTE_REVIEW_AND_CI" in suggestion.read_text(encoding="utf-8")
+
+        walkthrough = repo / ".xflow" / "issues" / "issue-1" / "walkthrough.md"
+        write(walkthrough, "# Walkthrough\n\nIssue evidence source.\n")
+        subtask = repo / ".xflow" / "issues" / "issue-1" / "subtask-001"
+        write(subtask / "evidence" / "screenshot.png", "local image evidence")
+        write(
+            subtask / "README.md",
+            """# Subtask 001
+
+## Source
+- walkthrough.md
+
+## Purpose
+Split a large issue into a focused local task.
+
+## Implementation Plan
+- [ ] Implement a focused slice.
+
+## Evidence
+- [screenshot](evidence/screenshot.png)
+
+## AI Review Checkpoints
+- [ ] Confirm local evidence stays in the repository.
+
+## Human Review Checkpoints
+- [ ] Review conclusion and evidence.
+
+## Conclusion
+success: implemented and verified locally.
+""",
+        )
+        run_devctl(repo, "check", "subtask", "--issue", "1")
+
+        zero_number = repo / ".xflow" / "issues" / "issue-1" / "subtask-000"
+        write(zero_number / "README.md", (subtask / "README.md").read_text(encoding="utf-8"))
+        run_devctl(repo, "check", "subtask", "--issue", "1", "--path", str(zero_number), expect=1)
+
+        bad_number = repo / ".xflow" / "issues" / "issue-1" / "subtask-1"
+        write(bad_number / "README.md", (subtask / "README.md").read_text(encoding="utf-8"))
+        run_devctl(repo, "check", "subtask", "--issue", "1", "--path", str(bad_number), expect=1)
+
+        missing_readme = repo / ".xflow" / "issues" / "issue-1" / "subtask-002"
+        missing_readme.mkdir(parents=True)
+        run_devctl(repo, "check", "subtask", "--issue", "1", "--path", str(missing_readme), expect=1)
+
+        missing_section = repo / ".xflow" / "issues" / "issue-1" / "subtask-003"
+        write(missing_section / "README.md", (subtask / "README.md").read_text(encoding="utf-8").replace("## Purpose\n", ""))
+        run_devctl(repo, "check", "subtask", "--issue", "1", "--path", str(missing_section), expect=1)
+
+        empty_purpose = repo / ".xflow" / "issues" / "issue-1" / "subtask-008"
+        write(empty_purpose / "README.md", (subtask / "README.md").read_text(encoding="utf-8").replace("Split a large issue into a focused local task.", ""))
+        run_devctl(repo, "check", "subtask", "--issue", "1", "--path", str(empty_purpose), expect=1)
+
+        empty_evidence = repo / ".xflow" / "issues" / "issue-1" / "subtask-009"
+        write(empty_evidence / "README.md", (subtask / "README.md").read_text(encoding="utf-8").replace("- [screenshot](evidence/screenshot.png)", ""))
+        run_devctl(repo, "check", "subtask", "--issue", "1", "--path", str(empty_evidence), expect=1)
+
+        outside_source = repo / ".xflow" / "issues" / "issue-1" / "subtask-004"
+        write(outside_source / "README.md", (subtask / "README.md").read_text(encoding="utf-8").replace("walkthrough.md", "../issue-draft/issue-draft.md"))
+        run_devctl(repo, "check", "subtask", "--issue", "1", "--path", str(outside_source), expect=1)
+
+        subtask_source = repo / ".xflow" / "issues" / "issue-1" / "subtask-010"
+        write(subtask_source / "README.md", (subtask / "README.md").read_text(encoding="utf-8").replace("walkthrough.md", "subtask-001/README.md"))
+        run_devctl(repo, "check", "subtask", "--issue", "1", "--path", str(subtask_source), expect=1)
+
+        remote_evidence = repo / ".xflow" / "issues" / "issue-1" / "subtask-005"
+        write(remote_evidence / "README.md", (subtask / "README.md").read_text(encoding="utf-8").replace("evidence/screenshot.png", "https://img.example.test/xflow/evidence.png"))
+        run_devctl(repo, "check", "subtask", "--issue", "1", "--path", str(remote_evidence), expect=1)
+
+        cos_evidence = repo / ".xflow" / "issues" / "issue-1" / "subtask-006"
+        write(cos_evidence / "README.md", (subtask / "README.md").read_text(encoding="utf-8").replace("evidence/screenshot.png", "cos://bucket/evidence.png"))
+        run_devctl(repo, "check", "subtask", "--issue", "1", "--path", str(cos_evidence), expect=1)
+
+        outside_evidence = repo / ".xflow" / "issues" / "issue-1" / "subtask-007"
+        write(outside_evidence / "README.md", (subtask / "README.md").read_text(encoding="utf-8").replace("evidence/screenshot.png", "../walkthrough.md"))
+        run_devctl(repo, "check", "subtask", "--issue", "1", "--path", str(outside_evidence), expect=1)
+
+        root_evidence = repo / ".xflow" / "issues" / "issue-1" / "subtask-011"
+        write(root_evidence / "notes.txt", "root evidence is not allowed")
+        write(root_evidence / "README.md", (subtask / "README.md").read_text(encoding="utf-8").replace("evidence/screenshot.png", "notes.txt"))
+        run_devctl(repo, "check", "subtask", "--issue", "1", "--path", str(root_evidence), expect=1)
 
         bad_issue = issue_file.with_name("bad-issue.md")
         shutil.copyfile(issue_file, bad_issue)

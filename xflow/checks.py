@@ -55,6 +55,19 @@ PRE_PR_STATES = {
     "S8_CREATE_REMOTE_MR",
 }
 REQUIRED_CURRENT_TASK_SECTIONS = ("## Allowed Actions", "## Forbidden Actions")
+SUBTASK_REQUIRED_SECTIONS = (
+    "## Source",
+    "## Purpose",
+    "## Implementation Plan",
+    "## Evidence",
+    "## AI Review Checkpoints",
+    "## Human Review Checkpoints",
+    "## Conclusion",
+)
+SUBTASK_CONCLUSIONS = {"success", "blocked", "superseded-by-human"}
+SUBTASK_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
+SUBTASK_NAME_RE = re.compile(r"subtask-(\d{3})")
+REMOTE_EVIDENCE_RE = re.compile(r"(?i)(https?://|oss://|cos://|aliyuncs\.com|myqcloud\.com|qcloudcos|cos\.)")
 
 
 def reject_publish_heading(path: Path, headings: tuple[str, ...]) -> None:
@@ -130,6 +143,129 @@ def check_current_task(repo_root: Path, issue: str | None = None) -> None:
             "stale current task state: local git config already records "
             f"devctl.pr={pr_number}, but State is still {state}; update to S9_REMOTE_REVIEW_AND_CI or later"
         )
+
+
+def issue_dir(repo_root: Path, issue: str) -> Path:
+    return repo_root / ".xflow" / "issues" / f"issue-{normalized_issue(issue)}"
+
+
+def resolve_repo_path(repo_root: Path, path: Path) -> Path:
+    return path.resolve() if path.is_absolute() else (repo_root / path).resolve()
+
+
+def require_inside(path: Path, parent: Path, message: str) -> None:
+    try:
+        path.resolve().relative_to(parent.resolve())
+    except ValueError as exc:
+        raise ValueError(message) from exc
+
+
+def section_text(text: str, heading: str) -> str:
+    pattern = rf"(?ms)^\s*{re.escape(heading)}\s*$\n(.*?)(?=^\s*##\s+|\Z)"
+    match = re.search(pattern, text)
+    return match.group(1).strip() if match else ""
+
+
+def has_section(text: str, heading: str) -> bool:
+    return re.search(rf"(?m)^\s*{re.escape(heading)}\s*$", text) is not None
+
+
+def first_section_entry(raw: str) -> str:
+    for line in raw.splitlines():
+        item = line.strip()
+        if not item:
+            continue
+        item = re.sub(r"^[-*]\s+", "", item).strip()
+        if not item:
+            continue
+        link = SUBTASK_LINK_RE.search(item)
+        if link:
+            item = link.group(1).strip()
+        if item.startswith("`") and "`" in item[1:]:
+            item = item.strip("`")
+        return item
+    return ""
+
+
+def section_entries(raw: str) -> list[str]:
+    entries = []
+    for line in raw.splitlines():
+        item = line.strip()
+        if not item:
+            continue
+        item = re.sub(r"^[-*]\s+", "", item).strip()
+        item = re.sub(r"^\[[ xX]\]\s+", "", item).strip()
+        if not item:
+            continue
+        link = SUBTASK_LINK_RE.search(item)
+        if link:
+            item = link.group(1).strip()
+        if item.startswith("`") and "`" in item[1:]:
+            item = item.strip("`")
+        entries.append(item)
+    return entries
+
+
+def check_subtask(repo_root: Path, issue: str, subtask_path: Path | None = None) -> Path:
+    repo_root = repo_root.resolve()
+    current_issue_dir = issue_dir(repo_root, issue).resolve()
+    path = resolve_repo_path(repo_root, subtask_path or current_issue_dir / "subtask-001")
+    if path.parent.resolve() != current_issue_dir:
+        raise ValueError(f"subtask path must be directly under {current_issue_dir}")
+    name_match = SUBTASK_NAME_RE.fullmatch(path.name)
+    if not name_match or int(name_match.group(1)) == 0:
+        raise ValueError("subtask directory must be named subtask-001, subtask-002, ...")
+
+    readme = path / "README.md"
+    if not readme.is_file():
+        raise ValueError(f"missing subtask README: {readme}")
+    text = read_text(readme)
+    sections = {}
+    for section in SUBTASK_REQUIRED_SECTIONS:
+        if not has_section(text, section):
+            raise ValueError(f"missing required subtask README section: {section}")
+        sections[section] = section_text(text, section)
+        if not sections[section]:
+            raise ValueError(f"empty required subtask README section: {section}")
+
+    source = first_section_entry(sections["## Source"])
+    if not source:
+        raise ValueError("subtask README Source must reference a file in the same issue directory")
+    if re.search(r"(?i)^[a-z][a-z0-9+.-]*://", source):
+        raise ValueError("subtask Source must be a local issue file, not a URL")
+    source_path = resolve_repo_path(current_issue_dir, Path(source))
+    require_inside(source_path, current_issue_dir, "subtask Source must stay inside the same issue directory")
+    source_relative = source_path.relative_to(current_issue_dir)
+    if source_relative.parts and SUBTASK_NAME_RE.fullmatch(source_relative.parts[0]):
+        raise ValueError("subtask Source must reference an issue-level file, not another subtask file")
+    if not source_path.is_file():
+        raise ValueError(f"subtask Source file does not exist: {source}")
+
+    evidence = sections["## Evidence"]
+    if REMOTE_EVIDENCE_RE.search(evidence):
+        raise ValueError("subtask evidence must stay in the repository; do not use COS/OSS/http(s) links")
+    evidence_entries = section_entries(evidence)
+    if not evidence_entries:
+        raise ValueError("subtask Evidence must reference at least one repository-local file")
+    for link in evidence_entries:
+        link = link.strip()
+        if not link or link.startswith("#"):
+            continue
+        if re.search(r"(?i)^[a-z][a-z0-9+.-]*://", link):
+            raise ValueError("subtask evidence links must be repository-local paths")
+        evidence_path = resolve_repo_path(path, Path(link))
+        require_inside(evidence_path, path, "subtask evidence links must stay inside the subtask directory")
+        evidence_relative = evidence_path.relative_to(path)
+        if not evidence_relative.parts or evidence_relative.parts[0] != "evidence":
+            raise ValueError("subtask evidence links must stay under the subtask evidence directory")
+        if not evidence_path.exists():
+            raise ValueError(f"subtask evidence file does not exist: {link}")
+
+    conclusion = sections["## Conclusion"]
+    match = re.search(r"\b(success|blocked|superseded-by-human)\b\s*[:\uFF1A-]\s*(\S.+)", conclusion, re.IGNORECASE)
+    if not match or match.group(1).lower() not in SUBTASK_CONCLUSIONS:
+        raise ValueError("subtask Conclusion must be success, blocked, or superseded-by-human with a reason")
+    return path
 
 
 def write_pr_state_update_suggestion(repo_root: Path, issue: str, pr_number: str, pr_url: str | None = None) -> Path:

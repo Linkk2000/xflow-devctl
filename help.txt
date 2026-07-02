@@ -75,8 +75,16 @@ Check:
   devctl check issue-draft [--issue draft|N] [--file F]
   devctl check mr-draft --issue N [--file F]
   devctl check current-task [--issue N]
+  devctl check subtask --issue N [--path .xflow/issues/issue-N/subtask-001]
   devctl check local-review --issue draft|N --file F --action issue-create|issue-comment|issue-close|git-mr [--attachments manifest.json]
   devctl check submodule-hygiene
+
+Subtask:
+  Large issues may be split into local subtask directories such as
+  .xflow/issues/issue-1/subtask-001.
+  Each subtask requires README.md and repository-local evidence under the
+  subtask evidence/ directory, for example subtask-001/evidence/screenshot.png.
+  Subtask evidence must stay in the repository; do not store it in COS/OSS.
 
 Approval:
   devctl approval prepare --issue draft|N --action ACTION --file F [--attachments manifest.json] [--command CMD] [--reviewer NAME] [--force]

@@ -15,6 +15,7 @@ from .checks import (
     check_current_task,
     check_issue_draft,
     check_mr_draft,
+    check_subtask,
     check_submodule_hygiene,
     write_pr_state_update_suggestion,
 )
@@ -109,6 +110,9 @@ def build_parser() -> argparse.ArgumentParser:
     check_sub.add_parser("submodule-hygiene")
     current_task = check_sub.add_parser("current-task")
     current_task.add_argument("--issue")
+    subtask = check_sub.add_parser("subtask")
+    subtask.add_argument("--issue", required=True)
+    subtask.add_argument("--path", type=Path)
 
     issue = sub.add_parser("issue")
     issue_sub = issue.add_subparsers(dest="issue_command")
@@ -300,6 +304,8 @@ def run_check(args: argparse.Namespace) -> int:
     elif args.check_command == "submodule-hygiene":
         path = ctx.repo_root
         check_submodule_hygiene(path)
+    elif args.check_command == "subtask":
+        path = check_subtask(ctx.repo_root, args.issue, args.path)
     elif args.check_command == "current-task":
         path = ctx.repo_root / ".xflow" / "current-task.md"
         check_current_task(ctx.repo_root, args.issue)

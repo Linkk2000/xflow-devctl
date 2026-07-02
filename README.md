@@ -26,6 +26,7 @@ devctl attachment publish --issue draft --manifest .xflow/issues/issue-draft/att
 devctl attachment render --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json --input .xflow/issues/issue-draft/issue-draft.md --output .xflow/issues/issue-draft/issue-draft.final.md
 devctl issue create "Title" --body-file .xflow/issues/issue-draft/issue-draft.md --no-local-review
 devctl check current-task --issue 1
+devctl check subtask --issue 1 --path .xflow/issues/issue-1/subtask-001
 devctl check local-review --issue draft --file .xflow/issues/issue-draft/issue-draft.md --action issue-create
 devctl git push --issue 1 --file .xflow/issues/issue-1/walkthrough.md
 devctl git mr --title "Title" --body-file .xflow/issues/issue-1/mr-draft.md --issue 1
@@ -105,6 +106,19 @@ prepare the attachment manifest first and pass `--attachments <manifest>` to
 `approval prepare`, `check local-review`, and the final remote-write command.
 Remote bodies are rejected if they still contain `xflow-attachment://`
 placeholders or local file paths.
+
+Large issues may be split into local subtask directories named
+`.xflow/issues/issue-<id>/subtask-001`, `subtask-002`, and so on. Each subtask
+requires `README.md` with Source, Purpose, Implementation Plan, Evidence, AI
+Review Checkpoints, Human Review Checkpoints, and Conclusion sections. Run
+`devctl check subtask --issue <id> --path .xflow/issues/issue-<id>/subtask-001`
+before using that subtask as workflow evidence. Subtask evidence must stay in
+the repository under the subtask `evidence/` directory, for example
+`subtask-001/evidence/screenshot.png`; do not store subtask evidence in
+COS/OSS/object storage. Object storage remains only for rendered remote
+issue/comment/PR bodies.
+
+Search anchor: Subtask evidence must stay in the repository.
 
 `devctl attachment publish --backend github` is a legacy release-asset backend.
 It rejects image attachments and must not be used as issue/comment image
