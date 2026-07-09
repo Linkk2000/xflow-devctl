@@ -26,7 +26,7 @@ from .paths import default_issue_file
 
 
 ISSUE_CREATE_EPILOG = """AI call recipes:
-  Plain unattended issue:
+  Restricted unattended issue, only after current-turn explicit human authorization for this exact no-attachment issue command:
     devctl issue create "<title>" --body-file issue.md --no-local-review
 
   Reviewed non-image attachment issue:
@@ -42,12 +42,14 @@ Notes:
   Aliyun OSS image attachments must be published first with attachment publish --backend aliyun-oss.
   For non-image files, use a reviewed manifest and an approved URL backend.
   GITHUB_TOKEN is required for issue creation.
-  --no-local-review is only valid when the current user explicitly authorized that exact unattended command.
+  --no-local-review is a restricted exception, not the normal route.
+  It is only valid when the current user explicitly authorized that exact unattended issue command.
+  It must not be used for push, MR/PR creation, merge, issue close, conflict resolution, or destructive actions.
 """
 
 
 ISSUE_COMMENT_EPILOG = """AI call recipes:
-  Plain unattended comment:
+  Restricted unattended comment, only after current-turn explicit human authorization for this exact no-attachment comment command:
     devctl issue comment <number> --body-file comment.md --no-local-review
 
   Reviewed non-image attachment comment:
@@ -63,7 +65,9 @@ Notes:
   Aliyun OSS image attachments must be published first with attachment publish --backend aliyun-oss.
   For non-image files, use a reviewed manifest and an approved URL backend.
   GITHUB_TOKEN is required for issue comments.
-  --no-local-review is only valid when the current user explicitly authorized that exact unattended command.
+  --no-local-review is a restricted exception, not the normal route.
+  It is only valid when the current user explicitly authorized that exact unattended comment command.
+  It must not be used for push, MR/PR creation, merge, issue close, conflict resolution, or destructive actions.
 """
 
 
@@ -589,11 +593,19 @@ def summarize_commit_message(repo_root: Path, override: str | None) -> str:
     paths = changed_paths(repo_root)
     if not paths:
         raise ValueError("no changes to summarize")
+    issue = branch_meta(repo_root, "issue")
+    if not issue:
+        raise ValueError("commit message requires an issue-linked branch or explicit -m message")
     names = [Path(path).name for path in paths[:3]]
     summary = ", ".join(names)
     if len(paths) > 3:
         summary = f"{summary} 等 {len(paths)} 个文件"
-    return f"{guess_commit_type(paths)}({guess_commit_scope(paths)}): 更新 {summary}"
+    return (
+        f"{guess_commit_type(paths)}({guess_commit_scope(paths)}): 更新 {summary}\n\n"
+        f"关联 issue: #{issue}\n\n"
+        "- 更新任务相关文件\n"
+        "- 保持提交消息可跨 GitHub/Gitee 识别"
+    )
 
 
 def push_branch(repo_root: Path, branch: str) -> None:

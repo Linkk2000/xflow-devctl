@@ -24,11 +24,11 @@ devctl attachment add --issue draft --file notes.txt --as file
 devctl attachment check --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json
 devctl attachment publish --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json --backend manual --url att-001=https://public.example/notes.txt
 devctl attachment render --issue draft --manifest .xflow/publish/issues/issue-draft/attachments/manifest.json --input .xflow/issues/issue-draft/issue-draft.md --output .xflow/publish/issues/issue-draft/issue-draft.final.md
-devctl issue create "Title" --body-file .xflow/issues/issue-draft/issue-draft.md --no-local-review
+devctl check local-review --issue draft --file .xflow/issues/issue-draft/issue-draft.md --action issue-create
+devctl issue create "Title" --body-file .xflow/issues/issue-draft/issue-draft.md
 devctl check current-task --issue 1
 devctl check issue-evidence --issue 1
 devctl check subtask --issue 1 --path .xflow/issues/issue-1/subtask-001
-devctl check local-review --issue draft --file .xflow/issues/issue-draft/issue-draft.md --action issue-create
 devctl git push --issue 1 --file .xflow/issues/issue-1/walkthrough.md
 devctl git mr --title "Title" --body-file .xflow/issues/issue-1/mr-draft.md --issue 1
 devctl check submodule-hygiene
@@ -40,13 +40,19 @@ devctl migrate inspect
 
 Use these recipes instead of probing random flag combinations.
 
-Plain unattended issue:
+Human Approval Is Non-Delegable. AI may prepare approval files, evidence,
+command drafts, and review notes, but AI must never satisfy a human gate
+itself. AI must never edit `Approved: no` to `Approved: yes`.
+
+Restricted unattended issue, only after current-turn explicit human
+authorization for this exact no-attachment issue command:
 
 ```text
 devctl issue create "Title" --body-file issue.md --no-local-review
 ```
 
-Plain unattended comment:
+Restricted unattended comment, only after current-turn explicit human
+authorization for this exact no-attachment comment command:
 
 ```text
 devctl issue comment 123 --body-file comment.md --no-local-review
@@ -102,6 +108,9 @@ If there are no attachments, omit all attachment flags.
 
 `devctl approval prepare` pre-fills the reviewer from `git config user.name`
 and `git config user.email` when available. Pass `--reviewer` to override it.
+Prepared by AI or tooling does not mean approved. Only the human reviewer may
+change `Approved: no` to `Approved: yes`; if AI made that edit, the approval is
+invalid.
 When an issue, comment, or PR/MR body references approved non-image files,
 prepare the attachment manifest first and pass `--attachments <manifest>` to
 `approval prepare`, `check local-review`, and the final remote-write command.
@@ -131,7 +140,10 @@ Search anchor: Subtask evidence must stay in the repository.
 `devctl attachment publish --backend github` is a legacy release-asset backend.
 It rejects image attachments and must not be used as issue/comment image
 storage. Use `--no-local-review` only when the user explicitly authorized an
-unattended remote write for that exact command.
+unattended issue/comment remote write for that exact command.
+`--no-local-review` is a restricted exception, not the normal route. It must
+not be used for push, MR/PR creation, merge, issue close, branch deletion,
+conflict resolution, or any destructive action.
 
 Push and MR/PR creation are separate Git gates. `devctl git push --issue <id>`
 only publishes the current task branch after `Approved Action: git-push`.
@@ -141,6 +153,22 @@ devctl records the returned PR number and URL in XFlow state files, creates a
 metadata-only state backfill commit, and pushes that commit to the same branch.
 That post-MR push is covered by the `git-mr` approval and must not include
 business code changes.
+
+Commit messages must be portable, scoped, Chinese-dominant, multi-line, and
+issue-linked:
+
+```text
+type(scope): 中文摘要
+
+关联 issue: #<id>
+
+- 中文说明关键变化
+- 中文说明验证或证据
+```
+
+Portable means plain Git text that travels across GitHub/Gitee. Do not add
+AI-client trailers, local absolute paths, machine-specific usernames, or
+provider-only metadata.
 
 PowerShell users should prefer the repository-local `devctl.ps1`, which invokes
 the Python core and sets `PYTHONDONTWRITEBYTECODE=1` to avoid `__pycache__`

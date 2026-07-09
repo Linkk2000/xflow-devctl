@@ -167,11 +167,14 @@ def test_python_core_git_and_app_commands(parent: Path) -> None:
     assert "issue:   #9" in status
 
     write(work / "feature.txt", "python core git command\n")
-    message = "Add Python core git commands"
-    msg = run_devctl(work, "git", "commit-msg", "-a", "-m", message).stdout
-    assert message in msg
-    run_devctl(work, "git", "commit-msg", "-a", "-c", "-m", message)
-    assert message in git_text(work, "log", "-1", "--pretty=%B")
+    msg = run_devctl(work, "git", "commit-msg", "-a").stdout
+    assert "chore(feature.txt): 更新 feature.txt" in msg
+    assert "关联 issue: #9" in msg
+    assert "- 更新任务相关文件" in msg
+    run_devctl(work, "git", "commit-msg", "-a", "-c")
+    committed_message = git_text(work, "log", "-1", "--pretty=%B")
+    assert "chore(feature.txt): 更新 feature.txt" in committed_message
+    assert "关联 issue: #9" in committed_message
 
     run_devctl(work, "git", "done", "--force", "--base", "main")
     assert git_text(work, "branch", "--show-current") == "main"
@@ -324,7 +327,9 @@ Closes #8
 def test_ai_call_guidance_is_visible(repo: Path) -> None:
     issue_help = run_devctl(repo, "issue", "create", "--help").stdout
     assert "AI call recipes" in issue_help
-    assert "Plain unattended issue" in issue_help
+    assert "Restricted unattended issue" in issue_help
+    assert "current-turn explicit human authorization" in issue_help
+    assert "--no-local-review is a restricted exception" in issue_help
     assert "Issue/comment image attachments are disabled" in issue_help
     assert "Do not use GitHub release assets as an issue image store" in issue_help
     assert "aliyun-oss" in issue_help
@@ -343,12 +348,17 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
 
     help_text = (OPS_ROOT / "help.txt").read_text(encoding="utf-8")
     assert "AI call recipes" in help_text
-    assert "Plain unattended issue" in help_text
+    assert "Human Approval Is Non-Delegable" in help_text
+    assert "Restricted unattended issue" in help_text
+    assert "AI must never satisfy a human gate itself" in help_text
+    assert "Only the human reviewer may change Approved: no to Approved: yes" in help_text
     assert "Issue/comment image attachments are disabled" in help_text
     assert "Do not use GitHub release assets as an issue image store" in help_text
     assert "devctl attachment publish --issue draft --backend aliyun-oss" in help_text
     assert "%USERPROFILE%\\.xflow\\env.local" in help_text
     assert "devctl git push --issue" in help_text
+    assert "type(scope): 中文摘要" in help_text
+    assert "关联 issue: #N" in help_text
     assert "state backfill commit" in help_text
     assert "Do not run bare bash/Git-Bash/WSL for normal XFlow validation on Windows" in help_text
     assert "devctl check subtask --issue" in help_text
@@ -359,7 +369,10 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
 
     readme_text = (OPS_ROOT / "README.md").read_text(encoding="utf-8")
     assert "AI Call Recipes" in readme_text
-    assert "Plain unattended issue" in readme_text
+    assert "Human Approval Is Non-Delegable" in readme_text
+    assert "Restricted unattended issue" in readme_text
+    assert "AI must never satisfy a human gate" in readme_text
+    assert "Only the human reviewer may" in readme_text
     assert "Issue/comment image attachments are disabled" in readme_text
     assert "GitHub release assets" in readme_text
     assert "issue image store" in readme_text
@@ -367,6 +380,8 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "ALIYUN_OSS_ACCESS_KEY_SECRET" in readme_text
     assert "must not be written to attachment manifests" in readme_text
     assert "devctl git push --issue" in readme_text
+    assert "type(scope): 中文摘要" in readme_text
+    assert "关联 issue: #<id>" in readme_text
     assert "state backfill commit" in readme_text
     assert "Normal Git, Issue, Attachment, Approval, Rules, Migration, and App commands route" in readme_text
     assert "repository-local `devctl.ps1`" in readme_text
@@ -811,6 +826,10 @@ success: implemented and verified locally.
         digest = hashlib.sha256(issue_file.read_bytes()).hexdigest()
         assert "Reviewer: Test User (test@example.com)" in text
         assert f"Approved SHA256: {digest}" in text
+        assert "## Human Gate" in text
+        assert "Prepared by AI or tooling does not mean approved." in text
+        assert "Only the human reviewer may change Approved: no to Approved: yes." in text
+        assert "If this file was approved by the AI, the approval is invalid." in text
         run_devctl(repo, "check", "local-review", "--issue", "draft", "--file", str(issue_file), expect=1)
         approval.write_text(text.replace("Approved: no", "Approved: yes").replace(digest, digest.upper()), encoding="utf-8")
         run_devctl(repo, "check", "local-review", "--issue", "draft", "--file", str(issue_file))
@@ -1024,7 +1043,7 @@ Create a plain issue without manual approval when explicitly requested.
                 plain_env,
                 "issue",
                 "create",
-                "Plain unattended issue",
+                "Restricted unattended issue",
                 "--body-file",
                 str(auto_issue_body),
                 "--no-local-review",

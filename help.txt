@@ -8,10 +8,15 @@ Issue (GitHub/Gitee):
   devctl issue close <number>
 
 AI call recipes:
-  Plain unattended issue:
+  Human Approval Is Non-Delegable. AI may prepare approval files, evidence,
+  command drafts, and review notes, but AI must never satisfy a human gate itself.
+
+  Restricted unattended issue, only after current-turn explicit human
+  authorization for this exact no-attachment issue command:
     devctl issue create "<title>" --body-file issue.md --no-local-review
 
-  Plain unattended comment:
+  Restricted unattended comment, only after current-turn explicit human
+  authorization for this exact no-attachment comment command:
     devctl issue comment <number> --body-file comment.md --no-local-review
 
   Reviewed non-image attachment issue:
@@ -36,7 +41,9 @@ AI recipe notes:
   Images may be published only after devctl attachment publish --backend aliyun-oss records reviewed URLs.
   For non-image files, use a reviewed manifest and an approved URL backend.
   GITHUB_TOKEN is required for issue/comment remote writes.
-  --no-local-review is valid only when the current user explicitly authorized that exact unattended command.
+  --no-local-review is a restricted exception, not the normal route.
+  It is valid only when the current user explicitly authorized that exact unattended issue/comment command.
+  It must not be used for push, MR/PR creation, merge, issue close, conflict resolution, or destructive actions.
 
 Attachment:
   devctl attachment add --issue draft|N --file PATH [--as auto|image|file] [--id ID] [--manifest manifest.json]
@@ -57,13 +64,20 @@ Git:
   devctl git pr-merge <number> [--method merge|squash|rebase] [--issue N] [--file F] [--commit-title T] [--commit-message M]
   devctl git status
   devctl git done [--base BRANCH] [--force]
+  Commit messages must be portable, scoped, Chinese-dominant, multi-line, and issue-linked.
+  Use first line: type(scope): 中文摘要
+  Include body line: 关联 issue: #N
+  Do not add AI-client trailers, local absolute paths, or provider-only metadata.
 
 Core remote-write rule:
   Remote writes require local human review of the exact body/evidence file.
+  Human Approval Is Non-Delegable: AI must never satisfy a human gate itself
+  and must never edit Approved: no to Approved: yes.
   Use --body-file for issue create/comment and git mr.
   Active approval file: .xflow/issues/issue-<id>/approvals/local-review.md
-  Use --no-local-review only when the current user explicitly authorizes an
-  unattended issue/comment command. Issue/comment image attachments are disabled.
+  Use --no-local-review only as a restricted exception when the current user
+  explicitly authorizes an unattended issue/comment command. Issue/comment image
+  attachments are disabled.
   Push and MR are separate gates: devctl git push --issue N only publishes the
   current branch, while devctl git mr only creates the PR/MR after the branch
   already has an upstream and no unpushed commits.
@@ -96,6 +110,8 @@ Subtask:
 Approval:
   devctl approval prepare --issue draft|N --action ACTION --file F [--attachments manifest.json] [--command CMD] [--reviewer NAME] [--force]
   reviewer defaults to git config user.name/user.email when available
+  Prepared by AI or tooling does not mean approved.
+  Only the human reviewer may change Approved: no to Approved: yes.
 
 AI rules:
   devctl rules list
