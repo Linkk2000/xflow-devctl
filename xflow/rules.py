@@ -5,6 +5,8 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from .io import read_text
+
 
 @dataclass(frozen=True)
 class RuleEntry:
@@ -23,7 +25,7 @@ def load_entries(repo_root: Path) -> list[RuleEntry]:
     manifest = root / "ai-rules.json"
     if not manifest.is_file():
         raise ValueError(f"AI rule manifest not found: {manifest}")
-    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data = json.loads(read_text(manifest))
     raw_entries = data.get("rules")
     if not isinstance(raw_entries, list):
         raise ValueError("AI rule manifest must contain a rules list")

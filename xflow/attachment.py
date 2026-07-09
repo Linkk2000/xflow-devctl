@@ -11,17 +11,13 @@ from urllib.parse import urlparse
 
 from . import object_storage, providers
 from .io import read_text
+from .paths import normalized_issue
 
 
 PLACEHOLDER_RE = re.compile(r"xflow-attachment://([A-Za-z0-9._-]+)")
 DRIVE_PATH_RE = re.compile(r"(?i)(^|[\s\(\[\"'])[A-Z]:[\\/]")
 POSIX_LOCAL_RE = re.compile(r"(^|[\s\(\[\"'])(/tmp/|/mnt/|/home/)")
 ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-
-
-def normalized_issue(issue: str) -> str:
-    issue = issue.strip()
-    return issue[1:] if issue.startswith("#") else issue
 
 
 def issue_dir(repo_root: Path, issue: str) -> Path:

@@ -28,6 +28,8 @@ from xflow.providers import (
     list_issues,
     show_issue,
 )
+from xflow.paths import default_approval_file, default_issue_file, issue_dir
+from xflow.cli import branch_name_from_slug
 
 
 def run_devctl(repo_root: Path, *args: str, expect: int = 0) -> subprocess.CompletedProcess[str]:
@@ -130,6 +132,21 @@ def test_python_core_rejects_inline_remote_bodies(repo: Path) -> None:
     run_devctl(repo, "issue", "create", "Inline body", "--body", r"line1\nline2", "--no-local-review", expect=1)
     run_devctl(repo, "issue", "create", "Inline body", "--body", "uses `code`", "--no-local-review", expect=1)
     run_devctl(repo, "issue", "create", "Inline body", "--body", "uses $(cmd)", "--no-local-review", expect=1)
+
+
+def test_issue_identifiers_are_portable(repo: Path) -> None:
+    assert issue_dir(repo, "#IJZT85") == repo / ".xflow" / "issues" / "issue-IJZT85"
+    assert default_issue_file(repo, "IJZT85", "mr-draft.md") == repo / ".xflow" / "issues" / "issue-IJZT85" / "mr-draft.md"
+    assert default_approval_file(repo, "#IJZT85") == repo / ".xflow" / "issues" / "issue-IJZT85" / "approvals" / "local-review.md"
+    assert branch_name_from_slug("gitee-work", "#IJZT85") == "feat/IJZT85-gitee-work"
+
+    for unsafe in ("", "#", "../1", "issue/1", "A\\B", ".", "..", "bad:id"):
+        try:
+            issue_dir(repo, unsafe)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"unsafe issue identifier should be rejected: {unsafe!r}")
 
 
 def test_python_core_git_and_app_commands(parent: Path) -> None:
@@ -358,11 +375,15 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "%USERPROFILE%\\.xflow\\env.local" in help_text
     assert "devctl git push --issue" in help_text
     assert "type(scope): 中文摘要" in help_text
-    assert "关联 issue: #N" in help_text
+    assert "关联 issue: #<id>" in help_text
     assert "state backfill commit" in help_text
     assert "Do not run bare bash/Git-Bash/WSL for normal XFlow validation on Windows" in help_text
     assert "devctl check subtask --issue" in help_text
     assert "devctl check issue-evidence --issue" in help_text
+    assert "devctl check gap-analysis --issue" in help_text
+    assert "devctl check resolution-report --issue" in help_text
+    assert "Problem/Gap Closure Loop" in help_text
+    assert "resolved|reduced|blocked" in help_text
     assert ".xflow/publish/issues" in help_text
     assert "subtask-001" in help_text
     assert "subtask evidence/ directory" in help_text
@@ -388,6 +409,10 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "do not run bare `bash`, Git Bash, or WSL for normal XFlow validation" in readme_text
     assert "devctl check subtask --issue" in readme_text
     assert "devctl check issue-evidence --issue" in readme_text
+    assert "devctl check gap-analysis --issue" in readme_text
+    assert "devctl check resolution-report --issue" in readme_text
+    assert "Problem/Gap Closure Loop" in readme_text
+    assert "resolved|reduced|blocked" in readme_text
     assert ".xflow/publish/issues" in readme_text
     assert "Subtask evidence must stay in the repository" in readme_text
     assert "subtask `evidence/` directory" in readme_text
@@ -434,10 +459,10 @@ class RecordingApiHandler(BaseHTTPRequestHandler):
                 )
             else:
                 self.send_status(404)
-        elif parsed.path.endswith("/issues/12"):
-            self.send_json('{"number":"12","state":"open","title":"Gitee Issue","body":"body","html_url":"https://gitee.test/issue/12"}')
+        elif parsed.path.endswith("/issues/IJZT85"):
+            self.send_json('{"number":"IJZT85","state":"open","title":"Gitee Issue","body":"body","html_url":"https://gitee.test/issue/IJZT85"}')
         elif parsed.path.endswith("/issues"):
-            self.send_json('[{"number":"12","state":"open","title":"Gitee Issue","body":"body","html_url":"https://gitee.test/issue/12"}]')
+            self.send_json('[{"number":"IJZT85","state":"open","title":"Gitee Issue","body":"body","html_url":"https://gitee.test/issue/IJZT85"}]')
         elif parsed.path.endswith("/pulls/7"):
             self.send_json('{"number":"7","state":"open","title":"Gitee PR","html_url":"https://gitee.test/pulls/7"}')
         else:
@@ -475,8 +500,8 @@ class RecordingApiHandler(BaseHTTPRequestHandler):
         elif parsed.path.endswith("/Linkk2000/issues"):
             form = self.read_form()
             self.requests.append({"method": "POST", "path": parsed.path, "form": form})
-            self.send_json('{"number":"12","html_url":"https://gitee.test/issue/12"}')
-        elif parsed.path.endswith("/issues/12/comments"):
+            self.send_json('{"number":"IJZT85","html_url":"https://gitee.test/issue/IJZT85"}')
+        elif parsed.path.endswith("/issues/IJZT85/comments"):
             form = self.read_form()
             self.requests.append({"method": "POST", "path": parsed.path, "form": form})
             self.send_json('{"id":"99","body":"comment"}')
@@ -511,8 +536,8 @@ class RecordingApiHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         form = self.read_form()
         self.requests.append({"method": "PATCH", "path": parsed.path, "form": form})
-        if parsed.path.endswith("/Linkk2000/issues/12"):
-            self.send_json('{"number":"12","state":"closed","title":"Gitee Issue"}')
+        if parsed.path.endswith("/Linkk2000/issues/IJZT85"):
+            self.send_json('{"number":"IJZT85","state":"closed","title":"Gitee Issue"}')
         else:
             self.send_response(404)
             self.end_headers()
@@ -588,6 +613,7 @@ def main() -> None:
         git(repo, "remote", "add", "origin", "git@gitee.com:Linkk2000/paper-demo.git")
         test_env_loading_policy(repo)
         test_python_core_rejects_inline_remote_bodies(repo)
+        test_issue_identifiers_are_portable(repo)
         test_python_core_git_and_app_commands(repo / "core-routing")
         test_git_push_and_mr_are_separate_with_state_backfill(repo / "push-mr-state")
         test_ai_call_guidance_is_visible(repo)
@@ -652,14 +678,14 @@ Closes #1
         with RecordingApiServer() as server:
             gitee_env = {"GITEE_API_BASE": server.base_url, "GITEE_TOKEN": "gitee-token"}
             created = create_issue(repo, "Gitee title", "Gitee body", "bug,docs", gitee_env)
-            assert created.number == "12"
+            assert created.number == "IJZT85"
             rows = list_issues(repo, "open", 20, gitee_env)
-            assert rows[0]["number"] == "12"
-            shown = show_issue(repo, "12", gitee_env)
+            assert rows[0]["number"] == "IJZT85"
+            shown = show_issue(repo, "IJZT85", gitee_env)
             assert shown["title"] == "Gitee Issue"
-            comment = comment_issue(repo, "12", "Gitee comment", gitee_env)
+            comment = comment_issue(repo, "IJZT85", "Gitee comment", gitee_env)
             assert comment["id"] == "99"
-            closed = close_issue(repo, "12", gitee_env)
+            closed = close_issue(repo, "IJZT85", gitee_env)
             assert closed["state"] == "closed"
             pr = create_pull_request(repo, "Gitee PR", "PR body", "feature/demo", "main", gitee_env)
             assert pr.number == "7"
@@ -670,9 +696,9 @@ Closes #1
             assert server.requests[0]["path"] == "/repos/Linkk2000/issues"
             assert server.requests[0]["form"]["repo"] == "paper-demo"
             assert server.requests[0]["form"]["access_token"] == "gitee-token"
-            assert server.requests[3]["path"] == "/repos/Linkk2000/paper-demo/issues/12/comments"
+            assert server.requests[3]["path"] == "/repos/Linkk2000/paper-demo/issues/IJZT85/comments"
             assert server.requests[4]["method"] == "PATCH"
-            assert server.requests[4]["path"] == "/repos/Linkk2000/issues/12"
+            assert server.requests[4]["path"] == "/repos/Linkk2000/issues/IJZT85"
             assert server.requests[4]["form"]["repo"] == "paper-demo"
             assert server.requests[4]["form"]["state"] == "closed"
             assert server.requests[5]["path"] == "/repos/Linkk2000/paper-demo/pulls"
@@ -743,6 +769,12 @@ success: implemented and verified locally.
         )
         run_devctl(repo, "check", "subtask", "--issue", "1")
 
+        bom_subtask = repo / ".xflow" / "issues" / "issue-1" / "subtask-012"
+        write(bom_subtask / "evidence" / "screenshot.png", "local image evidence")
+        bom_readme = "## Source" + (subtask / "README.md").read_text(encoding="utf-8").split("## Source", 1)[1]
+        (bom_subtask / "README.md").write_bytes(b"\xef\xbb\xbf" + bom_readme.encode("utf-8"))
+        run_devctl(repo, "check", "subtask", "--issue", "1", "--path", str(bom_subtask))
+
         zero_number = repo / ".xflow" / "issues" / "issue-1" / "subtask-000"
         write(zero_number / "README.md", (subtask / "README.md").read_text(encoding="utf-8"))
         run_devctl(repo, "check", "subtask", "--issue", "1", "--path", str(zero_number), expect=1)
@@ -791,6 +823,104 @@ success: implemented and verified locally.
         write(root_evidence / "notes.txt", "root evidence is not allowed")
         write(root_evidence / "README.md", (subtask / "README.md").read_text(encoding="utf-8").replace("evidence/screenshot.png", "notes.txt"))
         run_devctl(repo, "check", "subtask", "--issue", "1", "--path", str(root_evidence), expect=1)
+
+        gap = repo / ".xflow" / "issues" / "issue-1" / "gap-analysis.md"
+        write(gap.parent / "evidence" / "gap-note.txt", "gap evidence")
+        write(
+            gap,
+            """# Problem/Gap Analysis
+
+## User Original Statement
+The user described a workflow gap.
+
+## Clarified Problem Or Gap
+AI may implement before the gap is recognized.
+
+## Gap Analysis
+- Missing analysis gate.
+
+## Evidence
+- [gap note](evidence/gap-note.txt)
+
+## Scope Boundaries
+- Includes: local XFlow checks.
+- Excludes: remote publishing.
+
+## Proposed Modification Plan
+- [ ] Add check commands.
+
+## Acceptance Criteria
+- [ ] Gap analysis must pass a mechanical check.
+
+## Human Recognition
+Recognized: yes
+Reviewer: Test User
+""",
+        )
+        run_devctl(repo, "check", "gap-analysis", "--issue", "1")
+
+        unrecognized_gap = gap.with_name("gap-analysis-unrecognized.md")
+        write(unrecognized_gap, gap.read_text(encoding="utf-8").replace("Recognized: yes", "Recognized: no"))
+        run_devctl(repo, "check", "gap-analysis", "--issue", "1", "--file", str(unrecognized_gap), expect=1)
+
+        missing_gap_section = gap.with_name("gap-analysis-missing-section.md")
+        write(missing_gap_section, gap.read_text(encoding="utf-8").replace("## Acceptance Criteria\n- [ ] Gap analysis must pass a mechanical check.\n\n", ""))
+        run_devctl(repo, "check", "gap-analysis", "--issue", "1", "--file", str(missing_gap_section), expect=1)
+
+        remote_gap_evidence = gap.with_name("gap-analysis-remote-evidence.md")
+        write(remote_gap_evidence, gap.read_text(encoding="utf-8").replace("evidence/gap-note.txt", "https://example.test/gap-note.txt"))
+        run_devctl(repo, "check", "gap-analysis", "--issue", "1", "--file", str(remote_gap_evidence), expect=1)
+
+        resolution = repo / ".xflow" / "issues" / "issue-1" / "resolution-report.md"
+        write(resolution.parent / "evidence" / "resolution-note.txt", "resolution evidence")
+        write(
+            resolution,
+            """# Resolution Report
+
+## Source Problem Or Gap
+- gap-analysis.md
+
+## Actual Changes
+- Added gap closure checks.
+
+## Evidence Index
+- [resolution note](evidence/resolution-note.txt)
+
+## Closure Conclusion
+resolved: the gap check now exists.
+
+## AI Self-Review Result
+- [x] Gap analysis is checked.
+- [x] Resolution report is checked.
+
+## Remaining Risks
+- none
+
+## Human Review Request
+- Please review the evidence and conclusion.
+""",
+        )
+        run_devctl(repo, "check", "resolution-report", "--issue", "1")
+
+        reduced_resolution = resolution.with_name("resolution-report-reduced.md")
+        write(reduced_resolution, resolution.read_text(encoding="utf-8").replace("resolved: the gap check now exists.", "reduced: the main gap is smaller but follow-up remains."))
+        run_devctl(repo, "check", "resolution-report", "--issue", "1", "--file", str(reduced_resolution))
+
+        blocked_resolution = resolution.with_name("resolution-report-blocked.md")
+        write(blocked_resolution, resolution.read_text(encoding="utf-8").replace("resolved: the gap check now exists.", "blocked: human must choose the rollout path.").replace("- [x] Resolution report is checked.", "- [ ] Waiting for human rollout choice."))
+        run_devctl(repo, "check", "resolution-report", "--issue", "1", "--file", str(blocked_resolution))
+
+        unchecked_resolution = resolution.with_name("resolution-report-unchecked.md")
+        write(unchecked_resolution, resolution.read_text(encoding="utf-8").replace("- [x] Resolution report is checked.", "- [ ] Resolution report is checked."))
+        run_devctl(repo, "check", "resolution-report", "--issue", "1", "--file", str(unchecked_resolution), expect=1)
+
+        bad_conclusion = resolution.with_name("resolution-report-bad-conclusion.md")
+        write(bad_conclusion, resolution.read_text(encoding="utf-8").replace("resolved: the gap check now exists.", "done: looks good."))
+        run_devctl(repo, "check", "resolution-report", "--issue", "1", "--file", str(bad_conclusion), expect=1)
+
+        remote_resolution_evidence = resolution.with_name("resolution-report-remote-evidence.md")
+        write(remote_resolution_evidence, resolution.read_text(encoding="utf-8").replace("evidence/resolution-note.txt", "oss://bucket/resolution-note.txt"))
+        run_devctl(repo, "check", "resolution-report", "--issue", "1", "--file", str(remote_resolution_evidence), expect=1)
 
         simple_issue = repo / ".xflow" / "issues" / "issue-2"
         write(simple_issue / "evidence" / "note.txt", "local issue evidence")
@@ -1156,9 +1286,10 @@ Fail before remote writes when an issue body includes an image attachment.
             assert not upload_requests
 
         templates = repo / ".xflow" / "ops" / "workflow" / "templates"
-        write(
-            templates / "ai-rules.json",
-            """{
+        templates.mkdir(parents=True, exist_ok=True)
+        (templates / "ai-rules.json").write_bytes(
+            b"\xef\xbb\xbf"
+            + """{
   "rules": [
     {
       "id": "codex",
@@ -1168,7 +1299,7 @@ Fail before remote writes when an issue body includes an image attachment.
     }
   ]
 }
-""",
+""".encode("utf-8"),
         )
         write(templates / "codex-agents.md", "# Project Rules\n\n- Human review is required before remote writes.\n")
         run_devctl(repo, "rules", "list")

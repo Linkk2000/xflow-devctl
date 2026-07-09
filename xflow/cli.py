@@ -13,16 +13,18 @@ from pathlib import Path
 from . import approval, attachment, providers, rules
 from .checks import (
     check_current_task,
+    check_gap_analysis,
     check_issue_evidence,
     check_issue_draft,
     check_mr_draft,
+    check_resolution_report,
     check_subtask,
     check_submodule_hygiene,
     write_pr_state_update_suggestion,
 )
 from .env import RuntimeContext, load_env_files, python_version, token_status_lines
 from .migration import inspect, write_wrappers
-from .paths import default_issue_file
+from .paths import default_issue_file, normalized_issue
 
 
 ISSUE_CREATE_EPILOG = """AI call recipes:
@@ -41,7 +43,7 @@ Notes:
   --attach-file with an image MIME type or Markdown image attachment fails before remote writes.
   Aliyun OSS image attachments must be published first with attachment publish --backend aliyun-oss.
   For non-image files, use a reviewed manifest and an approved URL backend.
-  GITHUB_TOKEN is required for issue creation.
+  GITHUB_TOKEN or GITEE_TOKEN is required for issue creation, depending on platform.
   --no-local-review is a restricted exception, not the normal route.
   It is only valid when the current user explicitly authorized that exact unattended issue command.
   It must not be used for push, MR/PR creation, merge, issue close, conflict resolution, or destructive actions.
@@ -50,21 +52,21 @@ Notes:
 
 ISSUE_COMMENT_EPILOG = """AI call recipes:
   Restricted unattended comment, only after current-turn explicit human authorization for this exact no-attachment comment command:
-    devctl issue comment <number> --body-file comment.md --no-local-review
+    devctl issue comment <id> --body-file comment.md --no-local-review
 
   Reviewed non-image attachment comment:
-    devctl attachment add --issue <number> --file notes.txt --as file
-    devctl attachment publish --issue <number> --backend manual --url att-001=https://public.example/notes.txt --body-file comment.md --output .xflow/publish/issues/issue-<number>/comment.final.md
-    devctl approval prepare --issue <number> --action issue-comment --file .xflow/publish/issues/issue-<number>/comment.final.md --attachments .xflow/publish/issues/issue-<number>/attachments/manifest.json
-    devctl check local-review --issue <number> --file .xflow/publish/issues/issue-<number>/comment.final.md --action issue-comment --attachments .xflow/publish/issues/issue-<number>/attachments/manifest.json
-    devctl issue comment <number> --body-file .xflow/publish/issues/issue-<number>/comment.final.md --attachments .xflow/publish/issues/issue-<number>/attachments/manifest.json
+    devctl attachment add --issue <id> --file notes.txt --as file
+    devctl attachment publish --issue <id> --backend manual --url att-001=https://public.example/notes.txt --body-file comment.md --output .xflow/publish/issues/issue-<id>/comment.final.md
+    devctl approval prepare --issue <id> --action issue-comment --file .xflow/publish/issues/issue-<id>/comment.final.md --attachments .xflow/publish/issues/issue-<id>/attachments/manifest.json
+    devctl check local-review --issue <id> --file .xflow/publish/issues/issue-<id>/comment.final.md --action issue-comment --attachments .xflow/publish/issues/issue-<id>/attachments/manifest.json
+    devctl issue comment <id> --body-file .xflow/publish/issues/issue-<id>/comment.final.md --attachments .xflow/publish/issues/issue-<id>/attachments/manifest.json
 
 Notes:
   Issue/comment image attachments are disabled. Do not use GitHub release assets as an issue image store.
   --attach-file with an image MIME type or Markdown image attachment fails before remote writes.
   Aliyun OSS image attachments must be published first with attachment publish --backend aliyun-oss.
   For non-image files, use a reviewed manifest and an approved URL backend.
-  GITHUB_TOKEN is required for issue comments.
+  GITHUB_TOKEN or GITEE_TOKEN is required for issue comments, depending on platform.
   --no-local-review is a restricted exception, not the normal route.
   It is only valid when the current user explicitly authorized that exact unattended comment command.
   It must not be used for push, MR/PR creation, merge, issue close, conflict resolution, or destructive actions.
@@ -122,6 +124,12 @@ def build_parser() -> argparse.ArgumentParser:
     subtask = check_sub.add_parser("subtask")
     subtask.add_argument("--issue", required=True)
     subtask.add_argument("--path", type=Path)
+    gap_analysis = check_sub.add_parser("gap-analysis")
+    gap_analysis.add_argument("--issue", required=True)
+    gap_analysis.add_argument("--file", type=Path)
+    resolution_report = check_sub.add_parser("resolution-report")
+    resolution_report.add_argument("--issue", required=True)
+    resolution_report.add_argument("--file", type=Path)
 
     issue = sub.add_parser("issue")
     issue_sub = issue.add_subparsers(dest="issue_command")
@@ -315,6 +323,10 @@ def run_check(args: argparse.Namespace) -> int:
         check_submodule_hygiene(path)
     elif args.check_command == "subtask":
         path = check_subtask(ctx.repo_root, args.issue, args.path)
+    elif args.check_command == "gap-analysis":
+        path = check_gap_analysis(ctx.repo_root, args.issue, args.file)
+    elif args.check_command == "resolution-report":
+        path = check_resolution_report(ctx.repo_root, args.issue, args.file)
     elif args.check_command == "issue-evidence":
         path = check_issue_evidence(ctx.repo_root, args.issue, args.publish_root)
     elif args.check_command == "current-task":
@@ -407,8 +419,9 @@ def run_issue(args: argparse.Namespace) -> int:
             print(f"#{row.get('number', '')}\t[{row.get('state', '')}]\t{row.get('title', '')}")
         return 0
     if args.issue_command == "show":
-        item = providers.show_issue(ctx.repo_root, args.number, os.environ)
-        print(f"#{item.get('number', args.number)} [{item.get('state', '')}] {item.get('title', '')}")
+        issue_id = normalized_issue(args.number)
+        item = providers.show_issue(ctx.repo_root, issue_id, os.environ)
+        print(f"#{item.get('number', issue_id)} [{item.get('state', '')}] {item.get('title', '')}")
         if item.get("body"):
             print()
             print(item["body"])
@@ -417,26 +430,28 @@ def run_issue(args: argparse.Namespace) -> int:
             print(item["html_url"])
         return 0
     if args.issue_command == "comment":
+        issue_id = normalized_issue(args.number)
         _body, file_path = body_from_file(args.body_file, args.body, "remote issue comments require --body-file for local review")
-        body, file_path, manifest_path = prepare_attachment_body(ctx.repo_root, args.number, file_path, args)
+        body, file_path, manifest_path = prepare_attachment_body(ctx.repo_root, issue_id, file_path, args)
         if not args.no_local_review:
-            approval.require_remote(ctx.repo_root, "issue-comment", file_path, args.number, manifest_path)
+            approval.require_remote(ctx.repo_root, "issue-comment", file_path, issue_id, manifest_path)
         if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
             print("[INFO] issue-comment gate passed; provider skipped")
             return 0
-        result = providers.comment_issue(ctx.repo_root, args.number, body, os.environ)
-        print(f"[INFO] Comment posted on Issue #{args.number}")
+        result = providers.comment_issue(ctx.repo_root, issue_id, body, os.environ)
+        print(f"[INFO] Comment posted on Issue #{issue_id}")
         if result.get("html_url"):
             print(f"[INFO] {result['html_url']}")
         return 0
     if args.issue_command == "close":
-        file_path = Path(os.environ.get("DEVCTL_APPROVED_FILE", default_issue_file(ctx.repo_root, args.number, "walkthrough.md")))
-        approval.require_remote(ctx.repo_root, "issue-close", file_path, args.number)
+        issue_id = normalized_issue(args.number)
+        file_path = Path(os.environ.get("DEVCTL_APPROVED_FILE", default_issue_file(ctx.repo_root, issue_id, "walkthrough.md")))
+        approval.require_remote(ctx.repo_root, "issue-close", file_path, issue_id)
         if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
             print("[INFO] issue-close gate passed; provider skipped")
             return 0
-        result = providers.close_issue(ctx.repo_root, args.number, os.environ)
-        print(f"[INFO] Issue #{result.get('number', args.number)} closed")
+        result = providers.close_issue(ctx.repo_root, issue_id, os.environ)
+        print(f"[INFO] Issue #{result.get('number', issue_id)} closed")
         return 0
     if args.issue_command != "create":
         raise ValueError(f"unknown issue subcommand: {args.issue_command}")
@@ -491,11 +506,14 @@ def current_branch(repo_root: Path) -> str:
 
 
 def set_branch_meta(repo_root: Path, key: str, value: str) -> None:
+    if key == "issue":
+        value = normalized_issue(value)
     git_run(repo_root, ["config", "--local", f"devctl.{key}", value])
 
 
 def branch_meta(repo_root: Path, key: str) -> str:
-    return git_output(repo_root, ["config", "--local", "--get", f"devctl.{key}"])
+    value = git_output(repo_root, ["config", "--local", "--get", f"devctl.{key}"])
+    return normalized_issue(value) if key == "issue" and value else value
 
 
 def unset_branch_meta(repo_root: Path, key: str) -> None:
@@ -546,7 +564,7 @@ def branch_slugify(value: str) -> str:
 def branch_name_from_slug(slug: str, issue: str | None) -> str:
     prefix = os.environ.get("DEVCTL_BRANCH_PREFIX", "feat")
     normalized = branch_slugify(slug)
-    return f"{prefix}/{issue}-{normalized}" if issue else f"{prefix}/{normalized}"
+    return f"{prefix}/{normalized_issue(issue)}-{normalized}" if issue else f"{prefix}/{normalized}"
 
 
 def changed_paths(repo_root: Path) -> list[str]:
@@ -674,7 +692,7 @@ def commit_and_push_pr_backfill(repo_root: Path, branch: str, paths: list[Path],
 
 
 def run_git_push(ctx: RuntimeContext, args: argparse.Namespace) -> int:
-    issue = args.issue or branch_meta(ctx.repo_root, "issue")
+    issue = normalized_issue(args.issue) if args.issue else branch_meta(ctx.repo_root, "issue")
     if not issue:
         raise ValueError("devctl git push requires --issue or branch issue metadata")
     approved_file = args.file or default_issue_file(ctx.repo_root, issue, "walkthrough.md")
@@ -806,7 +824,7 @@ def run_git(args: argparse.Namespace) -> int:
             print(pr["html_url"])
         return 0
     if args.git_command == "pr-merge":
-        issue = args.issue or branch_meta(ctx.repo_root, "issue")
+        issue = normalized_issue(args.issue) if args.issue else branch_meta(ctx.repo_root, "issue")
         if not issue:
             raise ValueError("devctl git pr-merge requires --issue or branch issue metadata")
         approved_file = args.file or default_issue_file(ctx.repo_root, issue, "mr-draft.md")
@@ -834,7 +852,7 @@ def run_git(args: argparse.Namespace) -> int:
         raise ValueError(f"unknown git subcommand: {args.git_command}")
     if args.body:
         raise ValueError("remote MR/PR creation requires --body-file for local review")
-    issue = args.issue or branch_meta(ctx.repo_root, "issue")
+    issue = normalized_issue(args.issue) if args.issue else branch_meta(ctx.repo_root, "issue")
     if not issue:
         raise ValueError("devctl git mr requires --issue or branch issue metadata")
     body_file = args.body_file or default_issue_file(ctx.repo_root, issue, "mr-draft.md")

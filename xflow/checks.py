@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 from .io import read_text
+from .paths import normalized_issue
 
 
 ISSUE_REQUIRED = (
@@ -65,6 +66,26 @@ SUBTASK_REQUIRED_SECTIONS = (
     "## Conclusion",
 )
 SUBTASK_CONCLUSIONS = {"success", "blocked", "superseded-by-human"}
+GAP_ANALYSIS_REQUIRED_SECTIONS = (
+    "## User Original Statement",
+    "## Clarified Problem Or Gap",
+    "## Gap Analysis",
+    "## Evidence",
+    "## Scope Boundaries",
+    "## Proposed Modification Plan",
+    "## Acceptance Criteria",
+    "## Human Recognition",
+)
+RESOLUTION_REPORT_REQUIRED_SECTIONS = (
+    "## Source Problem Or Gap",
+    "## Actual Changes",
+    "## Evidence Index",
+    "## Closure Conclusion",
+    "## AI Self-Review Result",
+    "## Remaining Risks",
+    "## Human Review Request",
+)
+RESOLUTION_CONCLUSIONS = {"resolved", "reduced", "blocked"}
 SUBTASK_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 SUBTASK_NAME_RE = re.compile(r"subtask-(\d{3})")
 REMOTE_EVIDENCE_RE = re.compile(r"(?i)(https?://|oss://|cos://|aliyuncs\.com|myqcloud\.com|qcloudcos|cos\.)")
@@ -115,11 +136,6 @@ def git_config(repo_root: Path, key: str) -> str:
         stderr=subprocess.PIPE,
     )
     return result.stdout.strip() if result.returncode == 0 else ""
-
-
-def normalized_issue(value: str) -> str:
-    value = value.strip()
-    return value[1:] if value.startswith("#") else value
 
 
 def check_current_task(repo_root: Path, issue: str | None = None) -> None:
@@ -211,6 +227,53 @@ def section_entries(raw: str) -> list[str]:
     return entries
 
 
+def required_sections(text: str, sections: tuple[str, ...], label: str) -> dict[str, str]:
+    found = {}
+    for section in sections:
+        if not has_section(text, section):
+            raise ValueError(f"missing required {label} section: {section}")
+        found[section] = section_text(text, section)
+        if not found[section]:
+            raise ValueError(f"empty required {label} section: {section}")
+    return found
+
+
+def issue_file_path(repo_root: Path, issue: str, file_path: Path | None, filename: str) -> Path:
+    current_issue_dir = issue_dir(repo_root, issue).resolve()
+    return resolve_repo_path(repo_root, file_path or current_issue_dir / filename)
+
+
+def require_issue_workspace_file(repo_root: Path, issue: str, path: Path, label: str) -> tuple[Path, Path]:
+    repo_root = repo_root.resolve()
+    current_issue_dir = issue_dir(repo_root, issue).resolve()
+    resolved = resolve_repo_path(repo_root, path)
+    require_inside(resolved, current_issue_dir, f"{label} must stay under .xflow/issues/issue-<id>")
+    if not resolved.is_file():
+        raise ValueError(f"missing {label}: {resolved}")
+    return current_issue_dir, resolved
+
+
+def check_issue_local_evidence(current_issue_dir: Path, raw: str, label: str) -> None:
+    if REMOTE_EVIDENCE_RE.search(raw):
+        raise ValueError(f"{label} evidence must stay in the repository; do not use COS/OSS/http(s) links")
+    entries = section_entries(raw)
+    if not entries:
+        raise ValueError(f"{label} evidence must reference at least one repository-local file")
+    for entry in entries:
+        if not entry or entry.startswith("#"):
+            continue
+        if re.search(r"(?i)^[a-z][a-z0-9+.-]*://", entry):
+            raise ValueError(f"{label} evidence links must be repository-local paths")
+        evidence_path = resolve_repo_path(current_issue_dir, Path(entry))
+        require_inside(evidence_path, current_issue_dir, f"{label} evidence links must stay inside the issue directory")
+        if not evidence_path.exists():
+            raise ValueError(f"{label} evidence file does not exist: {entry}")
+
+
+def has_unchecked_checklist_item(raw: str) -> bool:
+    return re.search(r"(?m)^\s*[-*]\s+\[\s\]", raw) is not None
+
+
 def check_subtask(repo_root: Path, issue: str, subtask_path: Path | None = None) -> Path:
     repo_root = repo_root.resolve()
     current_issue_dir = issue_dir(repo_root, issue).resolve()
@@ -270,6 +333,47 @@ def check_subtask(repo_root: Path, issue: str, subtask_path: Path | None = None)
     match = re.search(r"\b(success|blocked|superseded-by-human)\b\s*[:\uFF1A-]\s*(\S.+)", conclusion, re.IGNORECASE)
     if not match or match.group(1).lower() not in SUBTASK_CONCLUSIONS:
         raise ValueError("subtask Conclusion must be success, blocked, or superseded-by-human with a reason")
+    return path
+
+
+def check_gap_analysis(repo_root: Path, issue: str, file_path: Path | None = None) -> Path:
+    current_issue_dir, path = require_issue_workspace_file(
+        repo_root,
+        issue,
+        issue_file_path(repo_root, issue, file_path, "gap-analysis.md"),
+        "gap analysis",
+    )
+    text = read_text(path)
+    sections = required_sections(text, GAP_ANALYSIS_REQUIRED_SECTIONS, "gap-analysis")
+    check_issue_local_evidence(current_issue_dir, sections["## Evidence"], "gap-analysis")
+
+    recognition = markdown_field(sections["## Human Recognition"], "Recognized").lower()
+    if recognition != "yes":
+        raise ValueError("gap-analysis Human Recognition must contain Recognized: yes before implementation")
+    return path
+
+
+def check_resolution_report(repo_root: Path, issue: str, file_path: Path | None = None) -> Path:
+    current_issue_dir, path = require_issue_workspace_file(
+        repo_root,
+        issue,
+        issue_file_path(repo_root, issue, file_path, "resolution-report.md"),
+        "resolution report",
+    )
+    text = read_text(path)
+    sections = required_sections(text, RESOLUTION_REPORT_REQUIRED_SECTIONS, "resolution-report")
+    check_issue_local_evidence(current_issue_dir, sections["## Evidence Index"], "resolution-report")
+
+    conclusion_match = re.search(
+        r"\b(resolved|reduced|blocked)\b\s*[:\uFF1A-]\s*(\S.+)",
+        sections["## Closure Conclusion"],
+        re.IGNORECASE,
+    )
+    if not conclusion_match or conclusion_match.group(1).lower() not in RESOLUTION_CONCLUSIONS:
+        raise ValueError("resolution-report Closure Conclusion must be resolved, reduced, or blocked with a reason")
+    conclusion = conclusion_match.group(1).lower()
+    if conclusion in {"resolved", "reduced"} and has_unchecked_checklist_item(sections["## AI Self-Review Result"]):
+        raise ValueError("resolved/reduced resolution-report must not contain unchecked AI self-review items")
     return path
 
 
