@@ -384,6 +384,9 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "devctl check resolution-report --issue" in help_text
     assert "Problem/Gap Closure Loop" in help_text
     assert "resolved|reduced|blocked" in help_text
+    assert "one evidence bundle per finding" in help_text
+    assert "A code diff or \"tests passed\" claim is" in help_text
+    assert "evidence/screenshots and" in help_text
     assert ".xflow/publish/issues" in help_text
     assert "subtask-001" in help_text
     assert "subtask evidence/ directory" in help_text
@@ -413,6 +416,9 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "devctl check resolution-report --issue" in readme_text
     assert "Problem/Gap Closure Loop" in readme_text
     assert "resolved|reduced|blocked" in readme_text
+    assert "numbered evidence bundle" in readme_text
+    assert "not completion evidence" in readme_text
+    assert "evidence/screenshots/" in readme_text
     assert ".xflow/publish/issues" in readme_text
     assert "Subtask evidence must stay in the repository" in readme_text
     assert "subtask `evidence/` directory" in readme_text
@@ -842,6 +848,34 @@ AI may implement before the gap is recognized.
 ## Evidence
 - [gap note](evidence/gap-note.txt)
 
+## Evidence-Backed Findings
+
+### Finding F-001: Analysis gate is missing
+
+#### Finding Type
+non-ui
+
+#### Observation
+The workflow permits implementation without a recorded human recognition.
+
+#### User Impact
+The user cannot review the proposed scope before changes begin.
+
+#### Evidence
+- [gap note](evidence/gap-note.txt)
+
+#### Analysis
+The existing workflow has no mechanical gate for this transition.
+
+#### Proposed Change
+Require a recognized gap analysis before implementation.
+
+#### Acceptance
+- [ ] A gap analysis without the required evidence bundle is rejected.
+
+#### Human Review
+- [ ] Confirm that the observed workflow gap and proposed gate are correct.
+
 ## Scope Boundaries
 - Includes: local XFlow checks.
 - Excludes: remote publishing.
@@ -858,6 +892,40 @@ Reviewer: Test User
 """,
         )
         run_devctl(repo, "check", "gap-analysis", "--issue", "1")
+
+        incomplete_finding = gap.with_name("gap-analysis-incomplete-finding.md")
+        write(
+            incomplete_finding,
+            gap.read_text(encoding="utf-8").replace(
+                "#### Human Review\n- [ ] Confirm that the observed workflow gap and proposed gate are correct.\n\n",
+                "",
+            ),
+        )
+        run_devctl(repo, "check", "gap-analysis", "--issue", "1", "--file", str(incomplete_finding), expect=1)
+
+        root_gap_evidence = gap.with_name("gap-analysis-root-evidence.md")
+        write(gap.parent / "root-gap-note.txt", "evidence outside evidence directory")
+        write(
+            root_gap_evidence,
+            gap.read_text(encoding="utf-8").replace("evidence/gap-note.txt", "root-gap-note.txt"),
+        )
+        run_devctl(repo, "check", "gap-analysis", "--issue", "1", "--file", str(root_gap_evidence), expect=1)
+
+        write(gap.parent / "evidence" / "screenshots" / "f-001-before.png", "ui screenshot")
+        write(gap.parent / "evidence" / "dom" / "f-001-before.html", "<main>observed UI</main>")
+        ui_evidence = "- [screenshot](evidence/screenshots/f-001-before.png)\n- [DOM](evidence/dom/f-001-before.html)"
+        ui_gap = gap.with_name("gap-analysis-ui.md")
+        write(
+            ui_gap,
+            gap.read_text(encoding="utf-8")
+            .replace("non-ui", "ui")
+            .replace("- [gap note](evidence/gap-note.txt)", ui_evidence),
+        )
+        run_devctl(repo, "check", "gap-analysis", "--issue", "1", "--file", str(ui_gap))
+
+        ui_gap_without_dom = gap.with_name("gap-analysis-ui-without-dom.md")
+        write(ui_gap_without_dom, ui_gap.read_text(encoding="utf-8").replace("\n- [DOM](evidence/dom/f-001-before.html)", ""))
+        run_devctl(repo, "check", "gap-analysis", "--issue", "1", "--file", str(ui_gap_without_dom), expect=1)
 
         unrecognized_gap = gap.with_name("gap-analysis-unrecognized.md")
         write(unrecognized_gap, gap.read_text(encoding="utf-8").replace("Recognized: yes", "Recognized: no"))
@@ -886,6 +954,25 @@ Reviewer: Test User
 ## Evidence Index
 - [resolution note](evidence/resolution-note.txt)
 
+## Completion Verification
+
+### Criterion C-001: Gap analysis check rejects incomplete evidence
+
+#### Verification Type
+non-ui
+
+#### Expected Result
+The command rejects a gap analysis that omits a required finding field.
+
+#### Evidence
+- [resolution note](evidence/resolution-note.txt)
+
+#### Actual Result
+The focused verification command returned the expected rejection.
+
+#### Human Review
+- [ ] Confirm this evidence supports the reported closure.
+
 ## Closure Conclusion
 resolved: the gap check now exists.
 
@@ -901,6 +988,32 @@ resolved: the gap check now exists.
 """,
         )
         run_devctl(repo, "check", "resolution-report", "--issue", "1")
+
+        incomplete_verification = resolution.with_name("resolution-report-incomplete-verification.md")
+        write(
+            incomplete_verification,
+            resolution.read_text(encoding="utf-8").replace(
+                "#### Human Review\n- [ ] Confirm this evidence supports the reported closure.\n\n",
+                "",
+            ),
+        )
+        run_devctl(repo, "check", "resolution-report", "--issue", "1", "--file", str(incomplete_verification), expect=1)
+
+        ui_resolution = resolution.with_name("resolution-report-ui.md")
+        write(
+            ui_resolution,
+            resolution.read_text(encoding="utf-8")
+            .replace("non-ui", "ui")
+            .replace("- [resolution note](evidence/resolution-note.txt)", ui_evidence),
+        )
+        run_devctl(repo, "check", "resolution-report", "--issue", "1", "--file", str(ui_resolution))
+
+        ui_resolution_without_dom = resolution.with_name("resolution-report-ui-without-dom.md")
+        write(
+            ui_resolution_without_dom,
+            ui_resolution.read_text(encoding="utf-8").replace("\n- [DOM](evidence/dom/f-001-before.html)", ""),
+        )
+        run_devctl(repo, "check", "resolution-report", "--issue", "1", "--file", str(ui_resolution_without_dom), expect=1)
 
         reduced_resolution = resolution.with_name("resolution-report-reduced.md")
         write(reduced_resolution, resolution.read_text(encoding="utf-8").replace("resolved: the gap check now exists.", "reduced: the main gap is smaller but follow-up remains."))

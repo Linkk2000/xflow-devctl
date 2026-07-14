@@ -148,14 +148,20 @@ When the user reports a problem or gap, prepare
 `.xflow/issues/issue-draft/gap-analysis.md` or
 `.xflow/issues/issue-<id>/gap-analysis.md` with local evidence, scope,
 proposed changes, acceptance criteria, and `Recognized: yes` after human
-recognition. Run:
+recognition. Every finding needs a numbered evidence bundle with an observation,
+direct local artifact, analysis, acceptance condition, and human-review
+checkbox. Issue-level artifacts must stay under `evidence/`; UI findings with
+browser access require both `evidence/screenshots/` and `evidence/dom/`.
+Run:
 
 ```text
 devctl check gap-analysis --issue <id>
 ```
 
 After implementation, write `.xflow/issues/issue-<id>/resolution-report.md`
-with local evidence and a `resolved|reduced|blocked` conclusion. Run:
+with fresh, numbered verification evidence for each claimed criterion and a
+`resolved|reduced|blocked` conclusion. A code diff or an AI's "tests passed"
+statement is not completion evidence. Run:
 
 ```text
 devctl check resolution-report --issue <id>

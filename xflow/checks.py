@@ -71,6 +71,7 @@ GAP_ANALYSIS_REQUIRED_SECTIONS = (
     "## Clarified Problem Or Gap",
     "## Gap Analysis",
     "## Evidence",
+    "## Evidence-Backed Findings",
     "## Scope Boundaries",
     "## Proposed Modification Plan",
     "## Acceptance Criteria",
@@ -80,14 +81,34 @@ RESOLUTION_REPORT_REQUIRED_SECTIONS = (
     "## Source Problem Or Gap",
     "## Actual Changes",
     "## Evidence Index",
+    "## Completion Verification",
     "## Closure Conclusion",
     "## AI Self-Review Result",
     "## Remaining Risks",
     "## Human Review Request",
 )
 RESOLUTION_CONCLUSIONS = {"resolved", "reduced", "blocked"}
+GAP_FINDING_REQUIRED_SECTIONS = (
+    "#### Finding Type",
+    "#### Observation",
+    "#### User Impact",
+    "#### Evidence",
+    "#### Analysis",
+    "#### Proposed Change",
+    "#### Acceptance",
+    "#### Human Review",
+)
+COMPLETION_VERIFICATION_REQUIRED_SECTIONS = (
+    "#### Verification Type",
+    "#### Expected Result",
+    "#### Evidence",
+    "#### Actual Result",
+    "#### Human Review",
+)
 SUBTASK_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 SUBTASK_NAME_RE = re.compile(r"subtask-(\d{3})")
+FINDING_BLOCK_RE = re.compile(r"(?ms)^### Finding F-(\d{3}):\s*(\S[^\n]*)\n(.*?)(?=^### Finding F-\d{3}:|\Z)")
+COMPLETION_CRITERION_RE = re.compile(r"(?ms)^### Criterion C-(\d{3}):\s*(\S[^\n]*)\n(.*?)(?=^### Criterion C-\d{3}:|\Z)")
 REMOTE_EVIDENCE_RE = re.compile(r"(?i)(https?://|oss://|cos://|aliyuncs\.com|myqcloud\.com|qcloudcos|cos\.)")
 ISSUE_WORKSPACE_REMOTE_RE = re.compile(
     r"(?i)(oss://|cos://|aliyuncs\.com|myqcloud\.com|qcloudcos|/xflow/issues/issue-[^\s)\"']+/attachments/)"
@@ -227,6 +248,23 @@ def section_entries(raw: str) -> list[str]:
     return entries
 
 
+def subsection_text(text: str, heading: str) -> str:
+    pattern = rf"(?ms)^\s*{re.escape(heading)}\s*$\n(.*?)(?=^\s*####\s+|\Z)"
+    match = re.search(pattern, text)
+    return match.group(1).strip() if match else ""
+
+
+def required_subsections(text: str, sections: tuple[str, ...], label: str) -> dict[str, str]:
+    found = {}
+    for section in sections:
+        if not has_section(text, section):
+            raise ValueError(f"missing required {label} field: {section}")
+        found[section] = subsection_text(text, section)
+        if not found[section]:
+            raise ValueError(f"empty required {label} field: {section}")
+    return found
+
+
 def required_sections(text: str, sections: tuple[str, ...], label: str) -> dict[str, str]:
     found = {}
     for section in sections:
@@ -253,12 +291,13 @@ def require_issue_workspace_file(repo_root: Path, issue: str, path: Path, label:
     return current_issue_dir, resolved
 
 
-def check_issue_local_evidence(current_issue_dir: Path, raw: str, label: str) -> None:
+def check_issue_local_evidence(current_issue_dir: Path, raw: str, label: str) -> list[Path]:
     if REMOTE_EVIDENCE_RE.search(raw):
         raise ValueError(f"{label} evidence must stay in the repository; do not use COS/OSS/http(s) links")
     entries = section_entries(raw)
     if not entries:
         raise ValueError(f"{label} evidence must reference at least one repository-local file")
+    evidence_paths = []
     for entry in entries:
         if not entry or entry.startswith("#"):
             continue
@@ -266,8 +305,67 @@ def check_issue_local_evidence(current_issue_dir: Path, raw: str, label: str) ->
             raise ValueError(f"{label} evidence links must be repository-local paths")
         evidence_path = resolve_repo_path(current_issue_dir, Path(entry))
         require_inside(evidence_path, current_issue_dir, f"{label} evidence links must stay inside the issue directory")
+        relative = evidence_path.relative_to(current_issue_dir)
+        if not relative.parts or relative.parts[0] != "evidence":
+            raise ValueError(f"{label} evidence links must stay under the issue evidence directory")
         if not evidence_path.exists():
             raise ValueError(f"{label} evidence file does not exist: {entry}")
+        evidence_paths.append(evidence_path)
+    return evidence_paths
+
+
+def require_checklist_item(raw: str, label: str) -> None:
+    if not re.search(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+\S", raw):
+        raise ValueError(f"{label} must contain at least one reviewable checklist item")
+
+
+def validate_evidence_bundle(
+    current_issue_dir: Path,
+    fields: dict[str, str],
+    type_field: str,
+    evidence_field: str,
+    human_review_field: str,
+    label: str,
+) -> None:
+    evidence_paths = check_issue_local_evidence(current_issue_dir, fields[evidence_field], label)
+    require_checklist_item(fields[human_review_field], f"{label} Human Review")
+    evidence_type = fields[type_field].strip().lower()
+    if evidence_type not in {"ui", "non-ui"}:
+        raise ValueError(f"{label} {type_field[5:]} must be ui or non-ui")
+    if evidence_type != "ui":
+        return
+
+    relative_paths = [path.relative_to(current_issue_dir) for path in evidence_paths]
+    has_screenshot = any("screenshots" in path.parts for path in relative_paths)
+    has_dom = any("dom" in path.parts for path in relative_paths)
+    if not has_screenshot or not has_dom:
+        raise ValueError(f"{label} UI evidence must include both evidence/screenshots and evidence/dom artifacts")
+
+
+def validate_evidence_blocks(
+    current_issue_dir: Path,
+    raw: str,
+    pattern: re.Pattern[str],
+    required_fields: tuple[str, ...],
+    type_field: str,
+    label: str,
+) -> None:
+    blocks = list(pattern.finditer(raw))
+    if not blocks:
+        raise ValueError(f"{label} must contain at least one numbered evidence bundle")
+    for block in blocks:
+        identifier, title, content = block.groups()
+        if not title.strip():
+            raise ValueError(f"{label} {identifier} must have a title")
+        fields = required_subsections(content, required_fields, f"{label} {identifier}")
+        validate_evidence_bundle(
+            current_issue_dir,
+            fields,
+            type_field,
+            "#### Evidence",
+            "#### Human Review",
+            f"{label} {identifier}",
+        )
 
 
 def has_unchecked_checklist_item(raw: str) -> bool:
@@ -346,6 +444,14 @@ def check_gap_analysis(repo_root: Path, issue: str, file_path: Path | None = Non
     text = read_text(path)
     sections = required_sections(text, GAP_ANALYSIS_REQUIRED_SECTIONS, "gap-analysis")
     check_issue_local_evidence(current_issue_dir, sections["## Evidence"], "gap-analysis")
+    validate_evidence_blocks(
+        current_issue_dir,
+        sections["## Evidence-Backed Findings"],
+        FINDING_BLOCK_RE,
+        GAP_FINDING_REQUIRED_SECTIONS,
+        "#### Finding Type",
+        "gap-analysis finding",
+    )
 
     recognition = markdown_field(sections["## Human Recognition"], "Recognized").lower()
     if recognition != "yes":
@@ -363,6 +469,14 @@ def check_resolution_report(repo_root: Path, issue: str, file_path: Path | None 
     text = read_text(path)
     sections = required_sections(text, RESOLUTION_REPORT_REQUIRED_SECTIONS, "resolution-report")
     check_issue_local_evidence(current_issue_dir, sections["## Evidence Index"], "resolution-report")
+    validate_evidence_blocks(
+        current_issue_dir,
+        sections["## Completion Verification"],
+        COMPLETION_CRITERION_RE,
+        COMPLETION_VERIFICATION_REQUIRED_SECTIONS,
+        "#### Verification Type",
+        "resolution-report criterion",
+    )
 
     conclusion_match = re.search(
         r"\b(resolved|reduced|blocked)\b\s*[:\uFF1A-]\s*(\S.+)",

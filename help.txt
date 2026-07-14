@@ -114,9 +114,14 @@ Problem/Gap Closure Loop:
   Oral problem/gap reports become .xflow/issues/issue-draft/gap-analysis.md
   or .xflow/issues/issue-<id>/gap-analysis.md before implementation.
   The gap analysis must include local evidence, scope, proposed changes,
-  acceptance criteria, and human recognition.
+  acceptance criteria, human recognition, and one evidence bundle per finding.
+  Each bundle records observation, direct local artifact, analysis, acceptance,
+  and a human-review checkbox. UI bundles require evidence/screenshots and
+  evidence/dom artifacts; all issue-level evidence stays under evidence/.
   After implementation, write .xflow/issues/issue-<id>/resolution-report.md
-  with local evidence and a resolved|reduced|blocked conclusion.
+  with local evidence, one fresh verification bundle per criterion, and a
+  resolved|reduced|blocked conclusion. A code diff or "tests passed" claim is
+  not completion evidence.
   For resolved/reduced, all AI self-review checklist items must be checked.
   If the report is not true, AI must rework and rewrite it before handoff.
   devctl check gap-analysis --issue <id>
