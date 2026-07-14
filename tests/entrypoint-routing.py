@@ -77,8 +77,34 @@ def assert_no_legacy_run_command() -> None:
     assert not (OPS_ROOT / "run.sh").exists()
 
 
+def assert_powershell_help_alias() -> None:
+    result = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(OPS_ROOT / "devctl.ps1"),
+            "help",
+        ],
+        cwd=OPS_ROOT,
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        print(result.stdout)
+        print(result.stderr, file=sys.stderr)
+        raise AssertionError("devctl.ps1 help must succeed")
+    assert "AI call recipes" in result.stdout
+
+
 def main() -> None:
     assert_no_legacy_run_command()
+    assert_powershell_help_alias()
 
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)

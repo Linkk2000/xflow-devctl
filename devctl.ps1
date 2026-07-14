@@ -18,5 +18,10 @@ if ($env:PYTHONPATH) {
     $env:PYTHONPATH = $Root
 }
 
+if ($args.Count -eq 0 -or $args[0] -in @("help", "-h", "--help")) {
+    Get-Content -Raw (Join-Path $Root "help.txt")
+    exit 0
+}
+
 python -m xflow @args
 exit $LASTEXITCODE
