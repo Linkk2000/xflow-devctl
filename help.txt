@@ -141,11 +141,6 @@ Migration:
   devctl migrate inspect
   devctl migrate wrappers
 
-App:
-  devctl app start-frontend [--port PORT] [--foreground]
-  devctl app stop-frontend [--port PORT]
-  devctl app status [--port PORT]
-
 Runtime:
   Repository-local devctl.ps1 and generated project wrappers route normal commands to Python core.
   Do not rely on a user-level PATH devctl shim for repository work.

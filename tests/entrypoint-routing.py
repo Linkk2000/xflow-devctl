@@ -71,9 +71,7 @@ def assert_no_legacy_run_command() -> None:
     assert 'run_script "$OPS/git/commit-msg.sh"' not in entrypoint
     assert 'run_script "$OPS/git/done.sh"' not in entrypoint
     assert 'run_script "$OPS/git/status.sh"' not in entrypoint
-    assert 'run_script "$OPS/app/start-frontend.sh"' not in entrypoint
-    assert 'run_script "$OPS/app/stop-frontend.sh"' not in entrypoint
-    assert 'run_script "$OPS/app/status.sh"' not in entrypoint
+    assert "|app)" not in entrypoint
     assert not (OPS_ROOT / "run.sh").exists()
 
 

@@ -197,11 +197,8 @@ def test_python_core_git_and_app_commands(parent: Path) -> None:
     assert git_text(work, "branch", "--show-current") == "main"
     assert "feat/9-wsl-free" not in git_text(work, "branch", "--format=%(refname:short)")
 
-    app_status = run_devctl(work, "app", "status", "--port", "65534").stdout
-    assert "frontend process: not running" in app_status
-    assert "frontend HTTP: unavailable" in app_status
-    app_stop = run_devctl(work, "app", "stop-frontend", "--port", "65534").stdout
-    assert "no recorded frontend process" in app_stop
+    removed_app = run_devctl(work, "app", expect=2)
+    assert "invalid choice" in removed_app.stderr
 
 
 def test_git_push_and_mr_are_separate_with_state_backfill(parent: Path) -> None:
@@ -407,7 +404,8 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "type(scope): 中文摘要" in readme_text
     assert "关联 issue: #<id>" in readme_text
     assert "state backfill commit" in readme_text
-    assert "Normal Git, Issue, Attachment, Approval, Rules, Migration, and App commands route" in readme_text
+    assert "Normal Git, Issue, Attachment, Approval, Rules, and Migration commands route" in readme_text
+    assert "App commands route" not in readme_text
     assert "repository-local `devctl.ps1`" in readme_text
     assert "do not run bare `bash`, Git Bash, or WSL for normal XFlow validation" in readme_text
     assert "devctl check subtask --issue" in readme_text

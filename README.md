@@ -208,14 +208,14 @@ provider-only metadata.
 PowerShell users should prefer the repository-local `devctl.ps1`, which invokes
 the Python core and sets `PYTHONDONTWRITEBYTECODE=1` to avoid `__pycache__`
 byproducts. Do not rely on a user-level PATH devctl shim for repository work.
-Normal Git, Issue, Attachment, Approval, Rules, Migration, and App commands route
+Normal Git, Issue, Attachment, Approval, Rules, and Migration commands route
 through Python core. On Windows, validate with Python commands such as
 `python tests/python-core.py` and `python tests/entrypoint-routing.py`; do not
 run bare `bash`, Git Bash, or WSL for normal XFlow validation. POSIX-only shell
 compatibility checks may use `bash -n` only when an explicit POSIX shell is
 selected outside Windows.
 
-Search anchor: Normal Git, Issue, Attachment, Approval, Rules, Migration, and App commands route through Python core.
+Search anchor: Normal Git, Issue, Attachment, Approval, Rules, and Migration commands route through Python core.
 Search anchor: Do not run bare bash/Git-Bash/WSL for normal XFlow validation on Windows.
 Search anchor: do not run bare `bash`, Git Bash, or WSL for normal XFlow validation.
 
