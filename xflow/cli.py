@@ -491,19 +491,33 @@ def current_branch(repo_root: Path) -> str:
     return branch
 
 
+def enable_worktree_config(repo_root: Path) -> None:
+    enabled = git_output(
+        repo_root,
+        ["config", "--local", "--get", "extensions.worktreeConfig"],
+    ).lower()
+    if enabled == "true":
+        return
+    git_run(repo_root, ["config", "--local", "extensions.worktreeConfig", "true"])
+
+
 def set_branch_meta(repo_root: Path, key: str, value: str) -> None:
     if key == "issue":
         value = normalized_issue(value)
-    git_run(repo_root, ["config", "--local", f"devctl.{key}", value])
+    enable_worktree_config(repo_root)
+    git_run(repo_root, ["config", "--worktree", f"devctl.{key}", value])
 
 
 def branch_meta(repo_root: Path, key: str) -> str:
-    value = git_output(repo_root, ["config", "--local", "--get", f"devctl.{key}"])
+    value = git_output(repo_root, ["config", "--worktree", "--get", f"devctl.{key}"])
     return normalized_issue(value) if key == "issue" and value else value
 
 
 def unset_branch_meta(repo_root: Path, key: str) -> None:
-    subprocess.run(["git", "-C", str(repo_root), "config", "--local", "--unset-all", f"devctl.{key}"], check=False)
+    subprocess.run(
+        ["git", "-C", str(repo_root), "config", "--worktree", "--unset-all", f"devctl.{key}"],
+        check=False,
+    )
 
 
 def default_base(repo_root: Path) -> str:
@@ -856,9 +870,9 @@ def run_git(args: argparse.Namespace) -> int:
         print("[INFO] git-mr gate passed; provider skipped")
         return 0
     result = providers.create_pull_request(ctx.repo_root, title, body_file.read_text(encoding="utf-8"), branch, base, os.environ)
-    subprocess.run(["git", "-C", str(ctx.repo_root), "config", "--local", "devctl.pr", result.number], check=False)
+    set_branch_meta(ctx.repo_root, "pr", result.number)
     if result.html_url:
-        subprocess.run(["git", "-C", str(ctx.repo_root), "config", "--local", "devctl.pr-url", result.html_url], check=False)
+        set_branch_meta(ctx.repo_root, "pr-url", result.html_url)
     suggestion = write_pr_state_update_suggestion(ctx.repo_root, issue, result.number, result.html_url)
     backfill_paths = [suggestion, *update_current_task_for_pr(ctx.repo_root, issue, result.number, result.html_url)]
     backfill_pushed = commit_and_push_pr_backfill(ctx.repo_root, branch, backfill_paths, result.number)

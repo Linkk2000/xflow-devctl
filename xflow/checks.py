@@ -150,7 +150,7 @@ def markdown_field(text: str, name: str) -> str:
 
 def git_config(repo_root: Path, key: str) -> str:
     result = subprocess.run(
-        ["git", "-C", str(repo_root), "config", "--local", "--get", key],
+        ["git", "-C", str(repo_root), "config", "--worktree", "--get", key],
         check=False,
         text=True,
         stdout=subprocess.PIPE,

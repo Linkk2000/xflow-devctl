@@ -201,6 +201,58 @@ def test_python_core_git_and_app_commands(parent: Path) -> None:
     assert "invalid choice" in removed_app.stderr
 
 
+def test_git_task_metadata_is_scoped_to_each_worktree(parent: Path) -> None:
+    parent.mkdir(parents=True, exist_ok=True)
+    origin = parent / "origin.git"
+    main_worktree = parent / "main-worktree"
+    sibling_worktree = parent / "sibling-worktree"
+
+    git(parent, "init", "--bare", str(origin))
+    main_worktree.mkdir()
+    git(main_worktree, "init", "-q")
+    git(main_worktree, "config", "user.email", "test@example.com")
+    git(main_worktree, "config", "user.name", "Test User")
+    git(main_worktree, "checkout", "-b", "main", "-q")
+    write(main_worktree / "README.md", "# Demo\n")
+    git(main_worktree, "add", "README.md")
+    git(main_worktree, "commit", "-m", "init", "-q")
+    git(main_worktree, "remote", "add", "origin", str(origin))
+    git(main_worktree, "push", "-u", "origin", "main", "-q")
+    git(
+        main_worktree,
+        "worktree",
+        "add",
+        "-b",
+        "feature/202-sibling-task",
+        str(sibling_worktree),
+        "main",
+    )
+
+    run_devctl(main_worktree, "git", "start", "main-task", "--issue", "101", "--base", "main")
+    run_devctl(sibling_worktree, "git", "start", "sibling-task", "--issue", "202", "--base", "main")
+
+    main_status = run_devctl(main_worktree, "git", "status").stdout
+    sibling_status = run_devctl(sibling_worktree, "git", "status").stdout
+
+    assert "branch:  feat/101-main-task" in main_status
+    assert "slug:    main-task" in main_status
+    assert "issue:   #101" in main_status
+    assert "branch:  feat/202-sibling-task" in sibling_status
+    assert "slug:    sibling-task" in sibling_status
+    assert "issue:   #202" in sibling_status
+    common_issue = subprocess.run(
+        ["git", "-C", str(main_worktree), "config", "--local", "--get", "devctl.issue"],
+        check=False,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert common_issue.returncode != 0
+    assert git_text(main_worktree, "config", "--worktree", "--get", "devctl.issue") == "101"
+    assert git_text(sibling_worktree, "config", "--worktree", "--get", "devctl.issue") == "202"
+
+
 def test_git_push_and_mr_are_separate_with_state_backfill(parent: Path) -> None:
     parent.mkdir(parents=True, exist_ok=True)
     origin = parent / "origin.git"
@@ -619,6 +671,7 @@ def main() -> None:
         test_python_core_rejects_inline_remote_bodies(repo)
         test_issue_identifiers_are_portable(repo)
         test_python_core_git_and_app_commands(repo / "core-routing")
+        test_git_task_metadata_is_scoped_to_each_worktree(repo / "worktree-metadata")
         test_git_push_and_mr_are_separate_with_state_backfill(repo / "push-mr-state")
         test_ai_call_guidance_is_visible(repo)
 
