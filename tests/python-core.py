@@ -234,6 +234,14 @@ def test_unattended_cli_lifecycle(repo: Path) -> None:
     assert "IK152D" in active.stdout
 
     state_path = repo / ".xflow" / "local" / "unattended.json"
+    state_bytes = state_path.read_bytes()
+    write(repo / ".xflow" / "current-task.md", current_task_text("OTHER"))
+    mismatched = run_devctl(repo, "unattended", "status")
+    assert "[WARN]" in mismatched.stdout
+    assert "invalid" in mismatched.stdout.lower()
+    assert "Issue mismatch" in mismatched.stdout
+    assert state_path.read_bytes() == state_bytes
+
     state_path.write_text("not-json", encoding="utf-8")
     invalid = run_devctl(repo, "unattended", "status")
     assert "[WARN]" in invalid.stdout
@@ -1122,9 +1130,13 @@ def test_python_core_git_and_app_commands(parent: Path) -> None:
     assert "chore(feature.txt): 更新 feature.txt[#9]" in committed_message
     check_commit_message(committed_message, branch_issue="9")
 
+    write(work / ".git" / "info" / "exclude", ".xflow/local/\n")
+    enable(work, "9", "XFLOW_HUMAN_UNATTENDED_ALL")
+    assert require_active(work, "9").issue == "9"
     run_devctl(work, "git", "done", "--force", "--base", "main")
     assert git_text(work, "branch", "--show-current") == "main"
     assert "feat/9-wsl-free" not in git_text(work, "branch", "--format=%(refname:short)")
+    assert load(work) is None
 
     removed_app = run_devctl(work, "app", expect=2)
     assert "invalid choice" in removed_app.stderr
@@ -1323,9 +1335,9 @@ Closes #8
 def test_ai_call_guidance_is_visible(repo: Path) -> None:
     issue_help = run_devctl(repo, "issue", "create", "--help").stdout
     assert "AI call recipes" in issue_help
-    assert "Restricted unattended issue" in issue_help
-    assert "current-turn explicit human authorization" in issue_help
-    assert "--no-local-review is a restricted exception" in issue_help
+    assert "Restricted unattended issue" not in issue_help
+    assert "current-turn explicit human authorization" not in issue_help
+    assert 'devctl issue create "<title>" --body-file issue.md --no-local-review' not in issue_help
     assert "Issue/comment image attachments are disabled" in issue_help
     assert "Do not use GitHub release assets as an issue image store" in issue_help
     assert "aliyun-oss" in issue_help
@@ -1345,7 +1357,16 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     help_text = (OPS_ROOT / "help.txt").read_text(encoding="utf-8")
     assert "AI call recipes" in help_text
     assert "Human Approval Is Non-Delegable" in help_text
-    assert "Restricted unattended issue" in help_text
+    assert "Restricted unattended issue" not in help_text
+    assert "explicitly authorized that exact unattended" not in help_text
+    assert 'devctl issue create "<title>" --body-file issue.md --no-local-review' not in help_text
+    assert "devctl unattended enable --issue <id|draft> --confirm XFLOW_HUMAN_UNATTENDED_ALL" in help_text
+    assert "devctl unattended status" in help_text
+    assert "devctl unattended disable" in help_text
+    assert "[UNATTENDED] Human approval gate bypassed for current task <id>." in help_text
+    assert "--no-local-review alone is invalid" in help_text
+    for exclusion in ("force push", "history rewrite", "destructive deletion", "secret or permission changes"):
+        assert exclusion in help_text
     assert "AI must never satisfy a human gate itself" in help_text
     assert "Only the human reviewer may change Approved: no to Approved: yes" in help_text
     assert "Issue/comment image attachments are disabled" in help_text
@@ -1376,7 +1397,16 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     readme_text = (OPS_ROOT / "README.md").read_text(encoding="utf-8")
     assert "AI Call Recipes" in readme_text
     assert "Human Approval Is Non-Delegable" in readme_text
-    assert "Restricted unattended issue" in readme_text
+    assert "Restricted unattended issue" not in readme_text
+    assert "explicitly authorized an unattended issue/comment" not in readme_text
+    assert 'devctl issue create "Title" --body-file issue.md --no-local-review' not in readme_text
+    assert "devctl unattended enable --issue <id|draft> --confirm XFLOW_HUMAN_UNATTENDED_ALL" in readme_text
+    assert "devctl unattended status" in readme_text
+    assert "devctl unattended disable" in readme_text
+    assert "[UNATTENDED] Human approval gate bypassed for current task <id>." in readme_text
+    assert "--no-local-review alone is invalid" in readme_text
+    for exclusion in ("force push", "history rewrite", "destructive deletion", "secret or permission changes"):
+        assert exclusion in readme_text
     assert "AI must never satisfy a human gate" in readme_text
     assert "Only the human reviewer may" in readme_text
     assert "Issue/comment image attachments are disabled" in readme_text

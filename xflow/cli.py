@@ -27,9 +27,6 @@ from .paths import default_issue_file, normalized_issue
 
 
 ISSUE_CREATE_EPILOG = """AI call recipes:
-  Restricted unattended issue, only after current-turn explicit human authorization for this exact no-attachment issue command:
-    devctl issue create "<title>" --body-file issue.md --no-local-review
-
   Reviewed non-image attachment issue:
     devctl attachment add --issue draft --file notes.txt --as file
     devctl attachment publish --issue draft --backend manual --url att-001=https://public.example/notes.txt --body-file issue.md --output .xflow/publish/issues/issue-draft/issue.final.md
@@ -43,16 +40,10 @@ Notes:
   Aliyun OSS image attachments must be published first with attachment publish --backend aliyun-oss.
   For non-image files, use a reviewed manifest and an approved URL backend.
   GITHUB_TOKEN or GITEE_TOKEN is required for issue creation, depending on platform.
-  --no-local-review is a restricted exception, not the normal route.
-  It is only valid when the current user explicitly authorized that exact unattended issue command.
-  It must not be used for push, MR/PR creation, merge, issue close, conflict resolution, or destructive actions.
 """
 
 
 ISSUE_COMMENT_EPILOG = """AI call recipes:
-  Restricted unattended comment, only after current-turn explicit human authorization for this exact no-attachment comment command:
-    devctl issue comment <id> --body-file comment.md --no-local-review
-
   Reviewed non-image attachment comment:
     devctl attachment add --issue <id> --file notes.txt --as file
     devctl attachment publish --issue <id> --backend manual --url att-001=https://public.example/notes.txt --body-file comment.md --output .xflow/publish/issues/issue-<id>/comment.final.md
@@ -66,9 +57,6 @@ Notes:
   Aliyun OSS image attachments must be published first with attachment publish --backend aliyun-oss.
   For non-image files, use a reviewed manifest and an approved URL backend.
   GITHUB_TOKEN or GITEE_TOKEN is required for issue comments, depending on platform.
-  --no-local-review is a restricted exception, not the normal route.
-  It is only valid when the current user explicitly authorized that exact unattended comment command.
-  It must not be used for push, MR/PR creation, merge, issue close, conflict resolution, or destructive actions.
 """
 
 
@@ -918,6 +906,7 @@ def run_git_done(ctx: RuntimeContext, args: argparse.Namespace) -> int:
         print(f"[INFO] deleted local branch {branch}")
     for key in ("slug", "issue", "base", "pr", "pr-url"):
         unset_branch_meta(ctx.repo_root, key)
+    unattended.disable(ctx.repo_root)
     print("[INFO] done")
     return 0
 
@@ -1049,6 +1038,10 @@ def run_unattended(args: argparse.Namespace) -> int:
     if args.unattended_command == "status":
         try:
             state = unattended.load(ctx.repo_root)
+            if state is not None and state.issue != "draft":
+                active_issue = resolve_action_issue(ctx, None)
+                if active_issue:
+                    state = unattended.require_active(ctx.repo_root, active_issue)
         except ValueError as exc:
             print(f"[WARN] unattended mode invalid: {exc}")
             return 0

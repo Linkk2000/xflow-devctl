@@ -205,6 +205,36 @@ def assert_check_commands_are_discoverable() -> None:
         assert "active dependencies warn but do not block local development" in text
 
 
+def assert_unattended_commands_are_discoverable() -> None:
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONPATH": str(OPS_ROOT)}
+    commands = (
+        [sys.executable, "-m", "xflow", "unattended", "--help"],
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(OPS_ROOT / "devctl.ps1"),
+            "unattended",
+            "--help",
+        ],
+    )
+    for command in commands:
+        result = subprocess.run(
+            command,
+            cwd=OPS_ROOT,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert result.returncode == 0, result.stderr
+        for name in ("enable", "status", "disable"):
+            assert name in result.stdout, (command, name, result.stdout)
+
+
 def run_powershell_devctl(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = {
         **os.environ,
@@ -261,6 +291,7 @@ def main() -> None:
     assert_no_legacy_run_command()
     assert_powershell_help_alias()
     assert_check_commands_are_discoverable()
+    assert_unattended_commands_are_discoverable()
 
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)

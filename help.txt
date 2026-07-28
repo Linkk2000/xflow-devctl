@@ -12,13 +12,26 @@ AI call recipes:
   Human Approval Is Non-Delegable. AI may prepare approval files, evidence,
   command drafts, and review notes, but AI must never satisfy a human gate itself.
 
-  Restricted unattended issue, only after current-turn explicit human
-  authorization for this exact no-attachment issue command:
-    devctl issue create "<title>" --body-file issue.md --no-local-review
+  Task-scoped unattended mode:
+    devctl unattended enable --issue <id|draft> --confirm XFLOW_HUMAN_UNATTENDED_ALL
+    devctl unattended status
+    devctl unattended disable
 
-  Restricted unattended comment, only after current-turn explicit human
-  authorization for this exact no-attachment comment command:
-    devctl issue comment <id> --body-file comment.md --no-local-review
+  State is stored only in .xflow/local/unattended.json without the safety word
+  or tokens. It is bound to the Git common directory, worktree, and current
+  task Issue. Mismatch is invalid and fails closed without state repair. Draft
+  migrates only after a provider returns a definite Issue ID. Task switch,
+  successful devctl git done, or unattended disable invalidates the state.
+
+  Unattended mode bypasses only the local human approval file. Current-task,
+  draft, dependency, evidence, attachment, sensitive-data, provider, platform,
+  test, and completion checks remain mandatory. Each actual bypass prints:
+    [UNATTENDED] Human approval gate bypassed for current task <id>.
+
+  --no-local-review alone is invalid. It is only a compatibility flag when an
+  already-valid matching state exists. The mode does not authorize force push,
+  history rewrite, destructive deletion, secret or permission changes, or any
+  expansion of existing --force behavior.
 
   Reviewed non-image attachment issue:
     devctl attachment add --issue draft --file notes.txt --as file
@@ -42,9 +55,6 @@ AI recipe notes:
   Images may be published only after devctl attachment publish --backend aliyun-oss records reviewed URLs.
   For non-image files, use a reviewed manifest and an approved URL backend.
   GITHUB_TOKEN or GITEE_TOKEN is required for issue/comment remote writes, depending on platform.
-  --no-local-review is a restricted exception, not the normal route.
-  It is valid only when the current user explicitly authorized that exact unattended issue/comment command.
-  It must not be used for push, MR/PR creation, merge, issue close, conflict resolution, or destructive actions.
 
 Attachment:
   devctl attachment add --issue draft|<id> --file PATH [--as auto|image|file] [--id ID] [--manifest manifest.json]
@@ -94,14 +104,13 @@ Git:
     - 完成联合回归并记录父级本地证据
 
 Core remote-write rule:
-  Remote writes require local human review of the exact body/evidence file.
+  Remote writes require local human review of the exact body/evidence file or
+  a matching task-scoped unattended state.
   Human Approval Is Non-Delegable: AI must never satisfy a human gate itself
   and must never edit Approved: no to Approved: yes.
   Use --body-file for issue create/comment and git mr.
   Active approval file: .xflow/issues/issue-<id>/approvals/local-review.md
-  Use --no-local-review only as a restricted exception when the current user
-  explicitly authorizes an unattended issue/comment command. Issue/comment image
-  attachments are disabled.
+  Issue/comment image attachments are disabled.
   Push and MR are separate gates: devctl git push --issue <id> only publishes the
   current branch, while devctl git mr only creates the PR/MR after the branch
   already has an upstream and no unpushed commits.

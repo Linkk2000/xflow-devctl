@@ -9,7 +9,8 @@ Core rules:
 
 - Remote writes use reviewed files, not long inline shell strings.
 - A local human approval file is required before issue creation, comments,
-  issue close, branch publication, and PR/MR creation.
+  issue close, branch publication, and PR/MR creation unless a matching
+  task-scoped unattended state is active.
 - The active approval file is
   `.xflow/issues/issue-<id>/approvals/local-review.md`.
 - Issue ids are provider identifiers. GitHub usually uses numeric ids such as
@@ -22,6 +23,9 @@ Useful commands:
 
 ```text
 devctl preflight
+devctl unattended enable --issue <id|draft> --confirm XFLOW_HUMAN_UNATTENDED_ALL
+devctl unattended status
+devctl unattended disable
 devctl approval prepare --issue draft --action issue-create --file .xflow/issues/issue-draft/issue-draft.md
 devctl attachment add --issue draft --file notes.txt --as file
 devctl attachment check --issue draft --manifest .xflow/issues/issue-draft/attachments/manifest.json
@@ -51,19 +55,33 @@ Human Approval Is Non-Delegable. AI may prepare approval files, evidence,
 command drafts, and review notes, but AI must never satisfy a human gate
 itself. AI must never edit `Approved: no` to `Approved: yes`.
 
-Restricted unattended issue, only after current-turn explicit human
-authorization for this exact no-attachment issue command:
+Task-scoped unattended mode is enabled, inspected, and ended only through:
 
 ```text
-devctl issue create "Title" --body-file issue.md --no-local-review
+devctl unattended enable --issue <id|draft> --confirm XFLOW_HUMAN_UNATTENDED_ALL
+devctl unattended status
+devctl unattended disable
 ```
 
-Restricted unattended comment, only after current-turn explicit human
-authorization for this exact no-attachment comment command:
+The state lives only at `.xflow/local/unattended.json` and stores no safety
+word or token. It is bound to the Git common directory, current worktree, and
+task Issue. Repository, worktree, Issue, branch metadata, or current-task
+mismatch is invalid and fails closed without rewriting the state. Draft state
+migrates only after the provider returns a definite Issue ID. Task switch,
+successful `devctl git done`, or `devctl unattended disable` invalidates it.
+
+The mode bypasses only the local human approval file. Current-task, draft,
+dependency, evidence, attachment, sensitive-data, provider, platform, test,
+and completion checks remain mandatory. Every actual bypass prints:
 
 ```text
-devctl issue comment 123 --body-file comment.md --no-local-review
+[UNATTENDED] Human approval gate bypassed for current task <id>.
 ```
+
+`--no-local-review alone is invalid`; it is only a compatibility flag when an
+already-valid matching state exists. Unattended mode does not authorize
+force push, history rewrite, destructive deletion, or secret or permission changes.
+It does not expand existing `--force` behavior.
 
 Reviewed non-image attachment issue:
 
@@ -200,11 +218,7 @@ active dependencies with their impact recorded.
 
 `devctl attachment publish --backend github` is a legacy release-asset backend.
 It rejects image attachments and must not be used as issue/comment image
-storage. Use `--no-local-review` only when the user explicitly authorized an
-unattended issue/comment remote write for that exact command.
-`--no-local-review` is a restricted exception, not the normal route. It must
-not be used for push, MR/PR creation, merge, issue close, branch deletion,
-conflict resolution, or any destructive action.
+storage. A standalone compatibility flag cannot authorize any remote write.
 
 Push and MR/PR creation are separate Git gates. `devctl git push --issue <id>`
 only publishes the current task branch after `Approved Action: git-push`.
