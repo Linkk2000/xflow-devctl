@@ -1527,6 +1527,7 @@ def test_commit_message_validator() -> None:
         (gitee + "- 证据位于 \\\\server\\share\\evidence.txt\n", "local absolute path"),
         (gitee + "- 证据位于（`\\\\server\\share\\evidence.txt`）\n", "local absolute path"),
         (gitee + "- 证据位于 \\\\.\\PhysicalDrive0\n", "local absolute path"),
+        (gitee + "- 证据位于（`\\\\.\\PhysicalDrive0`）\n", "local absolute path"),
         (gitee + "GitHub-PR: 42\n", "provider-only metadata"),
     )
     for message, expected in cases:
@@ -1536,6 +1537,12 @@ def test_commit_message_validator() -> None:
     assert_commit_message_error(merge.replace("[#IK17AW]", "[#IK152D]"), "distinct")
     check_commit_message(
         gitee + "- 远端验证证据链接已经发布并可供人工复核：https://example.test/workspace/evidence.txt\n"
+    )
+    check_commit_message(
+        gitee + "- 远端验证证据链接已经发布并可供人工复核：http://example.test/workspace/evidence.txt\n"
+    )
+    check_commit_message(
+        gitee + "- 远端仓库链接已经确认并可供人工复核：ssh://git@example.test/repository/project.git\n"
     )
     check_commit_message(gitee + "- 前端/后端均已完成中文验证并保留人工可见证据\n")
 
