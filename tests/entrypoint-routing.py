@@ -101,6 +101,35 @@ dependencies:
     assert "invalid dependency #IK17AW type" in invalid_result.stderr
 
 
+def assert_commit_message_check_routing(root: Path) -> None:
+    repo = root / "commit-message-routing"
+    message_file = repo / ".xflow" / "local" / "commit-message.txt"
+    message_file.parent.mkdir(parents=True, exist_ok=True)
+    message_file.write_bytes(
+        b"\xef\xbb\xbf"
+        + (
+            "feat(canvas): 修复稳定端点定位[#IK152D]\n\n"
+            "- 调整统一端点计算\n"
+            "- 覆盖 C-004 并记录测试证据\n"
+        ).encode("utf-8")
+    )
+    valid = run_devctl(
+        repo,
+        "check",
+        "commit-msg",
+        "--file",
+        str(message_file),
+        "--issue",
+        "IK152D",
+    )
+    assert "associated Issues: #IK152D" in valid.stdout
+    assert "commit-msg check passed" in valid.stdout
+
+    write(message_file, "feat: invalid message\n")
+    invalid = run_devctl(repo, "check", "commit-msg", "--file", str(message_file), expect=1)
+    assert "commit subject" in invalid.stderr
+
+
 def assert_no_legacy_run_command() -> None:
     entrypoint = (OPS_ROOT / "devctl").read_text(encoding="utf-8")
     assert "\n    run)" not in entrypoint
@@ -145,6 +174,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         assert_dependency_check_routing(root)
+        assert_commit_message_check_routing(root)
         repo = root / "work"
         repo.mkdir()
         origin = root / "origin.git"

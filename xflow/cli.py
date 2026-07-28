@@ -18,6 +18,7 @@ from .checks import (
     check_submodule_hygiene,
     write_pr_state_update_suggestion,
 )
+from .commit_message import check_commit_message
 from .env import RuntimeContext, load_env_files, python_version, token_status_lines
 from .dependencies import check_dependencies
 from .migration import inspect, write_wrappers
@@ -130,6 +131,9 @@ def build_parser() -> argparse.ArgumentParser:
     dependencies = check_sub.add_parser("dependencies")
     dependencies.add_argument("--issue", required=True)
     dependencies.add_argument("--file", type=Path)
+    commit_message = check_sub.add_parser("commit-msg")
+    commit_message.add_argument("--file", required=True, type=Path)
+    commit_message.add_argument("--issue")
 
     issue = sub.add_parser("issue")
     issue_sub = issue.add_subparsers(dest="issue_command")
@@ -322,6 +326,12 @@ def run_check(args: argparse.Namespace) -> int:
         path = result.path
         for warning in result.warnings:
             print(f"[WARN] {warning}")
+    elif args.check_command == "commit-msg":
+        path = resolve_check_file(ctx.repo_root, args.issue, args.file, "commit-message.txt")
+        if not path.is_file():
+            raise ValueError(f"commit message file does not exist: {path}")
+        issue_ids = check_commit_message(path.read_text(encoding="utf-8-sig"), branch_issue=args.issue)
+        print("[INFO] associated Issues: " + " ".join(f"#{issue_id}" for issue_id in issue_ids))
     elif args.check_command == "issue-evidence":
         path = check_issue_evidence(ctx.repo_root, args.issue, args.publish_root)
     elif args.check_command == "current-task":
@@ -614,25 +624,37 @@ def guess_commit_scope(paths: list[str]) -> str:
     return "dev"
 
 
-def summarize_commit_message(repo_root: Path, override: str | None) -> str:
-    if override:
-        return override
+def summarize_commit_message(
+    repo_root: Path,
+    full_message: str | None,
+    summary_override: str | None,
+) -> str:
+    issue = branch_meta(repo_root, "issue")
+    if not issue:
+        raise ValueError("commit message requires branch Issue identity metadata")
+    if full_message is not None and summary_override is not None:
+        raise ValueError("use either -m/--message or positional summary, not both")
+    if full_message is not None:
+        check_commit_message(full_message, branch_issue=issue)
+        return full_message
+
     paths = changed_paths(repo_root)
     if not paths:
         raise ValueError("no changes to summarize")
-    issue = branch_meta(repo_root, "issue")
-    if not issue:
-        raise ValueError("commit message requires an issue-linked branch or explicit -m message")
     names = [Path(path).name for path in paths[:3]]
-    summary = ", ".join(names)
+    changed_summary = ", ".join(names)
     if len(paths) > 3:
-        summary = f"{summary} 等 {len(paths)} 个文件"
-    return (
-        f"{guess_commit_type(paths)}({guess_commit_scope(paths)}): 更新 {summary}\n\n"
-        f"关联 issue: #{issue}\n\n"
-        "- 更新任务相关文件\n"
-        "- 保持提交消息可跨 GitHub/Gitee 识别"
+        changed_summary = f"{changed_summary} 等 {len(paths)} 个文件"
+    summary = summary_override.strip() if summary_override is not None else f"更新 {changed_summary}"
+    if not summary:
+        raise ValueError("positional summary must be a non-empty Chinese core summary")
+    message = (
+        f"{guess_commit_type(paths)}({guess_commit_scope(paths)}): {summary}[#{issue}]\n\n"
+        f"- 修改范围包含 {changed_summary}\n"
+        "- 验证结果由提交前检查确认"
     )
+    check_commit_message(message, branch_issue=issue)
+    return message
 
 
 def push_branch(repo_root: Path, branch: str) -> None:
@@ -687,7 +709,13 @@ def update_current_task_for_pr(repo_root: Path, issue: str, pr_number: str, pr_u
     return []
 
 
-def commit_and_push_pr_backfill(repo_root: Path, branch: str, paths: list[Path], pr_number: str) -> bool:
+def commit_and_push_pr_backfill(
+    repo_root: Path,
+    branch: str,
+    paths: list[Path],
+    pr_number: str,
+    issue: str,
+) -> bool:
     if not paths:
         return False
     for path in paths:
@@ -695,7 +723,13 @@ def commit_and_push_pr_backfill(repo_root: Path, branch: str, paths: list[Path],
             git_run(repo_root, ["add", "--", str(path.relative_to(repo_root))])
     if subprocess.run(["git", "-C", str(repo_root), "diff", "--cached", "--quiet"], check=False).returncode == 0:
         return False
-    git_run(repo_root, ["commit", "-m", f"chore(xflow): 回填 PR #{pr_number} 状态"])
+    message = (
+        f"chore(xflow): 回填合并请求状态[#{normalized_issue(issue)}]\n\n"
+        "- 记录合并请求编号与远端链接\n"
+        "- 同步当前任务状态文件"
+    )
+    check_commit_message(message, branch_issue=issue)
+    git_run(repo_root, ["commit", "-m", message])
     push_branch(repo_root, branch)
     return True
 
@@ -772,7 +806,7 @@ def run_git_status(ctx: RuntimeContext) -> int:
 def run_git_commit_msg(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     if args.all:
         git_run(ctx.repo_root, ["add", "-A"])
-    message = summarize_commit_message(ctx.repo_root, args.message or args.summary)
+    message = summarize_commit_message(ctx.repo_root, args.message, args.summary)
     print("[INFO] suggested commit message:")
     print()
     print(f"  {message}")
@@ -884,7 +918,7 @@ def run_git(args: argparse.Namespace) -> int:
         set_branch_meta(ctx.repo_root, "pr-url", result.html_url)
     suggestion = write_pr_state_update_suggestion(ctx.repo_root, issue, result.number, result.html_url)
     backfill_paths = [suggestion, *update_current_task_for_pr(ctx.repo_root, issue, result.number, result.html_url)]
-    backfill_pushed = commit_and_push_pr_backfill(ctx.repo_root, branch, backfill_paths, result.number)
+    backfill_pushed = commit_and_push_pr_backfill(ctx.repo_root, branch, backfill_paths, result.number, issue)
     print(f"[INFO] PR #{result.number} created")
     if result.html_url:
         print(f"[INFO] {result.html_url}")

@@ -18,6 +18,7 @@ OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
 from xflow.checks import check_resolution_report, write_pr_state_update_suggestion
+from xflow.commit_message import check_commit_message
 from xflow.dependencies import DependencyCheckResult, check_dependencies
 from xflow.env import load_env_files
 from xflow.providers import (
@@ -30,7 +31,7 @@ from xflow.providers import (
     show_issue,
 )
 from xflow.paths import default_approval_file, default_issue_file, issue_dir
-from xflow.cli import branch_name_from_slug
+from xflow.cli import branch_name_from_slug, commit_and_push_pr_backfill, summarize_commit_message
 
 
 def run_devctl(repo_root: Path, *args: str, expect: int = 0) -> subprocess.CompletedProcess[str]:
@@ -391,6 +392,147 @@ def test_resolution_report_dependency_closure(repo: Path) -> None:
         check_resolution_report(repo, "IK152D")
 
 
+def assert_commit_message_error(message: str, expected: str, branch_issue: str | None = None) -> None:
+    try:
+        check_commit_message(message, branch_issue=branch_issue)
+    except ValueError as exc:
+        assert expected in str(exc), (expected, str(exc))
+    else:
+        raise AssertionError(f"commit message should reject: {expected}")
+
+
+def test_commit_message_validator() -> None:
+    gitee = (
+        "feat(canvas): 修复稳定端点定位[#IK152D]\n\n"
+        "- 调整统一端点计算\n"
+        "- 覆盖 C-004 并记录测试证据\n"
+    )
+    assert check_commit_message(gitee, branch_issue="IK152D") == ("IK152D",)
+
+    github = (
+        "fix(api): 修复请求签名校验[#123]\n\n"
+        "- 调整请求签名的校验顺序\n"
+        "- 覆盖数字 Issue 的回归测试\n"
+    )
+    assert check_commit_message(github, branch_issue="#123") == ("123",)
+
+    merge = (
+        "merge(canvas): 集成统一容器事务能力[#IK152D][#IK17AW]\n\n"
+        "- 合并主功能与依赖能力的实现\n"
+        "- 完成联合回归并记录本地证据\n"
+    )
+    assert check_commit_message(merge, branch_issue="IK152D") == ("IK152D", "IK17AW")
+
+    cases = (
+        (gitee.replace("feat(canvas)", "feat"), "scope"),
+        (gitee.replace("[#IK152D]", ""), "Issue"),
+        (gitee.replace("修复稳定端点定位", "fix stable endpoint"), "Chinese-dominant"),
+        ("feat(canvas): 修复稳定端点定位[#IK152D]", "blank separator"),
+        (gitee.rsplit("\n- ", 1)[0] + "\n", "at least two"),
+        (gitee.replace("- 覆盖 C-004 并记录测试证据", "- verify C-004 with tests"), "Chinese-dominant"),
+        (gitee.replace("[#IK152D]", "[#IK152D][#IK17AW]"), "only merge"),
+        (gitee + "Co-authored-by: Claude <bot@example.test>\n", "AI-client trailer"),
+        (gitee + "Generated-by: tool\n", "AI-client trailer"),
+        (gitee + "OpenAI-Codex\n", "AI-client trailer"),
+        (gitee + "- 证据位于 C:\\temp\\evidence.txt\n", "absolute Windows path"),
+        (gitee + "GitHub-PR: 42\n", "provider-only metadata"),
+    )
+    for message, expected in cases:
+        assert_commit_message_error(message, expected)
+    assert_commit_message_error(gitee, "first Issue", branch_issue="IK17AW")
+
+
+def test_commit_message_cli(repo: Path) -> None:
+    message_file = repo / ".xflow" / "local" / "commit-message.txt"
+    write(
+        message_file,
+        "fix(api): 修复请求签名校验[#123]\n\n"
+        "- 调整请求签名的校验顺序\n"
+        "- 覆盖数字 Issue 的回归测试\n",
+    )
+    result = run_devctl(repo, "check", "commit-msg", "--file", str(message_file), "--issue", "123")
+    assert "associated Issues: #123" in result.stdout
+    assert "commit-msg check passed" in result.stdout
+
+    write(message_file, "fix(api): invalid English summary[#123]\n\n- 中文主体一\n- 中文主体二\n")
+    run_devctl(repo, "check", "commit-msg", "--file", str(message_file), "--issue", "123", expect=1)
+
+
+def test_commit_message_generator(repo: Path) -> None:
+    repo.mkdir(parents=True)
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test User")
+    git(repo, "checkout", "-b", "feature/IK152D-commit-policy", "-q")
+    write(repo / "README.md", "# Demo\n")
+    git(repo, "add", "README.md")
+    git(repo, "commit", "-m", "初始化仓库", "-q")
+    git(repo, "config", "extensions.worktreeConfig", "true")
+    git(repo, "config", "--worktree", "devctl.issue", "IK152D")
+    write(repo / "feature.txt", "commit generator fixture\n")
+    git(repo, "add", "feature.txt")
+
+    generated = summarize_commit_message(repo, None, None)
+    assert generated.startswith("chore(feature.txt): 更新 feature.txt[#IK152D]\n\n")
+    assert len([line for line in generated.splitlines()[2:] if line.strip()]) >= 2
+    check_commit_message(generated, branch_issue="IK152D")
+
+    positional = summarize_commit_message(repo, None, "修复稳定端点定位")
+    assert positional.startswith("chore(feature.txt): 修复稳定端点定位[#IK152D]\n\n")
+    check_commit_message(positional, branch_issue="IK152D")
+
+    full_message = (
+        "fix(canvas): 修复稳定端点定位[#IK152D]\n\n"
+        "- 调整统一端点计算\n"
+        "- 覆盖 C-004 并记录测试证据\n"
+    )
+    assert summarize_commit_message(repo, full_message, None) == full_message
+    try:
+        summarize_commit_message(repo, "修复稳定端点定位", None)
+    except ValueError as exc:
+        assert "commit subject" in str(exc)
+    else:
+        raise AssertionError("-m must reject an incomplete commit message")
+
+    no_issue_repo = repo.parent / "no-issue"
+    no_issue_repo.mkdir()
+    git(no_issue_repo, "init", "-q")
+    write(no_issue_repo / "change.txt", "change\n")
+    try:
+        summarize_commit_message(no_issue_repo, full_message, None)
+    except ValueError as exc:
+        assert "Issue identity" in str(exc)
+    else:
+        raise AssertionError("commit generation requires branch Issue metadata")
+
+
+def test_pr_backfill_commit_message_without_push(repo: Path) -> None:
+    repo.mkdir(parents=True)
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test User")
+    git(repo, "checkout", "-b", "feature/8-pr-backfill", "-q")
+    write(repo / "README.md", "# Demo\n")
+    git(repo, "add", "README.md")
+    git(repo, "commit", "-m", "初始化仓库", "-q")
+    suggestion = repo / ".xflow" / "issues" / "issue-8" / "state-update-suggestion.md"
+    write(suggestion, "PR: 42\n")
+    previous = os.environ.get("DEVCTL_SKIP_PUSH")
+    os.environ["DEVCTL_SKIP_PUSH"] = "1"
+    try:
+        assert commit_and_push_pr_backfill(repo, "feature/8-pr-backfill", [suggestion], "42", "8")
+    finally:
+        if previous is None:
+            os.environ.pop("DEVCTL_SKIP_PUSH", None)
+        else:
+            os.environ["DEVCTL_SKIP_PUSH"] = previous
+    message = git_text(repo, "log", "-1", "--pretty=%B")
+    assert message.startswith("chore(xflow): 回填合并请求状态[#8]\n\n")
+    assert "- 记录合并请求编号与远端链接" in message
+    assert "- 同步当前任务状态文件" in message
+    check_commit_message(message, branch_issue="8")
+
+
 def test_python_core_git_and_app_commands(parent: Path) -> None:
     parent.mkdir(parents=True, exist_ok=True)
     origin = parent / "origin.git"
@@ -427,13 +569,26 @@ def test_python_core_git_and_app_commands(parent: Path) -> None:
 
     write(work / "feature.txt", "python core git command\n")
     msg = run_devctl(work, "git", "commit-msg", "-a").stdout
-    assert "chore(feature.txt): 更新 feature.txt" in msg
-    assert "关联 issue: #9" in msg
-    assert "- 更新任务相关文件" in msg
+    assert "chore(feature.txt): 更新 feature.txt[#9]" in msg
+    assert "- 修改范围包含 feature.txt" in msg
+    assert "- 验证结果由提交前检查确认" in msg
+
+    positional = run_devctl(work, "git", "commit-msg", "修复稳定端点定位").stdout
+    assert "chore(feature.txt): 修复稳定端点定位[#9]" in positional
+
+    complete = (
+        "fix(devctl): 修复提交消息生成[#9]\n\n"
+        "- 校验完整消息并保持内容不变\n"
+        "- 覆盖位置摘要兼容行为\n"
+    )
+    complete_result = run_devctl(work, "git", "commit-msg", "-m", complete).stdout
+    assert complete in complete_result
+    run_devctl(work, "git", "commit-msg", "-m", "修复提交消息生成", expect=1)
+
     run_devctl(work, "git", "commit-msg", "-a", "-c")
     committed_message = git_text(work, "log", "-1", "--pretty=%B")
-    assert "chore(feature.txt): 更新 feature.txt" in committed_message
-    assert "关联 issue: #9" in committed_message
+    assert "chore(feature.txt): 更新 feature.txt[#9]" in committed_message
+    check_commit_message(committed_message, branch_issue="9")
 
     run_devctl(work, "git", "done", "--force", "--base", "main")
     assert git_text(work, "branch", "--show-current") == "main"
@@ -622,8 +777,9 @@ Closes #8
         pr_requests = [item for item in github_server.requests if item["method"] == "POST" and item["path"].endswith("/pulls")]
         assert pr_requests
 
-    latest_remote_subject = git_text(origin, "log", f"refs/heads/{branch}", "-1", "--pretty=%s")
-    assert latest_remote_subject == "chore(xflow): 回填 PR #42 状态"
+    latest_remote_message = git_text(origin, "log", f"refs/heads/{branch}", "-1", "--pretty=%B")
+    assert latest_remote_message.startswith("chore(xflow): 回填合并请求状态[#8]\n\n")
+    check_commit_message(latest_remote_message, branch_issue="8")
     remote_task = git_text(origin, "show", f"refs/heads/{branch}:.xflow/current-task.md")
     assert "State: S9_REMOTE_REVIEW_AND_CI" in remote_task
     assert "PR: 42" in remote_task
@@ -914,6 +1070,10 @@ def main() -> None:
         test_issue_identifiers_are_portable(repo)
         test_dependency_parser(repo)
         test_resolution_report_dependency_closure(repo / "dependency-closure")
+        test_commit_message_validator()
+        test_commit_message_cli(repo / "commit-message-cli")
+        test_commit_message_generator(repo / "commit-message-generator")
+        test_pr_backfill_commit_message_without_push(repo / "pr-backfill-message")
         test_python_core_git_and_app_commands(repo / "core-routing")
         test_git_task_metadata_is_scoped_to_each_worktree(repo / "worktree-metadata")
         test_git_push_and_mr_are_separate_with_state_backfill(repo / "push-mr-state")
