@@ -8,9 +8,19 @@ from pathlib import Path
 
 from .io import read_text
 from .paths import default_approval_file
+from .unattended import require_active
 
 
 UMBRELLA_ACTIONS = {"remote-write", "remote write", "all-remote-writes"}
+UNATTENDED_ACTIONS = {
+    "issue-create",
+    "issue-comment",
+    "issue-close",
+    "git-push",
+    "git-mr",
+    "git-pr-merge",
+    "git-state-backfill",
+}
 REQUIRED_TEXT = (
     "# Local Review Approval",
     "Issue:",
@@ -237,3 +247,30 @@ def require_remote(
     if approved_action != action and approved_action.lower() not in UMBRELLA_ACTIONS:
         raise ValueError(f"action mismatch: expected {action}, got {approved_action}")
     check(repo_root, issue, approved_file, attachment_manifest)
+
+
+def require_remote_or_unattended(
+    repo_root: Path,
+    action: str,
+    approved_file: Path,
+    issue: str,
+    attachment_manifest: Path | None = None,
+    request_unattended: bool = False,
+) -> str:
+    if action not in UNATTENDED_ACTIONS:
+        raise ValueError(f"remote action {action} is not eligible for unattended mode")
+
+    sha256_file(resolve_path(repo_root, approved_file))
+    if attachment_manifest is not None:
+        sha256_file(resolve_path(repo_root, attachment_manifest))
+
+    try:
+        state = require_active(repo_root, issue)
+    except ValueError:
+        if request_unattended:
+            raise ValueError("--no-local-review requires active task-scoped unattended mode") from None
+        require_remote(repo_root, action, approved_file, issue, attachment_manifest)
+        return "local-review"
+
+    print(f"[UNATTENDED] Human approval gate bypassed for current task {state.issue}.")
+    return "unattended"

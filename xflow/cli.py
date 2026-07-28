@@ -16,6 +16,7 @@ from .checks import (
     check_resolution_report,
     check_subtask,
     check_submodule_hygiene,
+    markdown_field,
     write_pr_state_update_suggestion,
 )
 from .commit_message import check_commit_message
@@ -429,6 +430,26 @@ def prepare_attachment_body(
     return current_body.read_text(encoding="utf-8"), current_body, manifest_path
 
 
+def current_task_issue(repo_root: Path) -> str:
+    path = repo_root / ".xflow" / "current-task.md"
+    if not path.is_file():
+        return ""
+    value = markdown_field(path.read_text(encoding="utf-8-sig"), "Issue")
+    return normalized_issue(value) if value else ""
+
+
+def resolve_action_issue(ctx: RuntimeContext, explicit_issue: str | None) -> str:
+    if explicit_issue:
+        return normalized_issue(explicit_issue)
+    issue = branch_meta(ctx.repo_root, "issue") or current_task_issue(ctx.repo_root)
+    return normalized_issue(issue) if issue else ""
+
+
+def check_action_current_task(repo_root: Path, issue: str) -> None:
+    if issue != "draft":
+        check_current_task(repo_root, issue)
+
+
 def run_issue(args: argparse.Namespace) -> int:
     ctx = context()
     if args.issue_command == "list":
@@ -452,9 +473,16 @@ def run_issue(args: argparse.Namespace) -> int:
     if args.issue_command == "comment":
         issue_id = normalized_issue(args.number)
         _body, file_path = body_from_file(args.body_file, args.body, "remote issue comments require --body-file for local review")
+        check_action_current_task(ctx.repo_root, issue_id)
         body, file_path, manifest_path = prepare_attachment_body(ctx.repo_root, issue_id, file_path, args)
-        if not args.no_local_review:
-            approval.require_remote(ctx.repo_root, "issue-comment", file_path, issue_id, manifest_path)
+        approval.require_remote_or_unattended(
+            ctx.repo_root,
+            "issue-comment",
+            file_path,
+            issue_id,
+            manifest_path,
+            request_unattended=args.no_local_review,
+        )
         if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
             print("[INFO] issue-comment gate passed; provider skipped")
             return 0
@@ -466,7 +494,8 @@ def run_issue(args: argparse.Namespace) -> int:
     if args.issue_command == "close":
         issue_id = normalized_issue(args.number)
         file_path = Path(os.environ.get("DEVCTL_APPROVED_FILE", default_issue_file(ctx.repo_root, issue_id, "walkthrough.md")))
-        approval.require_remote(ctx.repo_root, "issue-close", file_path, issue_id)
+        check_action_current_task(ctx.repo_root, issue_id)
+        approval.require_remote_or_unattended(ctx.repo_root, "issue-close", file_path, issue_id)
         if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
             print("[INFO] issue-close gate passed; provider skipped")
             return 0
@@ -476,13 +505,22 @@ def run_issue(args: argparse.Namespace) -> int:
     if args.issue_command != "create":
         raise ValueError(f"unknown issue subcommand: {args.issue_command}")
     _body, file_path = body_from_file(args.body_file, args.body, "remote issue creation requires --body-file for local review")
+    check_issue_draft(file_path)
     body, file_path, manifest_path = prepare_attachment_body(ctx.repo_root, "draft", file_path, args)
-    if not args.no_local_review:
-        approval.require_remote(ctx.repo_root, "issue-create", file_path, "draft", manifest_path)
+    gate_source = approval.require_remote_or_unattended(
+        ctx.repo_root,
+        "issue-create",
+        file_path,
+        "draft",
+        manifest_path,
+        request_unattended=args.no_local_review,
+    )
     if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
         print("[INFO] issue-create gate passed; provider skipped")
         return 0
     result = providers.create_issue(ctx.repo_root, args.title, body, args.labels, os.environ)
+    if gate_source == "unattended":
+        unattended.migrate_issue(ctx.repo_root, "draft", result.number)
     print(f"[INFO] Issue #{result.number} created")
     if result.html_url:
         print(f"[INFO] {result.html_url}")
@@ -772,14 +810,14 @@ def commit_and_push_pr_backfill(
 
 
 def run_git_push(ctx: RuntimeContext, args: argparse.Namespace) -> int:
-    issue = normalized_issue(args.issue) if args.issue else branch_meta(ctx.repo_root, "issue")
+    issue = resolve_action_issue(ctx, args.issue)
     if not issue:
         raise ValueError("devctl git push requires --issue or branch issue metadata")
     approved_file = args.file or default_issue_file(ctx.repo_root, issue, "walkthrough.md")
     if not approved_file.is_file():
         raise ValueError(f"approved file does not exist: {approved_file}")
-    approval.require_remote(ctx.repo_root, "git-push", approved_file, issue)
     check_current_task(ctx.repo_root, issue)
+    approval.require_remote_or_unattended(ctx.repo_root, "git-push", approved_file, issue)
     branch = current_branch(ctx.repo_root)
     base = branch_meta(ctx.repo_root, "base") or default_base(ctx.repo_root)
     if branch == base:
@@ -904,13 +942,15 @@ def run_git(args: argparse.Namespace) -> int:
             print(pr["html_url"])
         return 0
     if args.git_command == "pr-merge":
-        issue = normalized_issue(args.issue) if args.issue else branch_meta(ctx.repo_root, "issue")
+        issue = resolve_action_issue(ctx, args.issue)
         if not issue:
             raise ValueError("devctl git pr-merge requires --issue or branch issue metadata")
         approved_file = args.file or default_issue_file(ctx.repo_root, issue, "mr-draft.md")
         if not approved_file.is_file():
             raise ValueError(f"approved file does not exist: {approved_file}")
-        approval.require_remote(ctx.repo_root, "git-pr-merge", approved_file, issue)
+        check_current_task(ctx.repo_root, issue)
+        check_mr_draft(approved_file)
+        approval.require_remote_or_unattended(ctx.repo_root, "git-pr-merge", approved_file, issue)
         if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
             print("[INFO] git-pr-merge gate passed; provider skipped")
             return 0
@@ -932,14 +972,22 @@ def run_git(args: argparse.Namespace) -> int:
         raise ValueError(f"unknown git subcommand: {args.git_command}")
     if args.body:
         raise ValueError("remote MR/PR creation requires --body-file for local review")
-    issue = normalized_issue(args.issue) if args.issue else branch_meta(ctx.repo_root, "issue")
+    issue = resolve_action_issue(ctx, args.issue)
     if not issue:
         raise ValueError("devctl git mr requires --issue or branch issue metadata")
     body_file = args.body_file or default_issue_file(ctx.repo_root, issue, "mr-draft.md")
     if not body_file.is_file():
         raise ValueError(f"body file does not exist: {body_file}")
+    check_current_task(ctx.repo_root, issue)
+    check_mr_draft(body_file)
     attachment.ensure_publishable(ctx.repo_root, body_file, args.attachments, issue if args.attachments else None)
-    approval.require_remote(ctx.repo_root, "git-mr", body_file, issue, args.attachments)
+    gate_source = approval.require_remote_or_unattended(
+        ctx.repo_root,
+        "git-mr",
+        body_file,
+        issue,
+        args.attachments,
+    )
     branch = current_branch(ctx.repo_root)
     base = args.base or branch_meta(ctx.repo_root, "base") or default_base(ctx.repo_root)
     if branch == base:
@@ -953,6 +1001,14 @@ def run_git(args: argparse.Namespace) -> int:
     set_branch_meta(ctx.repo_root, "pr", result.number)
     if result.html_url:
         set_branch_meta(ctx.repo_root, "pr-url", result.html_url)
+    if gate_source == "unattended":
+        approval.require_remote_or_unattended(
+            ctx.repo_root,
+            "git-state-backfill",
+            body_file,
+            issue,
+            args.attachments,
+        )
     suggestion = write_pr_state_update_suggestion(ctx.repo_root, issue, result.number, result.html_url)
     backfill_paths = [suggestion, *update_current_task_for_pr(ctx.repo_root, issue, result.number, result.html_url)]
     backfill_pushed = commit_and_push_pr_backfill(ctx.repo_root, branch, backfill_paths, result.number, issue)

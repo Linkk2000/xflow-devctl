@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -18,6 +20,7 @@ OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
 from xflow.checks import check_resolution_report, write_pr_state_update_suggestion
+from xflow import approval as approval_gate
 from xflow.commit_message import check_commit_message
 from xflow.dependencies import DependencyCheckResult, check_dependencies
 from xflow.env import load_env_files
@@ -240,6 +243,272 @@ def test_unattended_cli_lifecycle(repo: Path) -> None:
     disabled = run_devctl(repo, "unattended", "disable")
     assert "disabled" in disabled.stdout.lower()
     run_devctl(repo, "unattended", "disable")
+
+
+def current_task_text(issue: str) -> str:
+    return f"""# XFlow Current Task
+
+Issue: {issue}
+State: G5_APPROVE_MR_CREATE
+
+## Allowed Actions
+- Run the current task remote workflow.
+
+## Forbidden Actions
+- Run a different task remote workflow.
+"""
+
+
+def issue_draft_text(goal: str) -> str:
+    return f"""<!-- xflow: issue-draft -->
+
+## Background
+Need a task-scoped unattended workflow.
+
+## Problem
+Repeated human gates interrupt one approved task.
+
+## Goal
+{goal}
+
+## Scope
+- Includes: ordinary remote writes for one task.
+
+## Acceptance Criteria
+- [ ] Human approval files are bypassed only by matching state.
+
+## Verification Plan
+- python tests/python-core.py
+"""
+
+
+def test_no_local_review_requires_active_state(parent: Path) -> None:
+    repo = parent / "repo"
+    init_test_repo(repo)
+    git(repo, "remote", "add", "origin", "git@gitee.com:Linkk2000/paper-demo.git")
+    issue_id = "IJZT85"
+    write(repo / ".xflow" / "current-task.md", current_task_text(issue_id))
+    comment = repo / ".xflow" / "issues" / f"issue-{issue_id}" / "comment.md"
+    write(comment, "<!-- xflow: issue-comment -->\n\nTask status update.\n")
+
+    with RecordingApiServer() as server:
+        env = {
+            "GITEE_API_BASE": server.base_url,
+            "GITEE_TOKEN": "gitee-token",
+            "XFLOW_PLATFORM": "gitee",
+            "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+        }
+        rejected = run_devctl_with_env(
+            repo,
+            env,
+            "issue",
+            "comment",
+            issue_id,
+            "--body-file",
+            str(comment),
+            "--no-local-review",
+            expect=1,
+        )
+        assert "--no-local-review requires active task-scoped unattended mode" in rejected.stderr
+        assert not server.requests
+
+        enable(repo, issue_id, "XFLOW_HUMAN_UNATTENDED_ALL")
+        automatic = run_devctl_with_env(
+            repo,
+            env,
+            "issue",
+            "comment",
+            issue_id,
+            "--body-file",
+            str(comment),
+        )
+        assert f"[UNATTENDED] Human approval gate bypassed for current task {issue_id}." in automatic.stdout
+        compatible = run_devctl_with_env(
+            repo,
+            env,
+            "issue",
+            "comment",
+            issue_id,
+            "--body-file",
+            str(comment),
+            "--no-local-review",
+        )
+        assert f"[UNATTENDED] Human approval gate bypassed for current task {issue_id}." in compatible.stdout
+        assert len(server.requests) == 2
+
+        write(repo / ".xflow" / "current-task.md", current_task_text("OTHER"))
+        mismatched = run_devctl_with_env(
+            repo,
+            env,
+            "issue",
+            "comment",
+            issue_id,
+            "--body-file",
+            str(comment),
+            expect=1,
+        )
+        assert "current task Issue mismatch" in mismatched.stderr
+        assert len(server.requests) == 2
+
+    write(repo / ".xflow" / "current-task.md", current_task_text(issue_id))
+    image = repo / "evidence.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\nunattended-attachment")
+    run_devctl(repo, "attachment", "add", "--issue", issue_id, "--file", str(image), "--as", "image")
+    manifest = repo / ".xflow" / "issues" / f"issue-{issue_id}" / "attachments" / "manifest.json"
+    attachment_result = run_devctl(
+        repo,
+        "issue",
+        "comment",
+        issue_id,
+        "--body-file",
+        str(comment),
+        "--attachments",
+        str(manifest),
+        "--no-local-review",
+        expect=1,
+    )
+    assert "issue/comment image attachments are disabled" in attachment_result.stderr
+
+
+def test_remote_gate_matrix(parent: Path) -> None:
+    repo = parent / "repo"
+    init_test_repo(repo)
+    issue_id = "IK152D"
+    approved_file = repo / ".xflow" / "issues" / f"issue-{issue_id}" / "walkthrough.md"
+    manifest = repo / ".xflow" / "issues" / f"issue-{issue_id}" / "attachments" / "manifest.json"
+    write(approved_file, "# Walkthrough\n\nVerified task evidence.\n")
+    write(manifest, '{"version":1,"issue":"IK152D","items":[]}\n')
+    enable(repo, issue_id, "XFLOW_HUMAN_UNATTENDED_ALL")
+
+    actions = (
+        "issue-create",
+        "issue-comment",
+        "issue-close",
+        "git-push",
+        "git-mr",
+        "git-pr-merge",
+        "git-state-backfill",
+    )
+    output = io.StringIO()
+    with redirect_stdout(output):
+        for action in actions:
+            selected = approval_gate.require_remote_or_unattended(
+                repo,
+                action,
+                approved_file,
+                issue_id,
+                manifest if action in {"issue-create", "issue-comment", "git-mr"} else None,
+            )
+            assert selected == "unattended"
+    expected_log = f"[UNATTENDED] Human approval gate bypassed for current task {issue_id}."
+    assert output.getvalue().count(expected_log) == len(actions)
+
+    assert_value_error(
+        "not eligible",
+        lambda: approval_gate.require_remote_or_unattended(
+            repo,
+            "git-force-push",
+            approved_file,
+            issue_id,
+        ),
+    )
+    disable(repo)
+    assert_value_error(
+        "local review approval required",
+        lambda: approval_gate.require_remote_or_unattended(repo, "git-push", approved_file, issue_id),
+    )
+    assert_value_error(
+        "--no-local-review requires active task-scoped unattended mode",
+        lambda: approval_gate.require_remote_or_unattended(
+            repo,
+            "issue-comment",
+            approved_file,
+            issue_id,
+            request_unattended=True,
+        ),
+    )
+
+
+def test_draft_state_migrates_only_after_confirmed_issue_creation(parent: Path) -> None:
+    repo = parent / "repo"
+    init_test_repo(repo)
+    git(repo, "remote", "add", "origin", "git@github.com:Linkk2000/paper-demo.git")
+    draft = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
+    write(draft, issue_draft_text("Create the confirmed remote Issue."))
+    enable(repo, "draft", "XFLOW_HUMAN_UNATTENDED_ALL")
+
+    skipped = run_devctl(repo, "issue", "create", "Skipped provider", "--body-file", str(draft))
+    assert "provider skipped" in skipped.stdout
+    assert require_active(repo, "draft").issue == "draft"
+
+    with RecordingApiServer() as server:
+        env = {
+            "GITHUB_API_BASE": server.base_url,
+            "GITHUB_TOKEN": "github-token",
+            "XFLOW_PLATFORM": "github",
+            "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+        }
+        created = run_devctl_with_env(
+            repo,
+            env,
+            "issue",
+            "create",
+            "Confirmed provider result",
+            "--body-file",
+            str(draft),
+        )
+        assert "Issue #42 created" in created.stdout
+        assert require_active(repo, "42").issue == "42"
+        assert not list((repo / ".xflow" / "local").glob("unattended.json.*.tmp"))
+
+    failed_repo = parent / "failed-repo"
+    init_test_repo(failed_repo)
+    git(failed_repo, "remote", "add", "origin", "git@github.com:Linkk2000/paper-demo.git")
+    failed_draft = failed_repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
+    write(failed_draft, issue_draft_text("Keep draft state after provider failure."))
+    enable(failed_repo, "draft", "XFLOW_HUMAN_UNATTENDED_ALL")
+    failed = run_devctl_with_env(
+        failed_repo,
+        {
+            "GITHUB_API_BASE": "http://127.0.0.1:1",
+            "GITHUB_TOKEN": "github-token",
+            "XFLOW_PLATFORM": "github",
+            "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+        },
+        "issue",
+        "create",
+        "Provider failure",
+        "--body-file",
+        str(failed_draft),
+        expect=1,
+    )
+    assert "request failed" in failed.stderr.lower()
+    assert require_active(failed_repo, "draft").issue == "draft"
+
+    ambiguous_repo = parent / "ambiguous-repo"
+    init_test_repo(ambiguous_repo)
+    git(ambiguous_repo, "remote", "add", "origin", "git@github.com:Linkk2000/paper-demo.git")
+    ambiguous_draft = ambiguous_repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
+    write(ambiguous_draft, issue_draft_text("Keep draft state without a confirmed Issue ID."))
+    enable(ambiguous_repo, "draft", "XFLOW_HUMAN_UNATTENDED_ALL")
+    with RecordingApiServer(issue_create_payload="{}") as server:
+        ambiguous = run_devctl_with_env(
+            ambiguous_repo,
+            {
+                "GITHUB_API_BASE": server.base_url,
+                "GITHUB_TOKEN": "github-token",
+                "XFLOW_PLATFORM": "github",
+                "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+            },
+            "issue",
+            "create",
+            "Ambiguous provider result",
+            "--body-file",
+            str(ambiguous_draft),
+            expect=1,
+        )
+        assert "response missing number" in ambiguous.stderr.lower()
+    assert require_active(ambiguous_repo, "draft").issue == "draft"
 
 
 def test_env_loading_policy(repo: Path) -> None:
@@ -1144,6 +1413,7 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
 class RecordingApiHandler(BaseHTTPRequestHandler):
     requests: list[dict[str, object]] = []
     release_created: bool = False
+    issue_create_payload: str = '{"number":42,"html_url":"https://github.test/issue/42"}'
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -1240,7 +1510,7 @@ class RecordingApiHandler(BaseHTTPRequestHandler):
         elif parsed.path.endswith("/issues"):
             payload = self.read_body().decode("utf-8")
             self.requests.append({"method": "POST", "path": parsed.path, "json": payload})
-            self.send_json('{"number":42,"html_url":"https://github.test/issue/42"}')
+            self.send_json(type(self).issue_create_payload)
         else:
             self.send_response(404)
             self.end_headers()
@@ -1267,9 +1537,17 @@ class RecordingApiHandler(BaseHTTPRequestHandler):
 
 
 class RecordingApiServer:
+    def __init__(self, issue_create_payload: str | None = None) -> None:
+        self.issue_create_payload = issue_create_payload
+
     def __enter__(self) -> "RecordingApiServer":
         RecordingApiHandler.requests = []
         RecordingApiHandler.release_created = False
+        RecordingApiHandler.issue_create_payload = (
+            self.issue_create_payload
+            if self.issue_create_payload is not None
+            else '{"number":42,"html_url":"https://github.test/issue/42"}'
+        )
         self.server = HTTPServer(("127.0.0.1", 0), RecordingApiHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -1336,6 +1614,9 @@ def main() -> None:
         git(repo, "remote", "add", "origin", "git@gitee.com:Linkk2000/paper-demo.git")
         test_unattended_state_lifecycle(repo / "unattended-state")
         test_unattended_cli_lifecycle(repo / "unattended-cli")
+        test_no_local_review_requires_active_state(repo / "unattended-compatibility")
+        test_remote_gate_matrix(repo / "unattended-gate-matrix")
+        test_draft_state_migrates_only_after_confirmed_issue_creation(repo / "unattended-draft-migration")
         test_env_loading_policy(repo)
         test_python_core_rejects_inline_remote_bodies(repo)
         test_issue_identifiers_are_portable(repo)
@@ -2007,6 +2288,20 @@ Create a plain issue without manual approval when explicitly requested.
                 "XFLOW_PLATFORM": "github",
                 "DEVCTL_SKIP_PROVIDER_LOAD": "0",
             }
+            rejected_plain = run_devctl_with_env(
+                repo,
+                plain_env,
+                "issue",
+                "create",
+                "Restricted unattended issue",
+                "--body-file",
+                str(auto_issue_body),
+                "--no-local-review",
+                expect=1,
+            )
+            assert "--no-local-review requires active task-scoped unattended mode" in rejected_plain.stderr
+            assert not plain_server.requests
+            enable(repo, "draft", "XFLOW_HUMAN_UNATTENDED_ALL")
             plain_result = run_devctl_with_env(
                 repo,
                 plain_env,
