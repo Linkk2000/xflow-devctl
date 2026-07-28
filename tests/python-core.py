@@ -235,6 +235,8 @@ def test_unattended_cli_lifecycle(repo: Path) -> None:
 
     state_path = repo / ".xflow" / "local" / "unattended.json"
     state_bytes = state_path.read_bytes()
+    git(repo, "config", "extensions.worktreeConfig", "true")
+    git(repo, "config", "--worktree", "devctl.issue", "IK152D")
     write(repo / ".xflow" / "current-task.md", current_task_text("OTHER"))
     mismatched = run_devctl(repo, "unattended", "status")
     assert "[WARN]" in mismatched.stdout

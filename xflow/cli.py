@@ -1039,9 +1039,12 @@ def run_unattended(args: argparse.Namespace) -> int:
         try:
             state = unattended.load(ctx.repo_root)
             if state is not None and state.issue != "draft":
-                active_issue = resolve_action_issue(ctx, None)
-                if active_issue:
-                    state = unattended.require_active(ctx.repo_root, active_issue)
+                for active_issue in (
+                    branch_meta(ctx.repo_root, "issue"),
+                    current_task_issue(ctx.repo_root),
+                ):
+                    if active_issue:
+                        state = unattended.require_active(ctx.repo_root, active_issue)
         except ValueError as exc:
             print(f"[WARN] unattended mode invalid: {exc}")
             return 0
