@@ -18,6 +18,7 @@ OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
 from xflow.checks import write_pr_state_update_suggestion
+from xflow.dependencies import DependencyCheckResult, check_dependencies
 from xflow.env import load_env_files
 from xflow.providers import (
     close_issue,
@@ -147,6 +148,116 @@ def test_issue_identifiers_are_portable(repo: Path) -> None:
             pass
         else:
             raise AssertionError(f"unsafe issue identifier should be rejected: {unsafe!r}")
+
+
+def assert_dependency_error(repo: Path, issue: str, yaml_text: str, expected: str) -> None:
+    path = repo / ".xflow" / "issues" / f"issue-{issue}" / "dependencies.yaml"
+    write(path, yaml_text)
+    try:
+        check_dependencies(repo, issue)
+    except ValueError as exc:
+        assert expected in str(exc), (expected, str(exc))
+    else:
+        raise AssertionError(f"dependency check should reject: {expected}")
+
+
+def dependency_yaml(issue: str = "IK152D", dependency: str = "IK17AW") -> str:
+    return f"""version: 0.1.0
+issue: {issue}
+dependencies:
+  - issue: {dependency}
+    repository: xflow-web
+    type: shared-infrastructure
+    requiredFor:
+      - C-004
+    integrationTarget: mainline
+    status: integrated
+    blockingAssessment: partial
+    decision: continue
+    rationale: 属性编辑可继续，最终验证依赖统一端点能力。
+    delivery:
+      branch: fix/{dependency}-canonical-endpoints
+      commit: abc1234
+      mergeRequest: "56"
+    integration:
+      commit: def5678
+      verifiedBy:
+        - C-004
+      evidence:
+        - evidence/logs/c-004-integration-tests.txt
+    closureAssessment:
+      affectsClosure: true
+      decision: integrated
+      rationale: 相关验收已在主功能分支重新验证。
+"""
+
+
+def test_dependency_parser(repo: Path) -> None:
+    gitee_root = repo / "gitee-dependencies"
+    evidence = gitee_root / ".xflow" / "issues" / "issue-IK152D" / "evidence" / "logs" / "c-004-integration-tests.txt"
+    write(evidence, "parent integration evidence\n")
+    write(evidence.parents[2] / "dependencies.yaml", dependency_yaml())
+    result = check_dependencies(gitee_root, "IK152D")
+    assert isinstance(result, DependencyCheckResult)
+    assert result.path.name == "dependencies.yaml"
+    assert result.entries[0]["issue"] == "IK17AW"
+    assert result.warnings == ()
+
+    github_root = repo / "github-dependencies"
+    github_evidence = github_root / ".xflow" / "issues" / "issue-123" / "evidence" / "logs" / "c-004-integration-tests.txt"
+    write(github_evidence, "numeric parent integration evidence\n")
+    write(github_evidence.parents[2] / "dependencies.yaml", dependency_yaml("123", "456"))
+    numeric = check_dependencies(github_root, "123")
+    assert numeric.entries[0]["issue"] == "456"
+
+    invalid_root = repo / "invalid-dependencies"
+    base = dependency_yaml()
+    write(invalid_root / ".xflow" / "issues" / "issue-IK152D" / "evidence" / "logs" / "c-004-integration-tests.txt", "evidence\n")
+    cases = (
+        (base.replace("issue: IK152D", "issue: WRONG", 1), "top-level issue"),
+        (base.replace("type: shared-infrastructure", "type: unknown"), "type"),
+        (base.replace("status: integrated", "status: done"), "status"),
+        (base.replace("blockingAssessment: partial", "blockingAssessment: maybe"), "blockingAssessment"),
+        (base.replace("decision: continue", "decision: integrated", 1), "development decision"),
+        (base.replace("    requiredFor:\n      - C-004", "    requiredFor: []"), "requiredFor"),
+        (base.replace("rationale: 属性编辑可继续，最终验证依赖统一端点能力。", "rationale: ''"), "rationale"),
+        (base.replace("status: integrated", "status: available").replace("      commit: abc1234", "      commit: ''"), "delivery.commit"),
+        (base.replace("      commit: def5678", "      commit: ''"), "integration.commit"),
+        (base.replace("      verifiedBy:\n        - C-004", "      verifiedBy: []"), "integration.verifiedBy"),
+        (base.replace("        - evidence/logs/c-004-integration-tests.txt", "        - https://example.test/evidence.txt"), "stay in the repository"),
+        (base.replace("        - evidence/logs/c-004-integration-tests.txt", "        - oss://bucket/evidence.txt"), "stay in the repository"),
+        (base.replace("        - evidence/logs/c-004-integration-tests.txt", "        - cos://bucket/evidence.txt"), "stay in the repository"),
+        (base.replace("        - evidence/logs/c-004-integration-tests.txt", "        - ../issue-IK17AW/resolution-report.md"), "inside the issue directory"),
+    )
+    for yaml_text, expected in cases:
+        assert_dependency_error(invalid_root, "IK152D", yaml_text, expected)
+
+    available_external = """version: 0.1.0
+issue: IK152D
+dependencies:
+  - issue: EXT-1
+    repository: external-service
+    type: external
+    requiredFor: [C-009]
+    status: available
+    blockingAssessment: partial
+    decision: continue
+    rationale: 外部服务可用后继续集成验证。
+    provider: ''
+    availableVersion: ''
+    verificationEntry: ''
+"""
+    for field in ("provider", "availableVersion", "verificationEntry"):
+        candidate = available_external
+        for other in ("provider", "availableVersion", "verificationEntry"):
+            candidate = candidate.replace(f"    {other}: ''", f"    {other}: value" if other != field else f"    {other}: ''")
+        assert_dependency_error(invalid_root, "IK152D", candidate, field)
+
+    superseded = base.replace("status: integrated", "status: superseded").replace(
+        "      decision: integrated\n      rationale: 相关验收已在主功能分支重新验证。",
+        "      decision: superseded\n      rationale: ''",
+    )
+    assert_dependency_error(invalid_root, "IK152D", superseded, "closureAssessment.rationale")
 
 
 def test_python_core_git_and_app_commands(parent: Path) -> None:
@@ -670,6 +781,7 @@ def main() -> None:
         test_env_loading_policy(repo)
         test_python_core_rejects_inline_remote_bodies(repo)
         test_issue_identifiers_are_portable(repo)
+        test_dependency_parser(repo)
         test_python_core_git_and_app_commands(repo / "core-routing")
         test_git_task_metadata_is_scoped_to_each_worktree(repo / "worktree-metadata")
         test_git_push_and_mr_are_separate_with_state_backfill(repo / "push-mr-state")
