@@ -140,6 +140,8 @@ def assert_no_legacy_run_command() -> None:
     assert 'run_script "$OPS/git/status.sh"' not in entrypoint
     assert "|app)" not in entrypoint
     assert not (OPS_ROOT / "run.sh").exists()
+    assert "preflight|approval|attachment|rules|migrate|unattended" in entrypoint
+    assert "preflight|approval|attachment|rules|migrate|unattended)" in entrypoint
 
 
 def assert_powershell_help_alias() -> None:
@@ -203,6 +205,7 @@ def assert_check_commands_are_discoverable() -> None:
         assert "devctl check commit-msg --file .xflow/local/commit-message.txt --issue IK152D" in text
         assert "type(scope): 中文核心摘要[#Issue编号]" in text
         assert "active dependencies warn but do not block local development" in text
+        assert "Gitee pull request merge is not supported" in text
 
 
 def assert_unattended_commands_are_discoverable() -> None:

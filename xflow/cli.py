@@ -216,6 +216,8 @@ def build_parser() -> argparse.ArgumentParser:
     git_done = git_sub.add_parser("done")
     git_done.add_argument("--base")
     git_done.add_argument("--force", action="store_true")
+    git_done.add_argument("--issue")
+    git_done.add_argument("--file", type=Path)
 
     approval_parser = sub.add_parser("approval")
     approval_sub = approval_parser.add_subparsers(dest="approval_command")
@@ -626,7 +628,11 @@ def branch_name_from_slug(slug: str, issue: str | None) -> str:
 
 def changed_paths(repo_root: Path) -> list[str]:
     paths = set()
-    for args in (["diff", "--cached", "--name-only"], ["diff", "--name-only"]):
+    for args in (
+        ["diff", "--cached", "--name-only"],
+        ["diff", "--name-only"],
+        ["ls-files", "--others", "--exclude-standard"],
+    ):
         output = git_output(repo_root, args)
         for line in output.splitlines():
             if line.strip():
@@ -718,6 +724,23 @@ def require_branch_ready_for_mr(repo_root: Path, branch: str) -> None:
     ahead = int(git_output(repo_root, ["rev-list", "--count", f"{upstream}..HEAD"]) or "0")
     if ahead:
         raise ValueError(f"task branch has {ahead} unpushed commit(s); run devctl git push before devctl git mr")
+
+
+def require_branch_contains_remote_base(repo_root: Path, base: str) -> None:
+    git_run(repo_root, ["fetch", "origin", base])
+    remote_base = f"origin/{base}"
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "merge-base", "--is-ancestor", remote_base, "HEAD"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode == 1:
+        raise ValueError(
+            f"current HEAD does not contain {remote_base}; synchronize the task branch and rerun checks before MR"
+        )
+    if result.returncode != 0:
+        raise ValueError(f"cannot verify target baseline {remote_base}")
 
 
 def update_current_task_for_pr(repo_root: Path, issue: str, pr_number: str, pr_url: str | None) -> list[Path]:
@@ -864,9 +887,9 @@ def run_git_status(ctx: RuntimeContext) -> int:
 
 
 def run_git_commit_msg(ctx: RuntimeContext, args: argparse.Namespace) -> int:
+    message = summarize_commit_message(ctx.repo_root, args.message, args.summary)
     if args.all:
         git_run(ctx.repo_root, ["add", "-A"])
-    message = summarize_commit_message(ctx.repo_root, args.message, args.summary)
     print("[INFO] suggested commit message:")
     print()
     print(f"  {message}")
@@ -884,6 +907,12 @@ def run_git_done(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     base = args.base or branch_meta(ctx.repo_root, "base") or default_base(ctx.repo_root)
     if branch == base:
         raise ValueError(f"current branch is already {base}; nothing to clean up")
+    issue = resolve_action_issue(ctx, args.issue)
+    if not issue:
+        raise ValueError("devctl git done requires --issue or branch issue metadata")
+    approved_file = args.file or default_issue_file(ctx.repo_root, issue, "resolution-report.md")
+    action = "git-cleanup-force" if args.force else "git-cleanup"
+    approval.require_exact_remote(ctx.repo_root, action, approved_file, issue)
     pr_number = branch_meta(ctx.repo_root, "pr")
     if not args.force and pr_number and os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") != "1":
         item = providers.get_pull_request(ctx.repo_root, pr_number, os.environ)
@@ -897,9 +926,8 @@ def run_git_done(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     print(f"[INFO] pull origin/{base}")
     git_run(ctx.repo_root, ["pull", "--ff-only", "origin", base])
     if subprocess.run(["git", "-C", str(ctx.repo_root), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], check=False).returncode == 0:
-        result = subprocess.run(["git", "-C", str(ctx.repo_root), "branch", "-d", branch], check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if result.returncode != 0:
-            git_run(ctx.repo_root, ["branch", "-D", branch])
+        delete_flag = "-D" if args.force else "-d"
+        git_run(ctx.repo_root, ["branch", delete_flag, branch])
         print(f"[INFO] deleted local branch {branch}")
     for key in ("slug", "issue", "base", "pr", "pr-url"):
         unset_branch_meta(ctx.repo_root, key)
@@ -992,6 +1020,7 @@ def run_git(args: argparse.Namespace) -> int:
     if branch == base:
         raise ValueError(f"current branch is {base}; start a task branch before creating an MR")
     require_branch_ready_for_mr(ctx.repo_root, branch)
+    require_branch_contains_remote_base(ctx.repo_root, base)
     gate_source = approval.require_remote_or_unattended(
         ctx.repo_root,
         "git-mr",

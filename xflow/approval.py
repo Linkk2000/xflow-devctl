@@ -105,6 +105,10 @@ def suggested_command(action: str, approved_file: Path, issue: str, attachment_m
         return f'devctl git mr --title "<title>" --body-file {path} --issue {issue}{attachments}'
     if action == "git-pr-merge":
         return f"devctl git pr-merge <number> --issue {issue} --file {path}"
+    if action == "git-cleanup":
+        return f"devctl git done --issue {issue} --file {path}"
+    if action == "git-cleanup-force":
+        return f"devctl git done --force --issue {issue} --file {path}"
     return f"devctl <remote-write-command> --body-file {path}"
 
 
@@ -247,6 +251,21 @@ def require_remote(
     if approved_action != action and approved_action.lower() not in UMBRELLA_ACTIONS:
         raise ValueError(f"action mismatch: expected {action}, got {approved_action}")
     check(repo_root, issue, approved_file, attachment_manifest)
+
+
+def require_exact_remote(
+    repo_root: Path,
+    action: str,
+    approved_file: Path,
+    issue: str,
+) -> None:
+    review_file = default_approval_file(repo_root, issue)
+    if not review_file.is_file():
+        raise ValueError(f"local review approval required: {review_file}")
+    approved_action = field(read_text(review_file), "Approved Action")
+    if approved_action != action:
+        raise ValueError(f"action mismatch: expected exact {action}, got {approved_action}")
+    check(repo_root, issue, approved_file)
 
 
 def require_remote_or_unattended(

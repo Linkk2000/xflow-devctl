@@ -875,6 +875,60 @@ def test_git_mechanical_checks_run_before_unattended_gate(parent: Path) -> None:
     assert "[UNATTENDED]" not in ahead.stdout
 
 
+def test_mr_rejects_branch_behind_remote_base(parent: Path) -> None:
+    parent.mkdir(parents=True, exist_ok=True)
+    origin = parent / "origin.git"
+    seed = parent / "seed"
+    work = parent / "work"
+    git(parent, "init", "--bare", str(origin))
+    seed.mkdir()
+    git(seed, "init", "-q")
+    git(seed, "config", "user.email", "test@example.com")
+    git(seed, "config", "user.name", "Test User")
+    git(seed, "checkout", "-b", "main", "-q")
+    write(seed / "README.md", "# Demo\n")
+    git(seed, "add", "README.md")
+    git(seed, "commit", "-m", "init", "-q")
+    git(seed, "remote", "add", "origin", str(origin))
+    git(seed, "push", "-u", "origin", "main", "-q")
+
+    subprocess.run(["git", "clone", str(origin), str(work), "-q"], check=True)
+    git(work, "config", "user.email", "test@example.com")
+    git(work, "config", "user.name", "Test User")
+    git(work, "checkout", "-b", "feature/IK152D-behind-base", "origin/main", "-q")
+    git(work, "config", "extensions.worktreeConfig", "true")
+    git(work, "config", "--worktree", "devctl.issue", "IK152D")
+    git(work, "config", "--worktree", "devctl.base", "main")
+    write(work / ".xflow" / "current-task.md", current_task_text("IK152D"))
+    mr_file = work / ".xflow" / "issues" / "issue-IK152D" / "mr-draft.md"
+    write(mr_file, mr_draft_text("IK152D"))
+    write(work / "feature.txt", "feature is ready before base advances\n")
+    git(work, "add", ".")
+    git(work, "commit", "-m", "feature ready", "-q")
+    git(work, "push", "-u", "origin", "feature/IK152D-behind-base", "-q")
+
+    write(seed / "base-change.txt", "new target baseline\n")
+    git(seed, "add", "base-change.txt")
+    git(seed, "commit", "-m", "advance base", "-q")
+    git(seed, "push", "origin", "main", "-q")
+
+    enable(work, "IK152D", "XFLOW_HUMAN_UNATTENDED_ALL")
+    rejected = run_devctl(
+        work,
+        "git",
+        "mr",
+        "--issue",
+        "IK152D",
+        "--body-file",
+        str(mr_file),
+        "--base",
+        "main",
+        expect=1,
+    )
+    assert "does not contain origin/main" in rejected.stderr
+    assert "[UNATTENDED]" not in rejected.stdout
+
+
 def test_draft_state_migrates_only_after_confirmed_issue_creation(parent: Path) -> None:
     repo = parent / "repo"
     init_test_repo(repo)
@@ -1089,6 +1143,13 @@ def test_dependency_parser(repo: Path) -> None:
         (base.replace("decision: continue", "decision: integrated", 1), "development decision"),
         (base.replace("    requiredFor:\n      - C-004", "    requiredFor: []"), "requiredFor"),
         (base.replace("rationale: 属性编辑可继续，最终验证依赖统一端点能力。", "rationale: ''"), "rationale"),
+        (base.replace("repository: xflow-web", "repository: {name: xflow-web}"), "repository must be a string"),
+        (base.replace("      - C-004", "      - {case: C-004}", 1), "requiredFor items must be strings"),
+        (base.replace("rationale: 属性编辑可继续，最终验证依赖统一端点能力。", "rationale: [invalid]"), "rationale must be a string"),
+        (base.replace("status: integrated", "status: discovered"), "invalid dependency #IK17AW status"),
+        (base.replace("      branch: fix/IK17AW-canonical-endpoints", "      branch: [invalid]"), "delivery.branch must be a string"),
+        (base.replace("        - C-004", "        - false"), "integration.verifiedBy items must be strings"),
+        (base.replace("      rationale: 相关验收已在主功能分支重新验证。", "      rationale: {invalid: true}"), "closureAssessment.rationale must be a string"),
         (base.replace("status: integrated", "status: available").replace("      commit: abc1234", "      commit: ''"), "delivery.commit"),
         (base.replace("      commit: def5678", "      commit: ''"), "integration.commit"),
         (base.replace("      verifiedBy:\n        - C-004", "      verifiedBy: []"), "integration.verifiedBy"),
@@ -1120,6 +1181,12 @@ dependencies:
         for other in ("provider", "availableVersion", "verificationEntry"):
             candidate = candidate.replace(f"    {other}: ''", f"    {other}: value" if other != field else f"    {other}: ''")
         assert_dependency_error(invalid_root, "IK152D", candidate, field)
+    assert_dependency_error(
+        invalid_root,
+        "IK152D",
+        available_external.replace("    provider: ''", "    provider: true"),
+        "provider must be a string",
+    )
 
     valid_external = available_external
     for field in ("provider", "availableVersion", "verificationEntry"):
@@ -1370,11 +1437,16 @@ def test_commit_message_validator() -> None:
         (gitee + "Generated-by: tool\n", "AI-client trailer"),
         (gitee + "OpenAI-Codex\n", "AI-client trailer"),
         (gitee + "- 证据位于 C:\\temp\\evidence.txt\n", "absolute Windows path"),
+        (gitee + "- 证据位于 /home/user/evidence.txt\n", "local absolute path"),
+        (gitee + "- 证据位于 \\\\server\\share\\evidence.txt\n", "local absolute path"),
+        (gitee + "- 证据位于 \\\\.\\PhysicalDrive0\n", "local absolute path"),
         (gitee + "GitHub-PR: 42\n", "provider-only metadata"),
     )
     for message, expected in cases:
         assert_commit_message_error(message, expected)
     assert_commit_message_error(gitee, "first Issue", branch_issue="IK17AW")
+    assert_commit_message_error(gitee.replace("[#IK152D]", "[#..]"), "Issue identifier")
+    assert_commit_message_error(merge.replace("[#IK17AW]", "[#IK152D]"), "distinct")
 
 
 def test_commit_message_cli(repo: Path) -> None:
@@ -1563,21 +1635,152 @@ def test_python_core_git_and_app_commands(parent: Path) -> None:
     assert complete in complete_result
     run_devctl(work, "git", "commit-msg", "-m", "修复提交消息生成", expect=1)
 
+    write(work / "must-not-stage.txt", "invalid message must leave index untouched\n")
+    before_invalid_index = git_text(work, "diff", "--cached", "--name-only")
+    run_devctl(work, "git", "commit-msg", "-a", "-m", "修复提交消息生成", expect=1)
+    assert git_text(work, "diff", "--cached", "--name-only") == before_invalid_index
+    (work / "must-not-stage.txt").unlink()
+
     run_devctl(work, "git", "commit-msg", "-a", "-c")
     committed_message = git_text(work, "log", "-1", "--pretty=%B")
     assert "chore(feature.txt): 更新 feature.txt[#9]" in committed_message
     check_commit_message(committed_message, branch_issue="9")
 
-    write(work / ".git" / "info" / "exclude", ".xflow/local/\n")
+    write(
+        work / ".git" / "info" / "exclude",
+        ".xflow/local/\n.xflow/issues/**/approvals/\n",
+    )
+    cleanup_evidence = work / ".xflow" / "issues" / "issue-9" / "resolution-report.md"
+    write(cleanup_evidence, "# Resolution Report\n\nCleanup reviewed by the human.\n")
+    git(work, "add", str(cleanup_evidence.relative_to(work)))
+    git(work, "commit", "-m", "record cleanup evidence", "-q")
     enable(work, "9", "XFLOW_HUMAN_UNATTENDED_ALL")
     assert require_active(work, "9").issue == "9"
-    run_devctl(work, "git", "done", "--force", "--base", "main")
+    unattended_cleanup = run_devctl(
+        work,
+        "git",
+        "done",
+        "--force",
+        "--base",
+        "main",
+        "--issue",
+        "9",
+        "--file",
+        str(cleanup_evidence),
+        expect=1,
+    )
+    assert "local review approval required" in unattended_cleanup.stderr
+    assert git_text(work, "branch", "--show-current") == "feat/9-wsl-free"
+    assert require_active(work, "9").issue == "9"
+    cleanup_review = approval_gate.prepare(
+        work,
+        "9",
+        "git-cleanup-force",
+        cleanup_evidence,
+    )
+    cleanup_review_text = cleanup_review.read_text(encoding="utf-8")
+    assert (
+        f"Suggested Command: devctl git done --force --issue 9 --file "
+        f"{cleanup_evidence.relative_to(work).as_posix()}"
+    ) in cleanup_review_text
+    cleanup_review.write_text(
+        cleanup_review_text.replace("Approved: no", "Approved: yes"),
+        encoding="utf-8",
+        newline="\n",
+    )
+    cleanup_status = git_text(work, "status", "--porcelain")
+    assert not cleanup_status, cleanup_status
+    run_devctl(
+        work,
+        "git",
+        "done",
+        "--force",
+        "--base",
+        "main",
+        "--issue",
+        "9",
+        "--file",
+        str(cleanup_evidence),
+    )
     assert git_text(work, "branch", "--show-current") == "main"
     assert "feat/9-wsl-free" not in git_text(work, "branch", "--format=%(refname:short)")
     assert load(work) is None
 
     removed_app = run_devctl(work, "app", expect=2)
     assert "invalid choice" in removed_app.stderr
+
+
+def test_git_done_requires_exact_human_cleanup_approval(parent: Path) -> None:
+    parent.mkdir(parents=True, exist_ok=True)
+    origin = parent / "origin.git"
+    work = parent / "work"
+    git(parent, "init", "--bare", str(origin))
+    work.mkdir()
+    git(work, "init", "-q")
+    git(work, "config", "user.email", "test@example.com")
+    git(work, "config", "user.name", "Test User")
+    git(work, "checkout", "-b", "main", "-q")
+    write(work / "README.md", "# Demo\n")
+    evidence = work / ".xflow" / "issues" / "issue-8" / "resolution-report.md"
+    write(evidence, "# Resolution Report\n\nCleanup reviewed by the human.\n")
+    git(work, "add", ".")
+    git(work, "commit", "-m", "init cleanup fixture", "-q")
+    git(work, "remote", "add", "origin", str(origin))
+    git(work, "push", "-u", "origin", "main", "-q")
+    write(
+        work / ".git" / "info" / "exclude",
+        ".xflow/local/\n.xflow/issues/**/approvals/\n",
+    )
+
+    run_devctl(work, "git", "start", "safe-cleanup", "--issue", "8", "--base", "main")
+    enable(work, "8", "XFLOW_HUMAN_UNATTENDED_ALL")
+    umbrella = approval_gate.prepare(work, "8", "remote-write", evidence)
+    assert "devctl <remote-write-command>" in umbrella.read_text(encoding="utf-8")
+    umbrella.write_text(
+        umbrella.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"),
+        encoding="utf-8",
+        newline="\n",
+    )
+    rejected = run_devctl(
+        work,
+        "git",
+        "done",
+        "--base",
+        "main",
+        "--issue",
+        "8",
+        "--file",
+        str(evidence),
+        expect=1,
+    )
+    assert "expected exact git-cleanup" in rejected.stderr
+    assert git_text(work, "branch", "--show-current") == "feat/8-safe-cleanup"
+    assert require_active(work, "8").issue == "8"
+
+    exact = approval_gate.prepare(work, "8", "git-cleanup", evidence, force=True)
+    exact_text = exact.read_text(encoding="utf-8")
+    assert f"Suggested Command: devctl git done --issue 8 --file {evidence.relative_to(work).as_posix()}" in exact_text
+    exact.write_text(
+        exact_text.replace("Approved: no", "Approved: yes"),
+        encoding="utf-8",
+        newline="\n",
+    )
+    cleanup_status = git_text(work, "status", "--porcelain")
+    assert not cleanup_status, cleanup_status
+    run_devctl(
+        work,
+        "git",
+        "done",
+        "--base",
+        "main",
+        "--issue",
+        "8",
+        "--file",
+        str(evidence),
+    )
+    assert git_text(work, "branch", "--show-current") == "main"
+    assert "feat/8-safe-cleanup" not in git_text(work, "branch", "--format=%(refname:short)")
+    assert load(work) is None
 
 
 def test_git_task_metadata_is_scoped_to_each_worktree(parent: Path) -> None:
@@ -2100,6 +2303,7 @@ def main() -> None:
         test_pr_merge_requires_recorded_and_remote_identity(repo / "pr-merge-identity")
         test_issue_identity_sources_must_all_match(repo / "issue-identity-consistency")
         test_git_mechanical_checks_run_before_unattended_gate(repo / "gate-ordering")
+        test_mr_rejects_branch_behind_remote_base(repo / "mr-behind-base")
         test_draft_state_migrates_only_after_confirmed_issue_creation(repo / "unattended-draft-migration")
         test_env_loading_policy(repo)
         test_python_core_rejects_inline_remote_bodies(repo)
@@ -2111,6 +2315,7 @@ def main() -> None:
         test_commit_message_generator(repo / "commit-message-generator")
         test_pr_backfill_commit_message_without_push(repo / "pr-backfill-message")
         test_python_core_git_and_app_commands(repo / "core-routing")
+        test_git_done_requires_exact_human_cleanup_approval(repo / "git-done-exact-approval")
         test_git_task_metadata_is_scoped_to_each_worktree(repo / "worktree-metadata")
         test_git_push_and_mr_are_separate_with_state_backfill(repo / "push-mr-state")
         test_ai_call_guidance_is_visible(repo)

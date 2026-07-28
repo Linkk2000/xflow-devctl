@@ -29,6 +29,8 @@ ISSUE_TAG_RE = re.compile(rf"\[#({ISSUE_ID_PATTERN})\]")
 HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 LATIN_TOKEN_RE = re.compile(r"[A-Za-z]+")
 WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])[A-Z]:[\\/][^\s]+")
+POSIX_ABSOLUTE_PATH_RE = re.compile(r"(?<!\S)/(?:home|Users|root|tmp|var|etc|opt|mnt)/\S+")
+UNC_OR_DEVICE_PATH_RE = re.compile(r"(?<!\S)\\\\\S+")
 AI_TRAILER_RE = re.compile(
     r"(?im)(?:^Co-authored-by:\s*(?:Cursor|Claude|Gemini)\b|^Generated-by:|OpenAI-Codex)"
 )
@@ -47,8 +49,12 @@ def check_commit_message(
 ) -> tuple[str, ...]:
     if AI_TRAILER_RE.search(message):
         raise ValueError("commit message must not contain an AI-client trailer")
-    if WINDOWS_ABSOLUTE_PATH_RE.search(message):
-        raise ValueError("commit message must not contain an absolute Windows path")
+    if (
+        WINDOWS_ABSOLUTE_PATH_RE.search(message)
+        or POSIX_ABSOLUTE_PATH_RE.search(message)
+        or UNC_OR_DEVICE_PATH_RE.search(message)
+    ):
+        raise ValueError("commit message must not contain a local absolute path (absolute Windows path included)")
     if PROVIDER_METADATA_RE.search(message):
         raise ValueError("commit message must not contain provider-only metadata")
 
@@ -67,9 +73,15 @@ def check_commit_message(
         raise ValueError("commit subject must contain one or two Issue IDs only in the suffix")
     if not _is_chinese_dominant(summary):
         raise ValueError("commit subject summary must be Chinese-dominant")
-    issue_ids = tuple(ISSUE_TAG_RE.findall(match.group("tags")))
+    raw_issue_ids = tuple(ISSUE_TAG_RE.findall(match.group("tags")))
+    try:
+        issue_ids = tuple(normalized_issue(issue_id) for issue_id in raw_issue_ids)
+    except ValueError as exc:
+        raise ValueError(f"commit subject Issue identifier is invalid: {exc}") from exc
     if len(issue_ids) == 2 and match.group("type") != "merge":
         raise ValueError("only merge commit subjects may contain two Issue IDs")
+    if len(issue_ids) == 2 and issue_ids[0] == issue_ids[1]:
+        raise ValueError("merge commit subjects require two distinct Issue IDs")
     if branch_issue is not None and issue_ids[0] != normalized_issue(branch_issue):
         raise ValueError(
             f"commit subject first Issue #{issue_ids[0]} does not match branch Issue #{normalized_issue(branch_issue)}"

@@ -21,7 +21,7 @@ AI call recipes:
   or tokens. It is bound to the Git common directory, worktree, and current
   task Issue. Mismatch is invalid and fails closed without state repair. Draft
   migrates only after a provider returns a definite Issue ID. Task switch,
-  successful devctl git done, or unattended disable invalidates the state.
+  successful human-approved devctl git done, or unattended disable invalidates the state.
 
   Unattended mode bypasses only the local human approval file. Current-task,
   draft, dependency, evidence, attachment, sensitive-data, provider, platform,
@@ -32,6 +32,8 @@ AI call recipes:
   already-valid matching state exists. The mode does not authorize force push,
   history rewrite, destructive deletion, secret or permission changes, or any
   expansion of existing --force behavior.
+  Unattended mode never authorizes local branch deletion. git done requires
+  exact human approval action git-cleanup; --force requires git-cleanup-force.
 
   Reviewed non-image attachment issue:
     devctl attachment add --issue draft --file notes.txt --as file
@@ -75,7 +77,11 @@ Git:
   devctl git pr-get <number>
   devctl git pr-merge <number> [--method merge|squash|rebase] [--issue <id>] [--file F] [--commit-title T] [--commit-message M]
   devctl git status
-  devctl git done [--base BRANCH] [--force]
+  devctl git done [--base BRANCH] [--force] --issue <id> --file resolution-report.md
+  MR readiness fetches origin/<base> and requires it to be an ancestor of HEAD
+  before any approval gate or provider write.
+  Normal cleanup uses git branch -d only. There is no implicit -D fallback.
+  Gitee pull request merge is not supported by devctl yet.
   Commit messages must be portable, scoped, Chinese-dominant, multi-line, and issue-linked.
   Use first line: type(scope): 中文核心摘要[#Issue编号]
   Require at least two non-empty Chinese-dominant body lines after a blank line.

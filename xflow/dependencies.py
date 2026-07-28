@@ -8,7 +8,7 @@ from .paths import normalized_issue
 
 
 DEPENDENCY_TYPES = {"child-feature", "shared-infrastructure", "external"}
-DEPENDENCY_STATUSES = {"discovered", "active", "available", "integrated", "superseded"}
+DEPENDENCY_STATUSES = {"active", "available", "integrated", "superseded"}
 BLOCKING_ASSESSMENTS = {"none", "partial", "full"}
 DEVELOPMENT_DECISIONS = {"continue", "pause-affected-scope", "wait", "use-temporary-adapter"}
 CLOSURE_DECISIONS = {"integrated", "not-required", "superseded"}
@@ -73,17 +73,22 @@ def _mapping(value: object, label: str) -> dict[str, Any]:
 
 
 def _non_empty(value: object, label: str) -> str:
-    if value is None or not str(value).strip():
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    if not value.strip():
         raise ValueError(f"{label} must be non-empty")
-    return str(value).strip()
+    return value.strip()
 
 
-def _non_empty_list(value: object, label: str) -> list[object]:
+def _non_empty_list(value: object, label: str) -> list[str]:
     if not isinstance(value, list) or not value:
         raise ValueError(f"{label} must be a non-empty list")
+    result: list[str] = []
     for item in value:
-        _non_empty(item, label)
-    return value
+        if not isinstance(item, str):
+            raise ValueError(f"{label} items must be strings")
+        result.append(_non_empty(item, f"{label} item"))
+    return result
 
 
 def _enum(value: object, choices: set[str], label: str) -> str:
@@ -91,6 +96,12 @@ def _enum(value: object, choices: set[str], label: str) -> str:
     if candidate not in choices:
         raise ValueError(f"invalid {label}: {candidate}; expected one of {'|'.join(sorted(choices))}")
     return candidate
+
+
+def _issue_identifier(value: object, label: str) -> str:
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError(f"{label} must be a string or integer Issue identifier")
+    return normalized_issue(str(value))
 
 
 def _validate_closure_assessment(entry: dict[str, Any], dependency: str) -> None:
@@ -162,7 +173,7 @@ def check_dependencies(
 
     document = _mapping(load_yaml(path), "dependencies document")
     _non_empty(document.get("version"), "dependencies version")
-    document_issue = normalized_issue(_non_empty(document.get("issue"), "top-level issue"))
+    document_issue = _issue_identifier(document.get("issue"), "top-level issue")
     if document_issue != expected_issue:
         raise ValueError(f"top-level issue mismatch: expected {expected_issue}, found {document_issue}")
     raw_entries = document.get("dependencies")
@@ -173,10 +184,12 @@ def check_dependencies(
     warnings: list[str] = []
     for index, raw_entry in enumerate(raw_entries, start=1):
         entry = dict(_mapping(raw_entry, f"dependency entry {index}"))
-        dependency = normalized_issue(_non_empty(entry.get("issue"), f"dependency entry {index} issue"))
+        dependency = _issue_identifier(entry.get("issue"), f"dependency entry {index} issue")
         entry["issue"] = dependency
         _non_empty(entry.get("repository"), f"dependency #{dependency} repository")
         dependency_type = _enum(entry.get("type"), DEPENDENCY_TYPES, f"dependency #{dependency} type")
+        if "integrationTarget" in entry:
+            _non_empty(entry["integrationTarget"], f"dependency #{dependency} integrationTarget")
         if "delivery" in entry:
             _mapping(entry["delivery"], f"dependency #{dependency} delivery")
             if dependency_type == "external":
@@ -214,7 +227,7 @@ def check_dependencies(
                 raise ValueError(
                     f"superseded dependency #{dependency} requires closure decision superseded and a non-empty rationale"
                 )
-        if status in {"discovered", "active", "available"}:
+        if status in {"active", "available"}:
             warnings.append(f"dependency #{dependency} is {status}; developer decision remains {decision}")
         entries.append(entry)
 

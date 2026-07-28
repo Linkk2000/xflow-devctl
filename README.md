@@ -68,7 +68,8 @@ word or token. It is bound to the Git common directory, current worktree, and
 task Issue. Repository, worktree, Issue, branch metadata, or current-task
 mismatch is invalid and fails closed without rewriting the state. Draft state
 migrates only after the provider returns a definite Issue ID. Task switch,
-successful `devctl git done`, or `devctl unattended disable` invalidates it.
+successful human-approved `devctl git done`, or `devctl unattended disable`
+invalidates it.
 
 The mode bypasses only the local human approval file. Current-task, draft,
 dependency, evidence, attachment, sensitive-data, provider, platform, test,
@@ -82,6 +83,21 @@ and completion checks remain mandatory. Every actual bypass prints:
 already-valid matching state exists. Unattended mode does not authorize
 force push, history rewrite, destructive deletion, or secret or permission changes.
 It does not expand existing `--force` behavior.
+Unattended mode never authorizes local branch deletion. Cleanup always needs
+an exact local human approval for `git-cleanup`; forced cleanup requires the
+separate exact action `git-cleanup-force`. Normal cleanup uses only
+`git branch -d`, with no implicit `-D` fallback, and failed cleanup keeps the
+unattended state active.
+
+Use the reviewed completion artifact for cleanup:
+
+```text
+devctl git done --issue IK152D --file .xflow/issues/issue-IK152D/resolution-report.md
+```
+
+Before `devctl git mr` reaches an approval gate or provider write, devctl
+fetches `origin/<base>` and requires that remote baseline to be an ancestor of
+the current `HEAD`.
 
 Reviewed non-image attachment issue:
 
@@ -329,6 +345,8 @@ from the `origin` remote URL. Do not put `XFLOW_PLATFORM` in the user-level
 `~/.xflow/env.local` when working across both GitHub and Gitee projects. Gitee
 calls use the v5 OpenAPI shape and `GITEE_TOKEN`; set `GITEE_API_BASE` only for
 tests or custom hosts.
+Gitee pull request merge is not supported by devctl yet; `git pr-merge` fails
+closed for Gitee.
 
 Gitee issue ids such as `IJZT85` are valid in all issue-scoped commands:
 `devctl issue show IJZT85`, `devctl issue comment IJZT85 --body-file comment.md`,
