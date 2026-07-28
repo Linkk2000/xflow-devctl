@@ -36,7 +36,8 @@ ISSUE_CREATE_EPILOG = """AI call recipes:
 
 Notes:
   Issue/comment image attachments are disabled. Do not use GitHub release assets as an issue image store.
-  --attach-file with an image MIME type or Markdown image attachment fails before remote writes.
+  Inline --attach-file and --upload-attachments are disabled for issue create/comment.
+  Use attachment add/publish/render before the final issue command.
   Aliyun OSS image attachments must be published first with attachment publish --backend aliyun-oss.
   For non-image files, use a reviewed manifest and an approved URL backend.
   GITHUB_TOKEN or GITEE_TOKEN is required for issue creation, depending on platform.
@@ -53,7 +54,8 @@ ISSUE_COMMENT_EPILOG = """AI call recipes:
 
 Notes:
   Issue/comment image attachments are disabled. Do not use GitHub release assets as an issue image store.
-  --attach-file with an image MIME type or Markdown image attachment fails before remote writes.
+  Inline --attach-file and --upload-attachments are disabled for issue create/comment.
+  Use attachment add/publish/render before the final issue command.
   Aliyun OSS image attachments must be published first with attachment publish --backend aliyun-oss.
   For non-image files, use a reviewed manifest and an approved URL backend.
   GITHUB_TOKEN or GITEE_TOKEN is required for issue comments, depending on platform.
@@ -357,15 +359,6 @@ def body_from_file(path: Path | None, inline: str | None, required_message: str)
     return path.read_text(encoding="utf-8"), path
 
 
-def generated_body_path(path: Path, suffix: str) -> Path:
-    extension = path.suffix or ".md"
-    return path.with_name(f"{path.stem}{suffix}{extension}")
-
-
-def release_tag(args: argparse.Namespace) -> str:
-    return getattr(args, "release_tag", None) or os.environ.get("XFLOW_GITHUB_ATTACHMENT_RELEASE_TAG", "xflow-attachments")
-
-
 def prepare_attachment_body(
     repo_root: Path,
     issue: str,
@@ -375,47 +368,25 @@ def prepare_attachment_body(
     manifest_path = getattr(args, "attachments", None)
     attach_files = list(getattr(args, "attach_file", []) or [])
     upload_backend = getattr(args, "upload_attachments", None)
-    if attach_files and manifest_path is None:
-        manifest_path = attachment.default_manifest(repo_root, issue)
-    if attach_files and upload_backend is None:
-        upload_backend = "github"
-
-    original_body = body_file
-    current_body = body_file
-    if attach_files:
-        markdown_items: list[str] = []
-        for file_path in attach_files:
-            item, manifest_path = attachment.add_attachment(
-                repo_root,
-                issue,
-                file_path,
-                getattr(args, "attach_as", "auto"),
-                None,
-                manifest_path,
-            )
-            markdown_items.append(str(item["markdown"]))
-        current_body = attachment.append_markdown_to_body(
-            repo_root,
-            current_body,
-            markdown_items,
-            generated_body_path(current_body, ".attachments"),
+    if attach_files or upload_backend:
+        raise ValueError(
+            "inline issue attachments are disabled; use attachment add/publish/render "
+            "before issue create or comment"
         )
 
     if manifest_path is not None:
         attachment.reject_issue_image_attachments(repo_root, manifest_path, issue)
+    attachment.ensure_publishable(repo_root, body_file, manifest_path, issue if manifest_path else None)
+    return body_file.read_text(encoding="utf-8"), body_file, manifest_path
 
-    if upload_backend:
-        if manifest_path is None:
-            raise ValueError("--upload-attachments requires --attachments or --attach-file")
-        if upload_backend not in {"github", "github-release"}:
-            raise ValueError(f"unsupported attachment upload backend: {upload_backend}")
-        manifest_path = attachment.publish_github_release(repo_root, issue, manifest_path, os.environ, release_tag(args))
-        output = getattr(args, "rendered_body_file", None) or attachment.default_rendered_body(repo_root, issue, original_body)
-        current_body = attachment.render_body(repo_root, issue, manifest_path, current_body, output)
-    else:
-        attachment.ensure_publishable(repo_root, current_body, manifest_path, issue if manifest_path else None)
 
-    return current_body.read_text(encoding="utf-8"), current_body, manifest_path
+def require_requested_unattended(repo_root: Path, issue: str, requested: bool) -> None:
+    if not requested:
+        return
+    try:
+        unattended.require_active(repo_root, issue)
+    except ValueError:
+        raise ValueError("--no-local-review requires active task-scoped unattended mode") from None
 
 
 def current_task_issue(repo_root: Path) -> str:
@@ -426,11 +397,34 @@ def current_task_issue(repo_root: Path) -> str:
     return normalized_issue(value) if value else ""
 
 
-def resolve_action_issue(ctx: RuntimeContext, explicit_issue: str | None) -> str:
-    if explicit_issue:
-        return normalized_issue(explicit_issue)
-    issue = branch_meta(ctx.repo_root, "issue") or current_task_issue(ctx.repo_root)
-    return normalized_issue(issue) if issue else ""
+def resolve_action_issue(
+    ctx: RuntimeContext,
+    explicit_issue: str | None,
+    *,
+    strict_state: bool = False,
+) -> str:
+    sources: list[tuple[str, str]] = []
+    for name, value in (
+        ("explicit", explicit_issue or ""),
+        ("branch", branch_meta(ctx.repo_root, "issue")),
+        ("current-task", current_task_issue(ctx.repo_root)),
+    ):
+        if value:
+            sources.append((name, normalized_issue(value)))
+    try:
+        state = unattended.load(ctx.repo_root)
+    except ValueError:
+        if strict_state:
+            raise
+        state = None
+    if state is not None:
+        sources.append(("unattended", state.issue))
+
+    identities = {value for _name, value in sources}
+    if len(identities) > 1:
+        details = ", ".join(f"{name}={value}" for name, value in sources)
+        raise ValueError(f"Issue identity mismatch: {details}")
+    return sources[0][1] if sources else ""
 
 
 def check_action_current_task(repo_root: Path, issue: str) -> None:
@@ -459,9 +453,10 @@ def run_issue(args: argparse.Namespace) -> int:
             print(item["html_url"])
         return 0
     if args.issue_command == "comment":
-        issue_id = normalized_issue(args.number)
+        issue_id = resolve_action_issue(ctx, args.number)
         _body, file_path = body_from_file(args.body_file, args.body, "remote issue comments require --body-file for local review")
         check_action_current_task(ctx.repo_root, issue_id)
+        require_requested_unattended(ctx.repo_root, issue_id, args.no_local_review)
         body, file_path, manifest_path = prepare_attachment_body(ctx.repo_root, issue_id, file_path, args)
         approval.require_remote_or_unattended(
             ctx.repo_root,
@@ -480,7 +475,7 @@ def run_issue(args: argparse.Namespace) -> int:
             print(f"[INFO] {result['html_url']}")
         return 0
     if args.issue_command == "close":
-        issue_id = normalized_issue(args.number)
+        issue_id = resolve_action_issue(ctx, args.number)
         file_path = Path(os.environ.get("DEVCTL_APPROVED_FILE", default_issue_file(ctx.repo_root, issue_id, "walkthrough.md")))
         check_action_current_task(ctx.repo_root, issue_id)
         approval.require_remote_or_unattended(ctx.repo_root, "issue-close", file_path, issue_id)
@@ -492,14 +487,16 @@ def run_issue(args: argparse.Namespace) -> int:
         return 0
     if args.issue_command != "create":
         raise ValueError(f"unknown issue subcommand: {args.issue_command}")
+    issue_id = resolve_action_issue(ctx, "draft")
     _body, file_path = body_from_file(args.body_file, args.body, "remote issue creation requires --body-file for local review")
     check_issue_draft(file_path)
-    body, file_path, manifest_path = prepare_attachment_body(ctx.repo_root, "draft", file_path, args)
+    require_requested_unattended(ctx.repo_root, issue_id, args.no_local_review)
+    body, file_path, manifest_path = prepare_attachment_body(ctx.repo_root, issue_id, file_path, args)
     gate_source = approval.require_remote_or_unattended(
         ctx.repo_root,
         "issue-create",
         file_path,
-        "draft",
+        issue_id,
         manifest_path,
         request_unattended=args.no_local_review,
     )
@@ -508,7 +505,7 @@ def run_issue(args: argparse.Namespace) -> int:
         return 0
     result = providers.create_issue(ctx.repo_root, args.title, body, args.labels, os.environ)
     if gate_source == "unattended":
-        unattended.migrate_issue(ctx.repo_root, "draft", result.number)
+        unattended.migrate_issue(ctx.repo_root, issue_id, result.number)
     print(f"[INFO] Issue #{result.number} created")
     if result.html_url:
         print(f"[INFO] {result.html_url}")
@@ -805,11 +802,11 @@ def run_git_push(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     if not approved_file.is_file():
         raise ValueError(f"approved file does not exist: {approved_file}")
     check_current_task(ctx.repo_root, issue)
-    approval.require_remote_or_unattended(ctx.repo_root, "git-push", approved_file, issue)
     branch = current_branch(ctx.repo_root)
     base = branch_meta(ctx.repo_root, "base") or default_base(ctx.repo_root)
     if branch == base:
         raise ValueError(f"current branch is {base}; start a task branch before pushing")
+    approval.require_remote_or_unattended(ctx.repo_root, "git-push", approved_file, issue)
     push_branch(ctx.repo_root, branch)
     print(f"[INFO] pushed {branch}")
     return 0
@@ -939,13 +936,33 @@ def run_git(args: argparse.Namespace) -> int:
             raise ValueError(f"approved file does not exist: {approved_file}")
         check_current_task(ctx.repo_root, issue)
         check_mr_draft(approved_file)
-        approval.require_remote_or_unattended(ctx.repo_root, "git-pr-merge", approved_file, issue)
+        branch = current_branch(ctx.repo_root)
+        base = branch_meta(ctx.repo_root, "base") or default_base(ctx.repo_root)
+        if branch == base:
+            raise ValueError(f"current branch is {base}; checkout the recorded task branch before merging its PR")
+        recorded_pr = branch_meta(ctx.repo_root, "pr")
+        if not recorded_pr:
+            raise ValueError("devctl git pr-merge requires branch PR metadata")
+        requested_pr = normalized_issue(args.number)
+        if normalized_issue(recorded_pr) != requested_pr:
+            raise ValueError(f"recorded PR mismatch: expected {recorded_pr}, got {requested_pr}")
         if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
-            print("[INFO] git-pr-merge gate passed; provider skipped")
-            return 0
+            raise ValueError("git pr-merge requires provider PR identity verification")
+        remote_pr = providers.normalize_pull_request_identity(
+            providers.get_pull_request(ctx.repo_root, requested_pr, os.environ)
+        )
+        if remote_pr.number != requested_pr:
+            raise ValueError(f"pull request number mismatch: expected {requested_pr}, got {remote_pr.number}")
+        if remote_pr.state != "open":
+            raise ValueError(f"pull request state mismatch: expected open, got {remote_pr.state}")
+        if remote_pr.head != branch:
+            raise ValueError(f"pull request head branch mismatch: expected {branch}, got {remote_pr.head}")
+        if remote_pr.base != base:
+            raise ValueError(f"pull request base branch mismatch: expected {base}, got {remote_pr.base}")
+        approval.require_remote_or_unattended(ctx.repo_root, "git-pr-merge", approved_file, issue)
         result = providers.merge_pull_request(
             ctx.repo_root,
-            args.number,
+            requested_pr,
             args.method,
             args.commit_title,
             args.commit_message,
@@ -970,6 +987,11 @@ def run_git(args: argparse.Namespace) -> int:
     check_current_task(ctx.repo_root, issue)
     check_mr_draft(body_file)
     attachment.ensure_publishable(ctx.repo_root, body_file, args.attachments, issue if args.attachments else None)
+    branch = current_branch(ctx.repo_root)
+    base = args.base or branch_meta(ctx.repo_root, "base") or default_base(ctx.repo_root)
+    if branch == base:
+        raise ValueError(f"current branch is {base}; start a task branch before creating an MR")
+    require_branch_ready_for_mr(ctx.repo_root, branch)
     gate_source = approval.require_remote_or_unattended(
         ctx.repo_root,
         "git-mr",
@@ -977,11 +999,6 @@ def run_git(args: argparse.Namespace) -> int:
         issue,
         args.attachments,
     )
-    branch = current_branch(ctx.repo_root)
-    base = args.base or branch_meta(ctx.repo_root, "base") or default_base(ctx.repo_root)
-    if branch == base:
-        raise ValueError(f"current branch is {base}; start a task branch before creating an MR")
-    require_branch_ready_for_mr(ctx.repo_root, branch)
     title = args.title or f"[#{issue}] {branch.replace('-', ' ')}"
     if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
         print("[INFO] git-mr gate passed; provider skipped")
@@ -1032,19 +1049,14 @@ def run_approval(args: argparse.Namespace) -> int:
 def run_unattended(args: argparse.Namespace) -> int:
     ctx = context()
     if args.unattended_command == "enable":
-        state = unattended.enable(ctx.repo_root, args.issue, args.confirm)
+        issue = resolve_action_issue(ctx, args.issue)
+        state = unattended.enable(ctx.repo_root, issue, args.confirm)
         print(f"[INFO] task-scoped unattended mode enabled for current task {state.issue}")
         return 0
     if args.unattended_command == "status":
         try:
+            resolve_action_issue(ctx, None, strict_state=True)
             state = unattended.load(ctx.repo_root)
-            if state is not None and state.issue != "draft":
-                for active_issue in (
-                    branch_meta(ctx.repo_root, "issue"),
-                    current_task_issue(ctx.repo_root),
-                ):
-                    if active_issue:
-                        state = unattended.require_active(ctx.repo_root, active_issue)
         except ValueError as exc:
             print(f"[WARN] unattended mode invalid: {exc}")
             return 0

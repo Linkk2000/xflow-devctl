@@ -129,6 +129,9 @@ as an issue image store. `devctl issue create` and `devctl issue comment` fail
 before remote writes when an attachment manifest contains an image MIME type or
 Markdown image attachment unless it has already been published by an approved
 backend such as `aliyun-oss`.
+Inline `--attach-file` and `--upload-attachments` are disabled for issue create
+and comment. Run `attachment add`, `attachment publish`, and `attachment render`
+first, then pass the final body and published manifest to the issue command.
 If there are no attachments, omit all attachment flags.
 
 `devctl approval prepare` pre-fills the reviewer from `git config user.name`

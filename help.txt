@@ -51,7 +51,8 @@ AI call recipes:
 AI recipe notes:
   Issue/comment image attachments are disabled.
   Do not use GitHub release assets as an issue image store.
-  --attach-file with an image MIME type or Markdown image attachment fails before remote writes.
+  Inline --attach-file and --upload-attachments are disabled for issue create/comment.
+  Use attachment add/publish/render before the final issue command.
   Images may be published only after devctl attachment publish --backend aliyun-oss records reviewed URLs.
   For non-image files, use a reviewed manifest and an approved URL backend.
   GITHUB_TOKEN or GITEE_TOKEN is required for issue/comment remote writes, depending on platform.
@@ -111,6 +112,7 @@ Core remote-write rule:
   Use --body-file for issue create/comment and git mr.
   Active approval file: .xflow/issues/issue-<id>/approvals/local-review.md
   Issue/comment image attachments are disabled.
+  Inline --attach-file and --upload-attachments are disabled for issue create/comment.
   Push and MR are separate gates: devctl git push --issue <id> only publishes the
   current branch, while devctl git mr only creates the PR/MR after the branch
   already has an upstream and no unpushed commits.

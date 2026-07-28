@@ -23,6 +23,14 @@ class PullRequestResult:
     html_url: str
 
 
+@dataclass(frozen=True)
+class PullRequestIdentity:
+    number: str
+    state: str
+    head: str
+    base: str
+
+
 def split_labels(labels: str | None) -> list[str]:
     return [label.strip() for label in (labels or "").split(",") if label.strip()]
 
@@ -447,6 +455,32 @@ def get_pull_request(repo_root: Path, number: str, env: Mapping[str, str]) -> di
     if not isinstance(response, dict):
         raise ValueError("GitHub pull request response must be a JSON object")
     return response
+
+
+def _pull_request_branch(value: object, field: str) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("ref", "name"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    raise ValueError(f"pull request response missing {field} branch")
+
+
+def normalize_pull_request_identity(item: Mapping[str, object]) -> PullRequestIdentity:
+    number = item.get("number")
+    state = item.get("state")
+    if number is None or not str(number).strip():
+        raise ValueError("pull request response missing number")
+    if not isinstance(state, str) or not state.strip():
+        raise ValueError("pull request response missing state")
+    return PullRequestIdentity(
+        number=str(number).strip(),
+        state=state.strip().lower(),
+        head=_pull_request_branch(item.get("head"), "head"),
+        base=_pull_request_branch(item.get("base"), "base"),
+    )
 
 
 def merge_pull_request(

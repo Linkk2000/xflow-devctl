@@ -21,6 +21,7 @@ sys.path.insert(0, str(OPS_ROOT))
 
 from xflow.checks import check_resolution_report, write_pr_state_update_suggestion
 from xflow import approval as approval_gate
+from xflow import providers as provider_module
 from xflow.commit_message import check_commit_message
 from xflow.dependencies import DependencyCheckResult, check_dependencies
 from xflow.env import load_env_files
@@ -241,7 +242,7 @@ def test_unattended_cli_lifecycle(repo: Path) -> None:
     mismatched = run_devctl(repo, "unattended", "status")
     assert "[WARN]" in mismatched.stdout
     assert "invalid" in mismatched.stdout.lower()
-    assert "Issue mismatch" in mismatched.stdout
+    assert "Issue identity mismatch" in mismatched.stdout
     assert state_path.read_bytes() == state_bytes
 
     state_path.write_text("not-json", encoding="utf-8")
@@ -289,6 +290,25 @@ Repeated human gates interrupt one approved task.
 
 ## Verification Plan
 - python tests/python-core.py
+"""
+
+
+def mr_draft_text(issue: str) -> str:
+    return f"""<!-- xflow: mr-draft -->
+
+Closes #{issue}
+
+## Summary
+- Merge the recorded task pull request.
+
+## Test Plan
+- python tests/python-core.py
+
+## Risk
+- Low.
+
+## Review Request
+- Verify the recorded pull request identity.
 """
 
 
@@ -357,7 +377,7 @@ def test_no_local_review_requires_active_state(parent: Path) -> None:
             str(comment),
             expect=1,
         )
-        assert "current task Issue mismatch" in mismatched.stderr
+        assert "Issue identity mismatch" in mismatched.stderr
         assert len(server.requests) == 2
 
     write(repo / ".xflow" / "current-task.md", current_task_text(issue_id))
@@ -378,6 +398,160 @@ def test_no_local_review_requires_active_state(parent: Path) -> None:
         expect=1,
     )
     assert "issue/comment image attachments are disabled" in attachment_result.stderr
+
+
+def test_inline_attachment_upload_is_rejected_before_gate_and_provider(parent: Path) -> None:
+    no_local_repo = parent / "no-local"
+    init_test_repo(no_local_repo)
+    git(no_local_repo, "remote", "add", "origin", "git@github.com:Linkk2000/paper-demo.git")
+    no_local_body = no_local_repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
+    inline_file = no_local_repo / "notes.txt"
+    write(no_local_body, issue_draft_text("Reject inline attachment publication before authorization."))
+    write(inline_file, "attachment notes\n")
+
+    with RecordingApiServer() as server:
+        env = {
+            "GITHUB_API_BASE": server.base_url,
+            "GITHUB_TOKEN": "github-token",
+            "XFLOW_PLATFORM": "github",
+            "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+        }
+        rejected = run_devctl_with_env(
+            no_local_repo,
+            env,
+            "issue",
+            "create",
+            "No local review",
+            "--body-file",
+            str(no_local_body),
+            "--attach-file",
+            str(inline_file),
+            "--upload-attachments",
+            "github",
+            "--no-local-review",
+            expect=1,
+        )
+        assert "--no-local-review requires active task-scoped unattended mode" in rejected.stderr
+        assert not server.requests
+        assert not (no_local_repo / ".xflow" / "issues" / "issue-draft" / "attachments" / "manifest.json").exists()
+
+    review_repo = parent / "review-required"
+    init_test_repo(review_repo)
+    git(review_repo, "remote", "add", "origin", "git@github.com:Linkk2000/paper-demo.git")
+    review_body = review_repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
+    review_file = review_repo / "notes.txt"
+    write(review_body, issue_draft_text("Reject implicit provider upload before local review."))
+    write(review_file, "attachment notes\n")
+    with RecordingApiServer() as server:
+        env = {
+            "GITHUB_API_BASE": server.base_url,
+            "GITHUB_TOKEN": "github-token",
+            "XFLOW_PLATFORM": "github",
+            "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+        }
+        rejected = run_devctl_with_env(
+            review_repo,
+            env,
+            "issue",
+            "create",
+            "Review required",
+            "--body-file",
+            str(review_body),
+            "--attach-file",
+            str(review_file),
+            expect=1,
+        )
+        assert "inline issue attachments are disabled" in rejected.stderr
+        assert not server.requests
+
+    published_repo = parent / "prepublished"
+    init_test_repo(published_repo)
+    git(published_repo, "remote", "add", "origin", "git@github.com:Linkk2000/paper-demo.git")
+    source_body = published_repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
+    published_file = published_repo / "notes.txt"
+    write(published_file, "published attachment notes\n")
+    run_devctl(published_repo, "attachment", "add", "--issue", "draft", "--file", str(published_file), "--as", "file")
+    write(
+        source_body,
+        issue_draft_text("Publish a pre-reviewed attachment manifest.")
+        + "\n## Attachments\n- [notes.txt](xflow-attachment://att-001)\n",
+    )
+    final_body = published_repo / ".xflow" / "publish" / "issues" / "issue-draft" / "issue.final.md"
+    run_devctl(
+        published_repo,
+        "attachment",
+        "publish",
+        "--issue",
+        "draft",
+        "--backend",
+        "manual",
+        "--url",
+        "att-001=https://public.example/notes.txt",
+        "--body-file",
+        str(source_body),
+        "--output",
+        str(final_body),
+    )
+    published_manifest = published_repo / ".xflow" / "publish" / "issues" / "issue-draft" / "attachments" / "manifest.json"
+    enable(published_repo, "draft", "XFLOW_HUMAN_UNATTENDED_ALL")
+    with RecordingApiServer() as server:
+        env = {
+            "GITHUB_API_BASE": server.base_url,
+            "GITHUB_TOKEN": "github-token",
+            "XFLOW_PLATFORM": "github",
+            "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+        }
+        created = run_devctl_with_env(
+            published_repo,
+            env,
+            "issue",
+            "create",
+            "Prepublished attachment",
+            "--body-file",
+            str(final_body),
+            "--attachments",
+            str(published_manifest),
+            "--no-local-review",
+        )
+        assert "Issue #42 created" in created.stdout
+        assert len([item for item in server.requests if item["method"] == "POST" and item["path"].endswith("/issues")]) == 1
+
+    unpublished_repo = parent / "unpublished"
+    init_test_repo(unpublished_repo)
+    git(unpublished_repo, "remote", "add", "origin", "git@github.com:Linkk2000/paper-demo.git")
+    unpublished_body = unpublished_repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
+    unpublished_file = unpublished_repo / "notes.txt"
+    write(unpublished_file, "unpublished attachment notes\n")
+    run_devctl(unpublished_repo, "attachment", "add", "--issue", "draft", "--file", str(unpublished_file), "--as", "file")
+    write(
+        unpublished_body,
+        issue_draft_text("Reject an unpublished attachment manifest.")
+        + "\n## Attachments\n- [notes.txt](xflow-attachment://att-001)\n",
+    )
+    unpublished_manifest = unpublished_repo / ".xflow" / "issues" / "issue-draft" / "attachments" / "manifest.json"
+    enable(unpublished_repo, "draft", "XFLOW_HUMAN_UNATTENDED_ALL")
+    with RecordingApiServer() as server:
+        env = {
+            "GITHUB_API_BASE": server.base_url,
+            "GITHUB_TOKEN": "github-token",
+            "XFLOW_PLATFORM": "github",
+            "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+        }
+        rejected = run_devctl_with_env(
+            unpublished_repo,
+            env,
+            "issue",
+            "create",
+            "Unpublished attachment",
+            "--body-file",
+            str(unpublished_body),
+            "--attachments",
+            str(unpublished_manifest),
+            "--no-local-review",
+            expect=1,
+        )
+        assert "published" in rejected.stderr.lower() or "placeholder" in rejected.stderr.lower()
+        assert not server.requests
 
 
 def test_remote_gate_matrix(parent: Path) -> None:
@@ -437,6 +611,268 @@ def test_remote_gate_matrix(parent: Path) -> None:
             request_unattended=True,
         ),
     )
+
+
+def test_pr_merge_requires_recorded_and_remote_identity(parent: Path) -> None:
+    repo = parent / "repo"
+    init_test_repo(repo)
+    git(repo, "remote", "add", "origin", "git@github.com:Linkk2000/paper-demo.git")
+    base = git_text(repo, "branch", "--show-current")
+    branch = "feature/IK152D-merge"
+    git(repo, "checkout", "-b", branch, "-q")
+    git(repo, "config", "extensions.worktreeConfig", "true")
+    git(repo, "config", "--worktree", "devctl.issue", "IK152D")
+    git(repo, "config", "--worktree", "devctl.base", base)
+    git(repo, "config", "--worktree", "devctl.pr", "42")
+    write(
+        repo / ".xflow" / "current-task.md",
+        current_task_text("IK152D").replace("G5_APPROVE_MR_CREATE", "S9_REMOTE_REVIEW_AND_CI"),
+    )
+    mr_file = repo / ".xflow" / "issues" / "issue-IK152D" / "mr-draft.md"
+    write(mr_file, mr_draft_text("IK152D"))
+    enable(repo, "IK152D", "XFLOW_HUMAN_UNATTENDED_ALL")
+    env_base = {
+        "GITHUB_TOKEN": "github-token",
+        "XFLOW_PLATFORM": "github",
+        "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+    }
+
+    with RecordingApiServer(
+        pull_request_payload=json.dumps(
+            {
+                "number": 999,
+                "state": "open",
+                "head": {"ref": branch},
+                "base": {"ref": base},
+            }
+        )
+    ) as server:
+        wrong = run_devctl_with_env(
+            repo,
+            {**env_base, "GITHUB_API_BASE": server.base_url},
+            "git",
+            "pr-merge",
+            "999",
+            "--issue",
+            "IK152D",
+            "--file",
+            str(mr_file),
+            expect=1,
+        )
+        assert "recorded PR mismatch: expected 42, got 999" in wrong.stderr
+        assert "[UNATTENDED]" not in wrong.stdout
+        assert not server.requests
+
+    correct_payload = json.dumps(
+        {
+            "number": 42,
+            "state": "open",
+            "head": {"ref": branch},
+            "base": {"ref": base},
+        }
+    )
+    with RecordingApiServer(pull_request_payload=correct_payload) as server:
+        merged = run_devctl_with_env(
+            repo,
+            {**env_base, "GITHUB_API_BASE": server.base_url},
+            "git",
+            "pr-merge",
+            "42",
+            "--issue",
+            "IK152D",
+            "--file",
+            str(mr_file),
+        )
+        assert "PR #42 merged" in merged.stdout
+        assert [item["method"] for item in server.requests] == ["GET", "PUT"]
+
+    invalid_payloads = (
+        ({"number": 41, "state": "open", "head": {"ref": branch}, "base": {"ref": base}}, "number mismatch"),
+        ({"number": 42, "state": "closed", "head": {"ref": branch}, "base": {"ref": base}}, "state mismatch"),
+        ({"number": 42, "state": "open", "head": {"ref": "feature/OTHER"}, "base": {"ref": base}}, "head branch mismatch"),
+        ({"number": 42, "state": "open", "head": {"ref": branch}, "base": {"ref": "other-base"}}, "base branch mismatch"),
+    )
+    for payload, expected in invalid_payloads:
+        with RecordingApiServer(pull_request_payload=json.dumps(payload)) as server:
+            rejected = run_devctl_with_env(
+                repo,
+                {**env_base, "GITHUB_API_BASE": server.base_url},
+                "git",
+                "pr-merge",
+                "42",
+                "--issue",
+                "IK152D",
+                "--file",
+                str(mr_file),
+                expect=1,
+            )
+            assert expected in rejected.stderr
+            assert "[UNATTENDED]" not in rejected.stdout
+            assert [item["method"] for item in server.requests] == ["GET"]
+
+    github = provider_module.normalize_pull_request_identity(
+        {"number": 42, "state": "open", "head": {"ref": branch}, "base": {"ref": base}}
+    )
+    assert (github.number, github.state, github.head, github.base) == ("42", "open", branch, base)
+    gitee = provider_module.normalize_pull_request_identity(
+        {"number": "7", "state": "open", "head": branch, "base": {"ref": base}}
+    )
+    assert (gitee.number, gitee.state, gitee.head, gitee.base) == ("7", "open", branch, base)
+
+
+def test_issue_identity_sources_must_all_match(parent: Path) -> None:
+    push_repo = parent / "push-conflict"
+    init_test_repo(push_repo)
+    base = git_text(push_repo, "branch", "--show-current")
+    git(push_repo, "checkout", "-b", "feature/IK152D-conflict", "-q")
+    git(push_repo, "config", "extensions.worktreeConfig", "true")
+    git(push_repo, "config", "--worktree", "devctl.base", base)
+    enable(push_repo, "IK152D", "XFLOW_HUMAN_UNATTENDED_ALL")
+    git(push_repo, "config", "--worktree", "devctl.issue", "OTHER")
+    write(push_repo / ".xflow" / "current-task.md", current_task_text("IK152D"))
+    walkthrough = push_repo / ".xflow" / "issues" / "issue-IK152D" / "walkthrough.md"
+    write(walkthrough, "# Walkthrough\n\nVerified push evidence.\n")
+    conflicted_push = run_devctl_with_env(
+        push_repo,
+        {"DEVCTL_SKIP_PUSH": "1"},
+        "git",
+        "push",
+        "--issue",
+        "IK152D",
+        "--file",
+        str(walkthrough),
+        expect=1,
+    )
+    assert "Issue identity mismatch" in conflicted_push.stderr
+    assert "branch=OTHER" in conflicted_push.stderr
+    assert "[UNATTENDED]" not in conflicted_push.stdout
+
+    enable_repo = parent / "enable-draft-conflict"
+    init_test_repo(enable_repo)
+    write(enable_repo / ".xflow" / "current-task.md", current_task_text("IK152D"))
+    rejected_enable = run_devctl(
+        enable_repo,
+        "unattended",
+        "enable",
+        "--issue",
+        "draft",
+        "--confirm",
+        "XFLOW_HUMAN_UNATTENDED_ALL",
+        expect=1,
+    )
+    assert "Issue identity mismatch" in rejected_enable.stderr
+    assert load(enable_repo) is None
+
+    draft_repo = parent / "active-draft-conflict"
+    init_test_repo(draft_repo)
+    git(draft_repo, "remote", "add", "origin", "git@github.com:Linkk2000/paper-demo.git")
+    enable(draft_repo, "draft", "XFLOW_HUMAN_UNATTENDED_ALL")
+    write(draft_repo / ".xflow" / "current-task.md", current_task_text("IK152D"))
+    invalid_status = run_devctl(draft_repo, "unattended", "status")
+    assert "[WARN]" in invalid_status.stdout
+    assert "Issue identity mismatch" in invalid_status.stdout
+    draft_body = draft_repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
+    write(draft_body, issue_draft_text("Reject draft state inherited by another current task."))
+    with RecordingApiServer() as server:
+        rejected_create = run_devctl_with_env(
+            draft_repo,
+            {
+                "GITHUB_API_BASE": server.base_url,
+                "GITHUB_TOKEN": "github-token",
+                "XFLOW_PLATFORM": "github",
+                "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+            },
+            "issue",
+            "create",
+            "Draft identity conflict",
+            "--body-file",
+            str(draft_body),
+            "--no-local-review",
+            expect=1,
+        )
+        assert "Issue identity mismatch" in rejected_create.stderr
+        assert "[UNATTENDED]" not in rejected_create.stdout
+        assert not server.requests
+
+
+def test_git_mechanical_checks_run_before_unattended_gate(parent: Path) -> None:
+    push_repo = parent / "push-on-base"
+    init_test_repo(push_repo)
+    base = git_text(push_repo, "branch", "--show-current")
+    git(push_repo, "config", "extensions.worktreeConfig", "true")
+    git(push_repo, "config", "--worktree", "devctl.issue", "IK152D")
+    git(push_repo, "config", "--worktree", "devctl.base", base)
+    write(push_repo / ".xflow" / "current-task.md", current_task_text("IK152D"))
+    walkthrough = push_repo / ".xflow" / "issues" / "issue-IK152D" / "walkthrough.md"
+    write(walkthrough, "# Walkthrough\n\nVerified push evidence.\n")
+    enable(push_repo, "IK152D", "XFLOW_HUMAN_UNATTENDED_ALL")
+    push_result = run_devctl_with_env(
+        push_repo,
+        {"DEVCTL_SKIP_PUSH": "1"},
+        "git",
+        "push",
+        "--issue",
+        "IK152D",
+        "--file",
+        str(walkthrough),
+        expect=1,
+    )
+    assert f"current branch is {base}" in push_result.stderr
+    assert "[UNATTENDED]" not in push_result.stdout
+
+    no_upstream_repo = parent / "mr-no-upstream"
+    init_test_repo(no_upstream_repo)
+    no_upstream_base = git_text(no_upstream_repo, "branch", "--show-current")
+    no_upstream_branch = "feature/IK152D-no-upstream"
+    git(no_upstream_repo, "checkout", "-b", no_upstream_branch, "-q")
+    git(no_upstream_repo, "config", "extensions.worktreeConfig", "true")
+    git(no_upstream_repo, "config", "--worktree", "devctl.issue", "IK152D")
+    git(no_upstream_repo, "config", "--worktree", "devctl.base", no_upstream_base)
+    write(no_upstream_repo / ".xflow" / "current-task.md", current_task_text("IK152D"))
+    no_upstream_mr = no_upstream_repo / ".xflow" / "issues" / "issue-IK152D" / "mr-draft.md"
+    write(no_upstream_mr, mr_draft_text("IK152D"))
+    enable(no_upstream_repo, "IK152D", "XFLOW_HUMAN_UNATTENDED_ALL")
+    no_upstream = run_devctl(
+        no_upstream_repo,
+        "git",
+        "mr",
+        "--issue",
+        "IK152D",
+        "--body-file",
+        str(no_upstream_mr),
+        expect=1,
+    )
+    assert "no upstream" in no_upstream.stderr
+    assert "[UNATTENDED]" not in no_upstream.stdout
+
+    ahead_repo = parent / "mr-ahead"
+    init_test_repo(ahead_repo)
+    ahead_base = git_text(ahead_repo, "branch", "--show-current")
+    ahead_branch = "feature/IK152D-ahead"
+    git(ahead_repo, "checkout", "-b", ahead_branch, "-q")
+    git(ahead_repo, "branch", "--set-upstream-to", ahead_base, ahead_branch)
+    write(ahead_repo / "feature.txt", "unpushed task change\n")
+    git(ahead_repo, "add", "feature.txt")
+    git(ahead_repo, "commit", "-m", "task change", "-q")
+    git(ahead_repo, "config", "extensions.worktreeConfig", "true")
+    git(ahead_repo, "config", "--worktree", "devctl.issue", "IK152D")
+    git(ahead_repo, "config", "--worktree", "devctl.base", ahead_base)
+    write(ahead_repo / ".xflow" / "current-task.md", current_task_text("IK152D"))
+    ahead_mr = ahead_repo / ".xflow" / "issues" / "issue-IK152D" / "mr-draft.md"
+    write(ahead_mr, mr_draft_text("IK152D"))
+    enable(ahead_repo, "IK152D", "XFLOW_HUMAN_UNATTENDED_ALL")
+    ahead = run_devctl(
+        ahead_repo,
+        "git",
+        "mr",
+        "--issue",
+        "IK152D",
+        "--body-file",
+        str(ahead_mr),
+        expect=1,
+    )
+    assert "unpushed commit" in ahead.stderr
+    assert "[UNATTENDED]" not in ahead.stdout
 
 
 def test_draft_state_migrates_only_after_confirmed_issue_creation(parent: Path) -> None:
@@ -1344,6 +1780,7 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "Do not use GitHub release assets as an issue image store" in issue_help
     assert "aliyun-oss" in issue_help
     assert "For non-image files, use a reviewed manifest" in issue_help
+    assert "Inline --attach-file and --upload-attachments are disabled" in issue_help
 
     publish_help = run_devctl(repo, "attachment", "publish", "--help").stdout
     assert "Attachment publishing" in publish_help
@@ -1372,6 +1809,7 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "AI must never satisfy a human gate itself" in help_text
     assert "Only the human reviewer may change Approved: no to Approved: yes" in help_text
     assert "Issue/comment image attachments are disabled" in help_text
+    assert "Inline --attach-file and --upload-attachments are disabled" in help_text
     assert "Do not use GitHub release assets as an issue image store" in help_text
     assert "devctl attachment publish --issue draft --backend aliyun-oss" in help_text
     assert "%USERPROFILE%\\.xflow\\env.local" in help_text
@@ -1412,6 +1850,7 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "AI must never satisfy a human gate" in readme_text
     assert "Only the human reviewer may" in readme_text
     assert "Issue/comment image attachments are disabled" in readme_text
+    assert "Inline `--attach-file` and `--upload-attachments` are disabled" in readme_text
     assert "GitHub release assets" in readme_text
     assert "issue image store" in readme_text
     assert "Aliyun OSS attachment backend" in readme_text
@@ -1446,6 +1885,7 @@ class RecordingApiHandler(BaseHTTPRequestHandler):
     requests: list[dict[str, object]] = []
     release_created: bool = False
     issue_create_payload: str = '{"number":42,"html_url":"https://github.test/issue/42"}'
+    pull_request_payload: str | None = None
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -1490,6 +1930,8 @@ class RecordingApiHandler(BaseHTTPRequestHandler):
             self.send_json('[{"number":"IJZT85","state":"open","title":"Gitee Issue","body":"body","html_url":"https://gitee.test/issue/IJZT85"}]')
         elif parsed.path.endswith("/pulls/7"):
             self.send_json('{"number":"7","state":"open","title":"Gitee PR","html_url":"https://gitee.test/pulls/7"}')
+        elif "/pulls/" in parsed.path and type(self).pull_request_payload is not None:
+            self.send_json(type(self).pull_request_payload)
         else:
             self.send_response(404)
             self.end_headers()
@@ -1569,8 +2011,13 @@ class RecordingApiHandler(BaseHTTPRequestHandler):
 
 
 class RecordingApiServer:
-    def __init__(self, issue_create_payload: str | None = None) -> None:
+    def __init__(
+        self,
+        issue_create_payload: str | None = None,
+        pull_request_payload: str | None = None,
+    ) -> None:
         self.issue_create_payload = issue_create_payload
+        self.pull_request_payload = pull_request_payload
 
     def __enter__(self) -> "RecordingApiServer":
         RecordingApiHandler.requests = []
@@ -1580,6 +2027,7 @@ class RecordingApiServer:
             if self.issue_create_payload is not None
             else '{"number":42,"html_url":"https://github.test/issue/42"}'
         )
+        RecordingApiHandler.pull_request_payload = self.pull_request_payload
         self.server = HTTPServer(("127.0.0.1", 0), RecordingApiHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -1647,7 +2095,11 @@ def main() -> None:
         test_unattended_state_lifecycle(repo / "unattended-state")
         test_unattended_cli_lifecycle(repo / "unattended-cli")
         test_no_local_review_requires_active_state(repo / "unattended-compatibility")
+        test_inline_attachment_upload_is_rejected_before_gate_and_provider(repo / "inline-attachment-gate")
         test_remote_gate_matrix(repo / "unattended-gate-matrix")
+        test_pr_merge_requires_recorded_and_remote_identity(repo / "pr-merge-identity")
+        test_issue_identity_sources_must_all_match(repo / "issue-identity-consistency")
+        test_git_mechanical_checks_run_before_unattended_gate(repo / "gate-ordering")
         test_draft_state_migrates_only_after_confirmed_issue_creation(repo / "unattended-draft-migration")
         test_env_loading_policy(repo)
         test_python_core_rejects_inline_remote_bodies(repo)
@@ -2115,6 +2567,7 @@ resolved: the gap check now exists.
         run_devctl(repo, "check", "local-review", "--issue", "draft", "--file", str(issue_file), expect=1)
         approval.write_text(text.replace("Approved: no", "Approved: yes").replace(digest, digest.upper()), encoding="utf-8")
         run_devctl(repo, "check", "local-review", "--issue", "draft", "--file", str(issue_file))
+        write(current_task, current_task_text("draft"))
         run_devctl(repo, "issue", "create", "Review gate", "--body-file", str(issue_file))
 
         pasted_image = repo / "pasted-image.png"
@@ -2196,6 +2649,7 @@ resolved: the gap check now exists.
 Image evidence is attached locally.
 """,
         )
+        write(current_task, current_task_text("1").replace("G5_APPROVE_MR_CREATE", "S9_REMOTE_REVIEW_AND_CI"))
         run_devctl(repo, "attachment", "add", "--issue", "1", "--file", str(pasted_image), "--as", "image")
         comment_manifest = repo / ".xflow" / "issues" / "issue-1" / "attachments" / "manifest.json"
         comment_result = run_devctl(
@@ -2286,6 +2740,7 @@ Image evidence is attached locally.
         approval_text = approval.read_text(encoding="utf-8")
         approval.write_text(approval_text.replace("Approved: no", "Approved: yes"), encoding="utf-8")
         run_devctl(repo, "check", "local-review", "--issue", "draft", "--file", str(oss_final_body), "--action", "issue-create", "--attachments", str(oss_published_manifest))
+        write(current_task, current_task_text("draft"))
         run_devctl(repo, "issue", "create", "OSS image gate", "--body-file", str(oss_final_body), "--attachments", str(oss_published_manifest))
 
         run_devctl(repo, "issue", "create", "Review required", "--body-file", str(auto_issue_body := issue_file.with_name("plain-issue.md")), expect=1)
@@ -2350,7 +2805,24 @@ Create a plain issue without manual approval when explicitly requested.
             assert "Need unattended plain issue creation." in str(plain_issue_requests[-1]["json"])
             assert not [item for item in plain_server.requests if item["path"].endswith("/releases/77/assets")]
 
-        with RecordingApiServer() as merge_server:
+        disable(repo)
+        write(current_task, current_task_text("1").replace("G5_APPROVE_MR_CREATE", "S9_REMOTE_REVIEW_AND_CI"))
+        merge_base = git_text(repo, "branch", "--show-current")
+        merge_branch = "feature/1-recorded-merge"
+        git(repo, "checkout", "-b", merge_branch, "-q")
+        git(repo, "config", "extensions.worktreeConfig", "true")
+        git(repo, "config", "--worktree", "devctl.issue", "1")
+        git(repo, "config", "--worktree", "devctl.base", merge_base)
+        git(repo, "config", "--worktree", "devctl.pr", "42")
+        merge_identity = json.dumps(
+            {
+                "number": 42,
+                "state": "open",
+                "head": {"ref": merge_branch},
+                "base": {"ref": merge_base},
+            }
+        )
+        with RecordingApiServer(pull_request_payload=merge_identity) as merge_server:
             merge_env = {
                 "GITHUB_API_BASE": merge_server.base_url,
                 "GITHUB_TOKEN": "github-token",
@@ -2390,6 +2862,7 @@ Create a plain issue without manual approval when explicitly requested.
             assert merge_requests[-1]["path"] == "/repos/Linkk2000/paper-demo/pulls/42/merge"
             assert '"merge_method": "squash"' in str(merge_requests[-1]["json"])
 
+        write(current_task, current_task_text("draft"))
         auto_issue_body = repo / ".xflow" / "issues" / "issue-draft" / "auto-issue.md"
         write(
             auto_issue_body,
@@ -2418,6 +2891,10 @@ Fail before remote writes when an issue body includes an image attachment.
         auto_image.write_bytes(b"\x89PNG\r\n\x1a\nauto-github-image")
         auto_file = repo / "notes.txt"
         auto_file.write_text("generic attachment notes\n", encoding="utf-8", newline="\n")
+        git(repo, "config", "--worktree", "devctl.issue", "draft")
+        enable(repo, "draft", "XFLOW_HUMAN_UNATTENDED_ALL")
+        auto_manifest = repo / ".xflow" / "issues" / "issue-draft" / "attachments" / "manifest.json"
+        manifest_before = auto_manifest.read_bytes()
         with RecordingApiServer() as github_server:
             github_env = {
                 "GITHUB_API_BASE": github_server.base_url,
@@ -2442,10 +2919,8 @@ Fail before remote writes when an issue body includes an image attachment.
                 "--no-local-review",
                 expect=1,
             )
-            assert "issue/comment image attachments are disabled" in auto_result.stderr
-            auto_manifest = repo / ".xflow" / "issues" / "issue-draft" / "attachments" / "manifest.json"
-            auto_manifest_data = json.loads(auto_manifest.read_text(encoding="utf-8"))
-            assert any(item["mime"] == "image/png" for item in auto_manifest_data["items"])
+            assert "inline issue attachments are disabled" in auto_result.stderr
+            assert auto_manifest.read_bytes() == manifest_before
             github_issue_requests = [item for item in github_server.requests if item["method"] == "POST" and item["path"].endswith("/issues")]
             assert not github_issue_requests
             upload_requests = [item for item in github_server.requests if item["path"].endswith("/releases/77/assets")]

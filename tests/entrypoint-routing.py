@@ -382,8 +382,12 @@ Closes #1
         git(repo, "add", ".")
         git(repo, "commit", "-m", "test: add routing task artifacts", "-q")
 
+        git(repo, "config", "--local", "devctl.issue", "draft")
+        write(current_task, current_task.read_text(encoding="utf-8").replace("Issue: 1", "Issue: draft"))
         issue_result = run_devctl(repo, "issue", "create", "Python routing", "--body-file", str(issue_file))
         assert "issue-create gate passed; provider skipped" in issue_result.stdout
+        git(repo, "config", "--local", "devctl.issue", "1")
+        write(current_task, current_task.read_text(encoding="utf-8").replace("Issue: draft", "Issue: 1"))
 
         approval(repo, "1", "git-push", walkthrough)
         push_result = run_devctl(repo, "git", "push", "--issue", "1", "--file", str(walkthrough))
