@@ -242,8 +242,8 @@ def test_unattended_cli_lifecycle(repo: Path) -> None:
     mismatched = run_devctl(repo, "unattended", "status")
     assert "[WARN]" in mismatched.stdout
     assert "invalid" in mismatched.stdout.lower()
-    assert "Issue identity mismatch" in mismatched.stdout
-    assert state_path.read_bytes() == state_bytes
+    assert "current task Issue mismatch" in mismatched.stdout
+    assert not state_path.exists()
 
     state_path.write_text("not-json", encoding="utf-8")
     invalid = run_devctl(repo, "unattended", "status")
@@ -254,6 +254,17 @@ def test_unattended_cli_lifecycle(repo: Path) -> None:
     disabled = run_devctl(repo, "unattended", "disable")
     assert "disabled" in disabled.stdout.lower()
     run_devctl(repo, "unattended", "disable")
+
+
+def test_completed_task_invalidates_unattended_state(repo: Path) -> None:
+    init_test_repo(repo)
+    enable(repo, "IK152D", "XFLOW_HUMAN_UNATTENDED_ALL")
+    write(
+        repo / ".xflow" / "current-task.md",
+        current_task_text("IK152D").replace("G5_APPROVE_MR_CREATE", "S10_DONE"),
+    )
+    assert_value_error("current task is completed", lambda: require_active(repo, "IK152D"))
+    assert load(repo) is None
 
 
 def current_task_text(issue: str) -> str:
@@ -381,6 +392,7 @@ def test_no_local_review_requires_active_state(parent: Path) -> None:
         assert len(server.requests) == 2
 
     write(repo / ".xflow" / "current-task.md", current_task_text(issue_id))
+    enable(repo, issue_id, "XFLOW_HUMAN_UNATTENDED_ALL")
     image = repo / "evidence.png"
     image.write_bytes(b"\x89PNG\r\n\x1a\nunattended-attachment")
     run_devctl(repo, "attachment", "add", "--issue", issue_id, "--file", str(image), "--as", "image")
@@ -398,6 +410,35 @@ def test_no_local_review_requires_active_state(parent: Path) -> None:
         expect=1,
     )
     assert "issue/comment image attachments are disabled" in attachment_result.stderr
+
+
+def test_successful_issue_close_invalidates_unattended_state(parent: Path) -> None:
+    repo = parent / "repo"
+    init_test_repo(repo)
+    issue_id = "IJZT85"
+    git(repo, "remote", "add", "origin", "git@gitee.com:Linkk2000/paper-demo.git")
+    write(repo / ".xflow" / "current-task.md", current_task_text(issue_id))
+    walkthrough = repo / ".xflow" / "issues" / f"issue-{issue_id}" / "walkthrough.md"
+    write(walkthrough, "# Walkthrough\n\nVerified completion evidence.\n")
+    enable(repo, issue_id, "XFLOW_HUMAN_UNATTENDED_ALL")
+
+    with RecordingApiServer() as server:
+        closed = run_devctl_with_env(
+            repo,
+            {
+                "GITEE_API_BASE": server.base_url,
+                "GITEE_TOKEN": "gitee-token",
+                "XFLOW_PLATFORM": "gitee",
+                "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+                "DEVCTL_APPROVED_FILE": str(walkthrough),
+            },
+            "issue",
+            "close",
+            issue_id,
+        )
+        assert f"Issue #{issue_id} closed" in closed.stdout
+        assert [item["method"] for item in server.requests] == ["PATCH"]
+    assert load(repo) is None
 
 
 def test_inline_attachment_upload_is_rejected_before_gate_and_provider(parent: Path) -> None:
@@ -770,7 +811,8 @@ def test_issue_identity_sources_must_all_match(parent: Path) -> None:
     write(draft_repo / ".xflow" / "current-task.md", current_task_text("IK152D"))
     invalid_status = run_devctl(draft_repo, "unattended", "status")
     assert "[WARN]" in invalid_status.stdout
-    assert "Issue identity mismatch" in invalid_status.stdout
+    assert "current task Issue mismatch" in invalid_status.stdout
+    assert load(draft_repo) is None
     draft_body = draft_repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
     write(draft_body, issue_draft_text("Reject draft state inherited by another current task."))
     with RecordingApiServer() as server:
@@ -1148,6 +1190,25 @@ def test_dependency_parser(repo: Path) -> None:
         (base.replace("rationale: 属性编辑可继续，最终验证依赖统一端点能力。", "rationale: [invalid]"), "rationale must be a string"),
         (base.replace("status: integrated", "status: discovered"), "invalid dependency #IK17AW status"),
         (base.replace("      branch: fix/IK17AW-canonical-endpoints", "      branch: [invalid]"), "delivery.branch must be a string"),
+        (
+            base.replace("status: integrated", "status: active").replace(
+                "      branch: fix/IK17AW-canonical-endpoints", "      branch: [invalid]"
+            ),
+            "delivery.branch must be a string",
+        ),
+        (
+            base.replace("status: integrated", "status: active").replace(
+                """    integration:
+      commit: def5678
+      verifiedBy:
+        - C-004
+      evidence:
+        - evidence/logs/c-004-integration-tests.txt
+""",
+                "    integration: [invalid]\n",
+            ),
+            "integration must be a mapping",
+        ),
         (base.replace("        - C-004", "        - false"), "integration.verifiedBy items must be strings"),
         (base.replace("      rationale: 相关验收已在主功能分支重新验证。", "      rationale: {invalid: true}"), "closureAssessment.rationale must be a string"),
         (base.replace("status: integrated", "status: available").replace("      commit: abc1234", "      commit: ''"), "delivery.commit"),
@@ -1185,6 +1246,12 @@ dependencies:
         invalid_root,
         "IK152D",
         available_external.replace("    provider: ''", "    provider: true"),
+        "provider must be a string",
+    )
+    assert_dependency_error(
+        invalid_root,
+        "IK152D",
+        available_external.replace("status: available", "status: active").replace("    provider: ''", "    provider: true"),
         "provider must be a string",
     )
 
@@ -1438,7 +1505,9 @@ def test_commit_message_validator() -> None:
         (gitee + "OpenAI-Codex\n", "AI-client trailer"),
         (gitee + "- 证据位于 C:\\temp\\evidence.txt\n", "absolute Windows path"),
         (gitee + "- 证据位于 /home/user/evidence.txt\n", "local absolute path"),
+        (gitee + "- 证据位于 `/workspace/repo/evidence.txt`\n", "local absolute path"),
         (gitee + "- 证据位于 \\\\server\\share\\evidence.txt\n", "local absolute path"),
+        (gitee + "- 证据位于（`\\\\server\\share\\evidence.txt`）\n", "local absolute path"),
         (gitee + "- 证据位于 \\\\.\\PhysicalDrive0\n", "local absolute path"),
         (gitee + "GitHub-PR: 42\n", "provider-only metadata"),
     )
@@ -1447,6 +1516,9 @@ def test_commit_message_validator() -> None:
     assert_commit_message_error(gitee, "first Issue", branch_issue="IK17AW")
     assert_commit_message_error(gitee.replace("[#IK152D]", "[#..]"), "Issue identifier")
     assert_commit_message_error(merge.replace("[#IK17AW]", "[#IK152D]"), "distinct")
+    check_commit_message(
+        gitee + "- 远端验证证据链接已经发布并可供人工复核：https://example.test/workspace/evidence.txt\n"
+    )
 
 
 def test_commit_message_cli(repo: Path) -> None:
@@ -1605,12 +1677,18 @@ def test_python_core_git_and_app_commands(parent: Path) -> None:
     git(work, "config", "user.email", "test@example.com")
     git(work, "config", "user.name", "Test User")
     git(work, "checkout", "main", "-q")
+    write(
+        work / ".git" / "info" / "exclude",
+        ".xflow/local/\n.xflow/issues/**/approvals/\n",
+    )
 
     status = run_devctl(work, "git", "status").stdout
     assert "branch:  main" in status
     assert "worktree: clean" in status
 
+    enable(work, "8", "XFLOW_HUMAN_UNATTENDED_ALL")
     run_devctl(work, "git", "start", "wsl-free", "--issue", "9", "--base", "main")
+    assert load(work) is None
     assert git_text(work, "branch", "--show-current") == "feat/9-wsl-free"
 
     status = run_devctl(work, "git", "status").stdout
@@ -1646,10 +1724,6 @@ def test_python_core_git_and_app_commands(parent: Path) -> None:
     assert "chore(feature.txt): 更新 feature.txt[#9]" in committed_message
     check_commit_message(committed_message, branch_issue="9")
 
-    write(
-        work / ".git" / "info" / "exclude",
-        ".xflow/local/\n.xflow/issues/**/approvals/\n",
-    )
     cleanup_evidence = work / ".xflow" / "issues" / "issue-9" / "resolution-report.md"
     write(cleanup_evidence, "# Resolution Report\n\nCleanup reviewed by the human.\n")
     git(work, "add", str(cleanup_evidence.relative_to(work)))
@@ -1781,6 +1855,35 @@ def test_git_done_requires_exact_human_cleanup_approval(parent: Path) -> None:
     assert git_text(work, "branch", "--show-current") == "main"
     assert "feat/8-safe-cleanup" not in git_text(work, "branch", "--format=%(refname:short)")
     assert load(work) is None
+
+    run_devctl(work, "git", "start", "unmerged-cleanup", "--issue", "9", "--base", "main")
+    unmerged_evidence = work / ".xflow" / "issues" / "issue-9" / "resolution-report.md"
+    write(unmerged_evidence, "# Resolution Report\n\nUnmerged cleanup evidence.\n")
+    write(work / "unmerged.txt", "unmerged task work\n")
+    git(work, "add", ".xflow/issues/issue-9/resolution-report.md", "unmerged.txt")
+    git(work, "commit", "-m", "unmerged cleanup fixture", "-q")
+    enable(work, "9", "XFLOW_HUMAN_UNATTENDED_ALL")
+    unmerged_review = approval_gate.prepare(work, "9", "git-cleanup", unmerged_evidence)
+    unmerged_review.write_text(
+        unmerged_review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"),
+        encoding="utf-8",
+        newline="\n",
+    )
+    rejected_unmerged = run_devctl(
+        work,
+        "git",
+        "done",
+        "--base",
+        "main",
+        "--issue",
+        "9",
+        "--file",
+        str(unmerged_evidence),
+        expect=1,
+    )
+    assert "branch -d" in rejected_unmerged.stderr
+    assert "feat/9-unmerged-cleanup" in git_text(work, "branch", "--format=%(refname:short)")
+    assert require_active(work, "9").issue == "9"
 
 
 def test_git_task_metadata_is_scoped_to_each_worktree(parent: Path) -> None:
@@ -2297,7 +2400,9 @@ def main() -> None:
         git(repo, "remote", "add", "origin", "git@gitee.com:Linkk2000/paper-demo.git")
         test_unattended_state_lifecycle(repo / "unattended-state")
         test_unattended_cli_lifecycle(repo / "unattended-cli")
+        test_completed_task_invalidates_unattended_state(repo / "unattended-completed-task")
         test_no_local_review_requires_active_state(repo / "unattended-compatibility")
+        test_successful_issue_close_invalidates_unattended_state(repo / "unattended-issue-close")
         test_inline_attachment_upload_is_rejected_before_gate_and_provider(repo / "inline-attachment-gate")
         test_remote_gate_matrix(repo / "unattended-gate-matrix")
         test_pr_merge_requires_recorded_and_remote_identity(repo / "pr-merge-identity")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 from dataclasses import asdict, dataclass, replace
@@ -16,6 +17,7 @@ CONFIRMATION = "XFLOW_HUMAN_UNATTENDED_ALL"
 STATE_VERSION = 1
 STATE_MODE = "task-unattended"
 STATE_FIELDS = {"version", "mode", "repository", "worktree", "issue", "enabledAt"}
+CURRENT_TASK_FIELD_RE = re.compile(r"(?im)^\s*(Issue|State)\s*:\s*(.+?)\s*$")
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,17 @@ def _bindings(repo_root: Path) -> tuple[str, str]:
     common_dir = _git_path(repo_root, "--git-common-dir")
     worktree = _git_path(repo_root, "--show-toplevel")
     return _fingerprint("repository", common_dir), _fingerprint("worktree", worktree)
+
+
+def _current_task_binding(repo_root: Path) -> tuple[str, str] | None:
+    path = repo_root.resolve() / ".xflow" / "current-task.md"
+    if not path.is_file():
+        return None
+    text = path.read_text(encoding="utf-8-sig", errors="strict")
+    fields = {match.group(1).lower(): match.group(2).strip() for match in CURRENT_TASK_FIELD_RE.finditer(text)}
+    issue = fields.get("issue", "")
+    state = fields.get("state", "")
+    return issue, state
 
 
 def _validate_timestamp(value: str) -> None:
@@ -157,6 +170,18 @@ def load(repo_root: Path) -> UnattendedState | None:
         raise ValueError("unattended state repository mismatch")
     if state.worktree != worktree:
         raise ValueError("unattended state worktree mismatch")
+    task_binding = _current_task_binding(repo_root)
+    if task_binding is not None:
+        task_issue, task_state = task_binding
+        if task_state == "S10_DONE":
+            disable(repo_root)
+            raise ValueError("unattended state invalidated because the current task is completed")
+        if task_issue and normalized_issue(task_issue) != state.issue:
+            disable(repo_root)
+            raise ValueError(
+                "unattended state invalidated by current task Issue mismatch: "
+                f"expected {state.issue}, found {normalized_issue(task_issue)}"
+            )
     return state
 
 

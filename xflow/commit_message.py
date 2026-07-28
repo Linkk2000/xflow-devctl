@@ -29,8 +29,9 @@ ISSUE_TAG_RE = re.compile(rf"\[#({ISSUE_ID_PATTERN})\]")
 HAN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 LATIN_TOKEN_RE = re.compile(r"[A-Za-z]+")
 WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])[A-Z]:[\\/][^\s]+")
-POSIX_ABSOLUTE_PATH_RE = re.compile(r"(?<!\S)/(?:home|Users|root|tmp|var|etc|opt|mnt)/\S+")
-UNC_OR_DEVICE_PATH_RE = re.compile(r"(?<!\S)\\\\\S+")
+URL_RE = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s<>()]+")
+POSIX_ABSOLUTE_PATH_RE = re.compile(r"(?<![:/])/(?!/)[^\s`'\"<>]+")
+UNC_OR_DEVICE_PATH_RE = re.compile(r"\\\\(?:[.?]\\|[^\\\s]+\\)[^\s`'\"<>]+")
 AI_TRAILER_RE = re.compile(
     r"(?im)(?:^Co-authored-by:\s*(?:Cursor|Claude|Gemini)\b|^Generated-by:|OpenAI-Codex)"
 )
@@ -49,10 +50,11 @@ def check_commit_message(
 ) -> tuple[str, ...]:
     if AI_TRAILER_RE.search(message):
         raise ValueError("commit message must not contain an AI-client trailer")
+    path_scan = URL_RE.sub("", message)
     if (
-        WINDOWS_ABSOLUTE_PATH_RE.search(message)
-        or POSIX_ABSOLUTE_PATH_RE.search(message)
-        or UNC_OR_DEVICE_PATH_RE.search(message)
+        WINDOWS_ABSOLUTE_PATH_RE.search(path_scan)
+        or POSIX_ABSOLUTE_PATH_RE.search(path_scan)
+        or UNC_OR_DEVICE_PATH_RE.search(path_scan)
     ):
         raise ValueError("commit message must not contain a local absolute path (absolute Windows path included)")
     if PROVIDER_METADATA_RE.search(message):

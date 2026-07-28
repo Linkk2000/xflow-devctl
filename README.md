@@ -67,9 +67,10 @@ The state lives only at `.xflow/local/unattended.json` and stores no safety
 word or token. It is bound to the Git common directory, current worktree, and
 task Issue. Repository, worktree, Issue, branch metadata, or current-task
 mismatch is invalid and fails closed without rewriting the state. Draft state
-migrates only after the provider returns a definite Issue ID. Task switch,
+migrates only after the provider returns a definite Issue ID. A current-task
+Issue mismatch, `S10_DONE`, successful Issue close, successful task start,
 successful human-approved `devctl git done`, or `devctl unattended disable`
-invalidates it.
+invalidates it permanently.
 
 The mode bypasses only the local human approval file. Current-task, draft,
 dependency, evidence, attachment, sensitive-data, provider, platform, test,

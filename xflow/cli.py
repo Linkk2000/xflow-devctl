@@ -485,6 +485,7 @@ def run_issue(args: argparse.Namespace) -> int:
             print("[INFO] issue-close gate passed; provider skipped")
             return 0
         result = providers.close_issue(ctx.repo_root, issue_id, os.environ)
+        unattended.disable(ctx.repo_root)
         print(f"[INFO] Issue #{result.get('number', issue_id)} closed")
         return 0
     if args.issue_command != "create":
@@ -853,6 +854,7 @@ def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     if args.issue:
         set_branch_meta(ctx.repo_root, "issue", args.issue)
     set_branch_meta(ctx.repo_root, "base", base)
+    unattended.disable(ctx.repo_root)
     print("[INFO] ready")
     return 0
 

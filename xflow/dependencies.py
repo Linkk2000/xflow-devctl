@@ -124,9 +124,22 @@ def _validate_delivery(entry: dict[str, Any], dependency: str) -> None:
         _non_empty(delivery.get(field), f"dependency #{dependency} delivery.{field}")
 
 
+def _validate_delivery_shape(entry: dict[str, Any], dependency: str) -> None:
+    delivery = _mapping(entry.get("delivery"), f"dependency #{dependency} delivery")
+    for field in ("branch", "commit", "mergeRequest"):
+        if field in delivery:
+            _non_empty(delivery[field], f"dependency #{dependency} delivery.{field}")
+
+
 def _validate_external_availability(entry: dict[str, Any], dependency: str) -> None:
     for field in ("provider", "availableVersion", "verificationEntry"):
         _non_empty(entry.get(field), f"dependency #{dependency} {field}")
+
+
+def _validate_external_shape(entry: dict[str, Any], dependency: str) -> None:
+    for field in ("provider", "availableVersion", "verificationEntry"):
+        if field in entry:
+            _non_empty(entry[field], f"dependency #{dependency} {field}")
 
 
 def _validate_integration(entry: dict[str, Any], dependency: str, issue_directory: Path) -> None:
@@ -154,6 +167,15 @@ def _validate_integration(entry: dict[str, Any], dependency: str, issue_director
         raise ValueError(
             f"dependency #{dependency} integration evidence must be fresh parent-side evidence, not a dependency resolution-report"
         )
+
+
+def _validate_integration_shape(entry: dict[str, Any], dependency: str) -> None:
+    integration = _mapping(entry.get("integration"), f"dependency #{dependency} integration")
+    if "commit" in integration:
+        _non_empty(integration["commit"], f"dependency #{dependency} integration.commit")
+    for field in ("verifiedBy", "evidence"):
+        if field in integration:
+            _non_empty_list(integration[field], f"dependency #{dependency} integration.{field}")
 
 
 def check_dependencies(
@@ -191,9 +213,13 @@ def check_dependencies(
         if "integrationTarget" in entry:
             _non_empty(entry["integrationTarget"], f"dependency #{dependency} integrationTarget")
         if "delivery" in entry:
-            _mapping(entry["delivery"], f"dependency #{dependency} delivery")
+            _validate_delivery_shape(entry, dependency)
             if dependency_type == "external":
                 raise ValueError(f"external dependency #{dependency} must not declare delivery")
+        if "integration" in entry:
+            _validate_integration_shape(entry, dependency)
+        if dependency_type == "external":
+            _validate_external_shape(entry, dependency)
         _non_empty_list(entry.get("requiredFor"), f"dependency #{dependency} requiredFor")
         status = _enum(entry.get("status"), DEPENDENCY_STATUSES, f"dependency #{dependency} status")
         _enum(

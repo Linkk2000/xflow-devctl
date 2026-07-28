@@ -20,8 +20,9 @@ AI call recipes:
   State is stored only in .xflow/local/unattended.json without the safety word
   or tokens. It is bound to the Git common directory, worktree, and current
   task Issue. Mismatch is invalid and fails closed without state repair. Draft
-  migrates only after a provider returns a definite Issue ID. Task switch,
-  successful human-approved devctl git done, or unattended disable invalidates the state.
+  migrates only after a provider returns a definite Issue ID. A current-task
+  Issue mismatch, S10_DONE, successful Issue close, successful task start,
+  successful human-approved git done, or unattended disable invalidates it permanently.
 
   Unattended mode bypasses only the local human approval file. Current-task,
   draft, dependency, evidence, attachment, sensitive-data, provider, platform,
