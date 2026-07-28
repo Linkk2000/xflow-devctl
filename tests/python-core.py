@@ -266,6 +266,22 @@ def test_completed_task_invalidates_unattended_state(repo: Path) -> None:
     assert_value_error("current task is completed", lambda: require_active(repo, "IK152D"))
     assert load(repo) is None
 
+    enable(repo, "IK152D", "XFLOW_HUMAN_UNATTENDED_ALL")
+    write(
+        repo / ".xflow" / "current-task.md",
+        current_task_text("IK152D").replace("Issue: IK152D\n", ""),
+    )
+    assert_value_error("current task Issue is missing", lambda: require_active(repo, "IK152D"))
+    assert load(repo) is None
+
+    enable(repo, "IK152D", "XFLOW_HUMAN_UNATTENDED_ALL")
+    write(
+        repo / ".xflow" / "current-task.md",
+        current_task_text("IK152D").replace("Issue: IK152D", "Issue: ../invalid"),
+    )
+    assert_value_error("current task Issue is invalid", lambda: require_active(repo, "IK152D"))
+    assert load(repo) is None
+
 
 def current_task_text(issue: str) -> str:
     return f"""# XFlow Current Task
@@ -1506,6 +1522,8 @@ def test_commit_message_validator() -> None:
         (gitee + "- 证据位于 C:\\temp\\evidence.txt\n", "absolute Windows path"),
         (gitee + "- 证据位于 /home/user/evidence.txt\n", "local absolute path"),
         (gitee + "- 证据位于 `/workspace/repo/evidence.txt`\n", "local absolute path"),
+        (gitee + "- 证据位于 `file:///etc/passwd`\n", "local absolute path"),
+        (gitee + "- 证据位于根目录 `/`\n", "local absolute path"),
         (gitee + "- 证据位于 \\\\server\\share\\evidence.txt\n", "local absolute path"),
         (gitee + "- 证据位于（`\\\\server\\share\\evidence.txt`）\n", "local absolute path"),
         (gitee + "- 证据位于 \\\\.\\PhysicalDrive0\n", "local absolute path"),
@@ -1519,6 +1537,7 @@ def test_commit_message_validator() -> None:
     check_commit_message(
         gitee + "- 远端验证证据链接已经发布并可供人工复核：https://example.test/workspace/evidence.txt\n"
     )
+    check_commit_message(gitee + "- 前端/后端均已完成中文验证并保留人工可见证据\n")
 
 
 def test_commit_message_cli(repo: Path) -> None:

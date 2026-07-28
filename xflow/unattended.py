@@ -176,11 +176,19 @@ def load(repo_root: Path) -> UnattendedState | None:
         if task_state == "S10_DONE":
             disable(repo_root)
             raise ValueError("unattended state invalidated because the current task is completed")
-        if task_issue and normalized_issue(task_issue) != state.issue:
+        if not task_issue:
+            disable(repo_root)
+            raise ValueError("unattended state invalidated because the current task Issue is missing")
+        try:
+            normalized_task_issue = normalized_issue(task_issue)
+        except ValueError as exc:
+            disable(repo_root)
+            raise ValueError(f"unattended state invalidated because the current task Issue is invalid: {exc}") from exc
+        if normalized_task_issue != state.issue:
             disable(repo_root)
             raise ValueError(
                 "unattended state invalidated by current task Issue mismatch: "
-                f"expected {state.issue}, found {normalized_issue(task_issue)}"
+                f"expected {state.issue}, found {normalized_task_issue}"
             )
     return state
 
