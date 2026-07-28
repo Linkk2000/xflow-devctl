@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import approval, attachment, providers, rules
+from . import approval, attachment, providers, rules, unattended
 from .checks import (
     check_current_task,
     check_gap_analysis,
@@ -141,6 +141,14 @@ def build_parser() -> argparse.ArgumentParser:
     commit_message = check_sub.add_parser("commit-msg")
     commit_message.add_argument("--file", required=True, type=Path)
     commit_message.add_argument("--issue")
+
+    unattended_parser = sub.add_parser("unattended")
+    unattended_sub = unattended_parser.add_subparsers(dest="unattended_command")
+    unattended_enable = unattended_sub.add_parser("enable")
+    unattended_enable.add_argument("--issue", required=True)
+    unattended_enable.add_argument("--confirm", required=True)
+    unattended_sub.add_parser("status")
+    unattended_sub.add_parser("disable")
 
     issue = sub.add_parser("issue")
     issue_sub = issue.add_subparsers(dest="issue_command")
@@ -976,6 +984,31 @@ def run_approval(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_unattended(args: argparse.Namespace) -> int:
+    ctx = context()
+    if args.unattended_command == "enable":
+        state = unattended.enable(ctx.repo_root, args.issue, args.confirm)
+        print(f"[INFO] task-scoped unattended mode enabled for current task {state.issue}")
+        return 0
+    if args.unattended_command == "status":
+        try:
+            state = unattended.load(ctx.repo_root)
+        except ValueError as exc:
+            print(f"[WARN] unattended mode invalid: {exc}")
+            return 0
+        if state is None:
+            print("[INFO] task-scoped unattended mode inactive")
+        else:
+            print(f"[INFO] task-scoped unattended mode active for current task {state.issue}")
+        return 0
+    if args.unattended_command == "disable":
+        removed = unattended.disable(ctx.repo_root)
+        status = "disabled" if removed else "already inactive"
+        print(f"[INFO] task-scoped unattended mode {status}")
+        return 0
+    raise ValueError(f"unknown unattended subcommand: {args.unattended_command}")
+
+
 def attachment_manifest_path(repo_root: Path, issue: str, manifest: Path | None) -> Path:
     return manifest or attachment.default_manifest(repo_root, issue)
 
@@ -1074,6 +1107,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_git(args)
         if args.command == "approval":
             return run_approval(args)
+        if args.command == "unattended":
+            return run_unattended(args)
         if args.command == "attachment":
             return run_attachment(args)
         if args.command == "rules":

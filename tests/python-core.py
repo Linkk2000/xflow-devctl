@@ -32,6 +32,7 @@ from xflow.providers import (
 )
 from xflow.paths import default_approval_file, default_issue_file, issue_dir
 from xflow.cli import branch_name_from_slug, commit_and_push_pr_backfill, summarize_commit_message
+from xflow.unattended import disable, enable, load, migrate_issue, require_active
 
 
 def run_devctl(repo_root: Path, *args: str, expect: int = 0) -> subprocess.CompletedProcess[str]:
@@ -104,6 +105,141 @@ def git_text(repo_root: Path, *args: str) -> str:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     ).stdout.strip()
+
+
+def init_test_repo(repo: Path) -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test User")
+    write(repo / "README.md", "# Demo\n")
+    git(repo, "add", "README.md")
+    git(repo, "commit", "-m", "init", "-q")
+
+
+def assert_value_error(expected: str, action: object) -> None:
+    try:
+        action()
+    except ValueError as exc:
+        assert expected in str(exc), (expected, str(exc))
+    else:
+        raise AssertionError(f"expected ValueError containing {expected!r}")
+
+
+def test_unattended_state_lifecycle(parent: Path) -> None:
+    repo = parent / "repo"
+    other_repo = parent / "other-repo"
+    sibling = parent / "sibling"
+    init_test_repo(repo)
+    init_test_repo(other_repo)
+
+    assert load(repo) is None
+    assert disable(repo) is False
+
+    invalid_confirmations = (
+        "xflow_human_unattended_all",
+        " XFLOW_HUMAN_UNATTENDED_ALL",
+        "XFLOW_HUMAN_UNATTENDED_ALL ",
+        "XFLOW_HUMAN_UNATTENDED_AL",
+        "XFLOW_HUMAN_UNATTENDED_ALL!",
+    )
+    for confirmation in invalid_confirmations:
+        assert_value_error("confirmation", lambda value=confirmation: enable(repo, "IK152D", value))
+        assert load(repo) is None
+
+    state = enable(repo, "#IK152D", "XFLOW_HUMAN_UNATTENDED_ALL")
+    state_path = repo / ".xflow" / "local" / "unattended.json"
+    raw = state_path.read_text(encoding="utf-8")
+    payload = json.loads(raw)
+    assert state.issue == "IK152D"
+    assert require_active(repo, "IK152D") == state
+    assert payload["version"] == 1
+    assert payload["mode"] == "task-unattended"
+    assert set(payload) == {"version", "mode", "repository", "worktree", "issue", "enabledAt"}
+    assert "XFLOW_HUMAN_UNATTENDED_ALL" not in raw
+    assert "confirm" not in raw.lower()
+
+    original = state_path.read_bytes()
+    assert_value_error("Issue mismatch", lambda: require_active(repo, "IK152E"))
+    assert state_path.read_bytes() == original
+
+    copied = other_repo / ".xflow" / "local" / "unattended.json"
+    copied.parent.mkdir(parents=True, exist_ok=True)
+    copied.write_bytes(original)
+    assert_value_error("repository mismatch", lambda: require_active(other_repo, "IK152D"))
+    assert copied.read_bytes() == original
+
+    git(repo, "worktree", "add", "-b", "feature/sibling", str(sibling), "HEAD")
+    sibling_state = sibling / ".xflow" / "local" / "unattended.json"
+    sibling_state.parent.mkdir(parents=True, exist_ok=True)
+    sibling_state.write_bytes(original)
+    assert_value_error("worktree mismatch", lambda: require_active(sibling, "IK152D"))
+    assert sibling_state.read_bytes() == original
+
+    state_path.write_bytes(b"\xef\xbb\xbf" + original)
+    assert require_active(repo, "IK152D").issue == "IK152D"
+    assert state_path.read_bytes().startswith(b"\xef\xbb\xbf")
+
+    state_path.write_text("{broken", encoding="utf-8")
+    assert_value_error("invalid unattended state", lambda: load(repo))
+    assert state_path.read_text(encoding="utf-8") == "{broken"
+
+    state_path.write_text(json.dumps({**payload, "version": "1"}), encoding="utf-8")
+    assert_value_error("invalid unattended state", lambda: load(repo))
+
+    enable(repo, "draft", "XFLOW_HUMAN_UNATTENDED_ALL")
+    migrated = migrate_issue(repo, "draft", "42")
+    assert migrated.issue == "42"
+    assert require_active(repo, "42").issue == "42"
+    assert_value_error("Issue mismatch", lambda: require_active(repo, "draft"))
+    assert not list(state_path.parent.glob("unattended.json.*.tmp"))
+
+    assert disable(repo) is True
+    assert disable(repo) is False
+    assert load(repo) is None
+
+
+def test_unattended_cli_lifecycle(repo: Path) -> None:
+    init_test_repo(repo)
+    inactive = run_devctl(repo, "unattended", "status")
+    assert "inactive" in inactive.stdout.lower()
+
+    rejected = run_devctl(
+        repo,
+        "unattended",
+        "enable",
+        "--issue",
+        "IK152D",
+        "--confirm",
+        "xflow_human_unattended_all",
+        expect=1,
+    )
+    assert "confirmation" in rejected.stderr.lower()
+
+    enabled = run_devctl(
+        repo,
+        "unattended",
+        "enable",
+        "--issue",
+        "IK152D",
+        "--confirm",
+        "XFLOW_HUMAN_UNATTENDED_ALL",
+    )
+    assert "enabled" in enabled.stdout.lower()
+    active = run_devctl(repo, "unattended", "status")
+    assert "active" in active.stdout.lower()
+    assert "IK152D" in active.stdout
+
+    state_path = repo / ".xflow" / "local" / "unattended.json"
+    state_path.write_text("not-json", encoding="utf-8")
+    invalid = run_devctl(repo, "unattended", "status")
+    assert "[WARN]" in invalid.stdout
+    assert "invalid" in invalid.stdout.lower()
+    assert state_path.read_text(encoding="utf-8") == "not-json"
+
+    disabled = run_devctl(repo, "unattended", "disable")
+    assert "disabled" in disabled.stdout.lower()
+    run_devctl(repo, "unattended", "disable")
 
 
 def test_env_loading_policy(repo: Path) -> None:
@@ -1198,6 +1334,8 @@ def main() -> None:
         git(repo, "config", "user.email", "test@example.com")
         git(repo, "config", "user.name", "Test User")
         git(repo, "remote", "add", "origin", "git@gitee.com:Linkk2000/paper-demo.git")
+        test_unattended_state_lifecycle(repo / "unattended-state")
+        test_unattended_cli_lifecycle(repo / "unattended-cli")
         test_env_loading_policy(repo)
         test_python_core_rejects_inline_remote_bodies(repo)
         test_issue_identifiers_are_portable(repo)

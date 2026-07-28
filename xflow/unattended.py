@@ -1,0 +1,186 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import tempfile
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .paths import normalized_issue
+
+
+CONFIRMATION = "XFLOW_HUMAN_UNATTENDED_ALL"
+STATE_VERSION = 1
+STATE_MODE = "task-unattended"
+STATE_FIELDS = {"version", "mode", "repository", "worktree", "issue", "enabledAt"}
+
+
+@dataclass(frozen=True)
+class UnattendedState:
+    version: int
+    mode: str
+    repository: str
+    worktree: str
+    issue: str
+    enabledAt: str
+
+
+def state_path(repo_root: Path) -> Path:
+    return repo_root.resolve() / ".xflow" / "local" / "unattended.json"
+
+
+def _git_path(repo_root: Path, argument: str) -> Path:
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--path-format=absolute", argument],
+        check=False,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    value = result.stdout.strip()
+    if result.returncode != 0 or not value:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise ValueError(f"cannot resolve Git {argument}: {detail or 'unknown Git error'}")
+    return Path(value).resolve()
+
+
+def _canonical_path(path: Path) -> str:
+    return os.path.normcase(str(path.resolve()))
+
+
+def _fingerprint(label: str, path: Path) -> str:
+    value = f"{label}\0{_canonical_path(path)}".encode("utf-8")
+    return hashlib.sha256(value).hexdigest()
+
+
+def _bindings(repo_root: Path) -> tuple[str, str]:
+    common_dir = _git_path(repo_root, "--git-common-dir")
+    worktree = _git_path(repo_root, "--show-toplevel")
+    return _fingerprint("repository", common_dir), _fingerprint("worktree", worktree)
+
+
+def _validate_timestamp(value: str) -> None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("invalid unattended state: enabledAt must be an ISO timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("invalid unattended state: enabledAt must include a timezone")
+
+
+def _parse(payload: object) -> UnattendedState:
+    if not isinstance(payload, dict) or set(payload) != STATE_FIELDS:
+        raise ValueError("invalid unattended state: unexpected JSON fields")
+    if type(payload["version"]) is not int or payload["version"] != STATE_VERSION:
+        raise ValueError("invalid unattended state: unsupported version")
+    for name in ("mode", "repository", "worktree", "issue", "enabledAt"):
+        if not isinstance(payload[name], str) or not payload[name]:
+            raise ValueError(f"invalid unattended state: {name} must be a non-empty string")
+    if payload["mode"] != STATE_MODE:
+        raise ValueError("invalid unattended state: unsupported mode")
+    for name in ("repository", "worktree"):
+        value = payload[name]
+        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            raise ValueError(f"invalid unattended state: {name} fingerprint is malformed")
+    try:
+        issue = normalized_issue(payload["issue"])
+    except ValueError as exc:
+        raise ValueError(f"invalid unattended state: {exc}") from exc
+    if issue != payload["issue"]:
+        raise ValueError("invalid unattended state: Issue identifier is not normalized")
+    _validate_timestamp(payload["enabledAt"])
+    return UnattendedState(
+        version=payload["version"],
+        mode=payload["mode"],
+        repository=payload["repository"],
+        worktree=payload["worktree"],
+        issue=issue,
+        enabledAt=payload["enabledAt"],
+    )
+
+
+def _write(repo_root: Path, state: UnattendedState) -> None:
+    path = state_path(repo_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f"{path.name}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(asdict(state), handle, ensure_ascii=True, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def enable(repo_root: Path, issue: str, confirmation: str) -> UnattendedState:
+    if confirmation != CONFIRMATION:
+        raise ValueError("confirmation does not exactly match the required unattended value")
+    repository, worktree = _bindings(repo_root)
+    state = UnattendedState(
+        version=STATE_VERSION,
+        mode=STATE_MODE,
+        repository=repository,
+        worktree=worktree,
+        issue=normalized_issue(issue),
+        enabledAt=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+    )
+    _write(repo_root, state)
+    return state
+
+
+def load(repo_root: Path) -> UnattendedState | None:
+    path = state_path(repo_root)
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise ValueError(f"invalid unattended state: expected a file at {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig", errors="strict"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid unattended state: cannot read {path}: {exc}") from exc
+    state = _parse(payload)
+    repository, worktree = _bindings(repo_root)
+    if state.repository != repository:
+        raise ValueError("unattended state repository mismatch")
+    if state.worktree != worktree:
+        raise ValueError("unattended state worktree mismatch")
+    return state
+
+
+def require_active(repo_root: Path, issue: str) -> UnattendedState:
+    state = load(repo_root)
+    if state is None:
+        raise ValueError("task-scoped unattended mode is not active")
+    expected_issue = normalized_issue(issue)
+    if state.issue != expected_issue:
+        raise ValueError(f"unattended state Issue mismatch: expected {expected_issue}, found {state.issue}")
+    return state
+
+
+def disable(repo_root: Path) -> bool:
+    path = state_path(repo_root)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def migrate_issue(repo_root: Path, old_issue: str, new_issue: str) -> UnattendedState:
+    state = require_active(repo_root, old_issue)
+    migrated = replace(state, issue=normalized_issue(new_issue))
+    _write(repo_root, migrated)
+    return migrated

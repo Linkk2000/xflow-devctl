@@ -205,6 +205,58 @@ def assert_check_commands_are_discoverable() -> None:
         assert "active dependencies warn but do not block local development" in text
 
 
+def run_powershell_devctl(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    env = {
+        **os.environ,
+        "DEVCTL_REPO_ROOT": str(repo_root),
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    result = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(OPS_ROOT / "devctl.ps1"),
+            *args,
+        ],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert result.returncode == 0, result.stderr
+    return result
+
+
+def assert_unattended_lifecycle_routing(root: Path) -> None:
+    repo = root / "unattended-routing"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    inactive = run_powershell_devctl(repo, "unattended", "status")
+    assert "inactive" in inactive.stdout.lower()
+
+    enabled = run_powershell_devctl(
+        repo,
+        "unattended",
+        "enable",
+        "--issue",
+        "IK152D",
+        "--confirm",
+        "XFLOW_HUMAN_UNATTENDED_ALL",
+    )
+    assert "enabled" in enabled.stdout.lower()
+    status = run_powershell_devctl(repo, "unattended", "status")
+    assert "active" in status.stdout.lower()
+    assert "IK152D" in status.stdout
+    disabled = run_powershell_devctl(repo, "unattended", "disable")
+    assert "disabled" in disabled.stdout.lower()
+
+
 def main() -> None:
     assert_no_legacy_run_command()
     assert_powershell_help_alias()
@@ -214,6 +266,7 @@ def main() -> None:
         root = Path(raw)
         assert_dependency_check_routing(root)
         assert_commit_message_check_routing(root)
+        assert_unattended_lifecycle_routing(root)
         repo = root / "work"
         repo.mkdir()
         origin = root / "origin.git"
