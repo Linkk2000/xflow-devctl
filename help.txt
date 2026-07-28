@@ -94,6 +94,7 @@ Check:
   devctl check subtask --issue <id> [--path .xflow/issues/issue-<id>/subtask-001]
   devctl check gap-analysis --issue draft|<id> [--file F]
   devctl check resolution-report --issue <id> [--file F]
+  devctl check dependencies --issue IK152D [--file .xflow/issues/issue-IK152D/dependencies.yaml]
   devctl check local-review --issue draft|<id> --file F --action issue-create|issue-comment|issue-close|git-mr [--attachments manifest.json]
   devctl check submodule-hygiene
 
@@ -126,6 +127,16 @@ Problem/Gap Closure Loop:
   If the report is not true, AI must rework and rewrite it before handoff.
   devctl check gap-analysis --issue <id>
   devctl check resolution-report --issue <id>
+
+Advisory dependencies:
+  The default manifest is .xflow/issues/issue-<id>/dependencies.yaml.
+  devctl check dependencies --issue IK152D
+  devctl check dependencies --issue 123
+  active and available dependencies warn but do not block local development,
+  commits, tests, or evidence collection.
+  integrated requires fresh parent-side verification and repository-local evidence.
+  A dependency's own completion report is not parent integration evidence.
+  Remote dependency Issue creation still requires the normal human approval gate.
 
 Approval:
   devctl approval prepare --issue draft|<id> --action ACTION --file F [--attachments manifest.json] [--command CMD] [--reviewer NAME] [--force]

@@ -34,6 +34,7 @@ devctl check issue-evidence --issue 1
 devctl check subtask --issue 1 --path .xflow/issues/issue-1/subtask-001
 devctl check gap-analysis --issue 1
 devctl check resolution-report --issue 1
+devctl check dependencies --issue IK152D
 devctl git push --issue 1 --file .xflow/issues/issue-1/walkthrough.md
 devctl git mr --title "Title" --body-file .xflow/issues/issue-1/mr-draft.md --issue 1
 devctl check submodule-hygiene
@@ -171,6 +172,16 @@ For `resolved` and `reduced`, all AI self-review checklist items must be
 checked. If self-review finds the report is not true, rework and rewrite the
 report before human handoff. Gap and resolution report evidence must stay under
 the issue directory; do not use COS/OSS/object storage as local evidence.
+
+Advisory dependency graphs live at
+`.xflow/issues/issue-<id>/dependencies.yaml`. Check a Gitee-style ID with
+`devctl check dependencies --issue IK152D`, or a GitHub-style numeric ID with
+`devctl check dependencies --issue 123`. An `active` or `available` dependency
+produces a warning but does not block local development, commits, tests, or
+evidence collection. `integrated` requires fresh parent-side verification and
+repository-local evidence; a dependency's own completion report is not parent
+integration evidence. Creating a remote dependency Issue remains protected by
+the normal human approval gate.
 
 `devctl attachment publish --backend github` is a legacy release-asset backend.
 It rejects image attachments and must not be used as issue/comment image

@@ -203,6 +203,22 @@ def test_dependency_parser(repo: Path) -> None:
     assert result.entries[0]["issue"] == "IK17AW"
     assert result.warnings == ()
 
+    active_yaml = dependency_yaml().replace("status: integrated", "status: active")
+    write(evidence.parents[2] / "dependencies.yaml", active_yaml)
+    active_check = run_devctl(gitee_root, "check", "dependencies", "--issue", "IK152D")
+    assert "[WARN] dependency #IK17AW is active" in active_check.stdout
+    explicit_check = run_devctl(
+        gitee_root,
+        "check",
+        "dependencies",
+        "--issue",
+        "IK152D",
+        "--file",
+        str(evidence.parents[2] / "dependencies.yaml"),
+    )
+    assert "dependencies check passed" in explicit_check.stdout
+    write(evidence.parents[2] / "dependencies.yaml", dependency_yaml())
+
     github_root = repo / "github-dependencies"
     github_evidence = github_root / ".xflow" / "issues" / "issue-123" / "evidence" / "logs" / "c-004-integration-tests.txt"
     write(github_evidence, "numeric parent integration evidence\n")

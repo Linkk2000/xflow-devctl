@@ -19,6 +19,7 @@ from .checks import (
     write_pr_state_update_suggestion,
 )
 from .env import RuntimeContext, load_env_files, python_version, token_status_lines
+from .dependencies import check_dependencies
 from .migration import inspect, write_wrappers
 from .paths import default_issue_file, normalized_issue
 
@@ -126,6 +127,9 @@ def build_parser() -> argparse.ArgumentParser:
     resolution_report = check_sub.add_parser("resolution-report")
     resolution_report.add_argument("--issue", required=True)
     resolution_report.add_argument("--file", type=Path)
+    dependencies = check_sub.add_parser("dependencies")
+    dependencies.add_argument("--issue", required=True)
+    dependencies.add_argument("--file", type=Path)
 
     issue = sub.add_parser("issue")
     issue_sub = issue.add_subparsers(dest="issue_command")
@@ -313,6 +317,11 @@ def run_check(args: argparse.Namespace) -> int:
         path = check_gap_analysis(ctx.repo_root, args.issue, args.file)
     elif args.check_command == "resolution-report":
         path = check_resolution_report(ctx.repo_root, args.issue, args.file)
+    elif args.check_command == "dependencies":
+        result = check_dependencies(ctx.repo_root, args.issue, args.file)
+        path = result.path
+        for warning in result.warnings:
+            print(f"[WARN] {warning}")
     elif args.check_command == "issue-evidence":
         path = check_issue_evidence(ctx.repo_root, args.issue, args.publish_root)
     elif args.check_command == "current-task":

@@ -40,7 +40,7 @@ Approved: yes
     )
 
 
-def run_devctl(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def run_devctl(repo_root: Path, *args: str, expect: int = 0) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["DEVCTL_REPO_ROOT"] = str(repo_root)
     env["DEVCTL_SKIP_PROVIDER_LOAD"] = "1"
@@ -56,11 +56,49 @@ def run_devctl(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    if result.returncode != 0:
+    if result.returncode != expect:
         print(result.stdout)
         print(result.stderr, file=sys.stderr)
-        raise AssertionError(f"expected success: {' '.join(args)}")
+        raise AssertionError(f"expected exit {expect}: {' '.join(args)}")
     return result
+
+
+def assert_dependency_check_routing(root: Path) -> None:
+    repo = root / "dependency-routing"
+    dependency_file = repo / ".xflow" / "issues" / "issue-IK152D" / "dependencies.yaml"
+    write(
+        dependency_file,
+        """version: 0.1.0
+issue: IK152D
+dependencies:
+  - issue: IK17AW
+    repository: xflow-web
+    type: child-feature
+    requiredFor: [C-004]
+    status: active
+    blockingAssessment: partial
+    decision: continue
+    rationale: 不受影响的开发和测试继续进行。
+""",
+    )
+    default_result = run_devctl(repo, "check", "dependencies", "--issue", "IK152D")
+    assert "[WARN] dependency #IK17AW is active" in default_result.stdout
+    assert str(dependency_file) in default_result.stdout
+
+    explicit_result = run_devctl(
+        repo,
+        "check",
+        "dependencies",
+        "--issue",
+        "IK152D",
+        "--file",
+        str(dependency_file),
+    )
+    assert "dependencies check passed" in explicit_result.stdout
+
+    write(dependency_file, dependency_file.read_text(encoding="utf-8").replace("type: child-feature", "type: invalid"))
+    invalid_result = run_devctl(repo, "check", "dependencies", "--issue", "IK152D", expect=1)
+    assert "invalid dependency #IK17AW type" in invalid_result.stderr
 
 
 def assert_no_legacy_run_command() -> None:
@@ -106,6 +144,7 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
+        assert_dependency_check_routing(root)
         repo = root / "work"
         repo.mkdir()
         origin = root / "origin.git"
