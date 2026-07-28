@@ -649,9 +649,7 @@ def summarize_commit_message(
     if not paths:
         raise ValueError("no changes to summarize")
     names = [Path(path).name for path in paths[:3]]
-    changed_summary = ", ".join(names)
-    if len(paths) > 3:
-        changed_summary = f"{changed_summary} 等 {len(paths)} 个文件"
+    changed_summary = names[0] if len(paths) == 1 else f"{len(paths)} 个任务文件"
     summary = summary_override.strip() if summary_override is not None else f"更新 {changed_summary}"
     if not summary:
         raise ValueError("positional summary must be a non-empty Chinese core summary")
@@ -723,12 +721,36 @@ def commit_and_push_pr_backfill(
     pr_number: str,
     issue: str,
 ) -> bool:
+    staged_before = {
+        line
+        for line in git_run(repo_root, ["diff", "--cached", "--name-only"]).splitlines()
+        if line
+    }
+    if staged_before:
+        raise ValueError(
+            "PR state backfill requires an empty index; found staged paths: "
+            + ", ".join(sorted(staged_before))
+        )
     if not paths:
         return False
-    for path in paths:
-        if path.exists():
-            git_run(repo_root, ["add", "--", str(path.relative_to(repo_root))])
-    if subprocess.run(["git", "-C", str(repo_root), "diff", "--cached", "--quiet"], check=False).returncode == 0:
+    expected_paths = {
+        path.relative_to(repo_root).as_posix()
+        for path in paths
+        if path.exists()
+    }
+    for relative_path in sorted(expected_paths):
+        git_run(repo_root, ["add", "--", relative_path])
+    staged_after = {
+        line
+        for line in git_run(repo_root, ["diff", "--cached", "--name-only"]).splitlines()
+        if line
+    }
+    if staged_after != expected_paths:
+        raise ValueError(
+            "PR state backfill staged paths must exactly match metadata paths; "
+            f"expected {sorted(expected_paths)}, found {sorted(staged_after)}"
+        )
+    if not staged_after:
         return False
     message = (
         f"chore(xflow): 回填合并请求状态[#{normalized_issue(issue)}]\n\n"

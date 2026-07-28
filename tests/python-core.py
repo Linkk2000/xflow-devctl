@@ -270,11 +270,62 @@ dependencies:
             candidate = candidate.replace(f"    {other}: ''", f"    {other}: value" if other != field else f"    {other}: ''")
         assert_dependency_error(invalid_root, "IK152D", candidate, field)
 
+    valid_external = available_external
+    for field in ("provider", "availableVersion", "verificationEntry"):
+        valid_external = valid_external.replace(f"    {field}: ''", f"    {field}: value")
+    write(
+        invalid_root / ".xflow" / "issues" / "issue-IK152D" / "dependencies.yaml",
+        valid_external,
+    )
+    external_result = check_dependencies(invalid_root, "IK152D")
+    assert external_result.entries[0]["type"] == "external"
+
+    assert_dependency_error(
+        invalid_root,
+        "IK152D",
+        valid_external + "    delivery: local-commit\n",
+        "delivery must be a mapping",
+    )
+    assert_dependency_error(
+        invalid_root,
+        "IK152D",
+        valid_external + "    delivery: {}\n",
+        "external dependency #EXT-1 must not declare delivery",
+    )
+
     superseded = base.replace("status: integrated", "status: superseded").replace(
         "      decision: integrated\n      rationale: 相关验收已在主功能分支重新验证。",
         "      decision: superseded\n      rationale: ''",
     )
     assert_dependency_error(invalid_root, "IK152D", superseded, "closureAssessment.rationale")
+
+    temporary_adapter = base.replace("status: integrated", "status: active").replace(
+        "decision: continue",
+        "decision: use-temporary-adapter",
+        1,
+    )
+    assert_dependency_error(invalid_root, "IK152D", temporary_adapter, "removalCondition")
+    assert_dependency_error(
+        invalid_root,
+        "IK152D",
+        temporary_adapter.replace(
+            "    decision: use-temporary-adapter\n",
+            "    decision: use-temporary-adapter\n    removalCondition: ''\n",
+        ),
+        "removalCondition",
+    )
+    valid_temporary_adapter = temporary_adapter.replace(
+        "    decision: use-temporary-adapter\n",
+        "    decision: use-temporary-adapter\n    removalCondition: 依赖集成并通过 C-004 后移除。\n",
+    )
+    write(
+        invalid_root / ".xflow" / "issues" / "issue-IK152D" / "dependencies.yaml",
+        valid_temporary_adapter,
+    )
+    temporary_result = check_dependencies(invalid_root, "IK152D")
+    assert temporary_result.warnings == (
+        "dependency #IK17AW is active; developer decision remains use-temporary-adapter",
+    )
 
     dependency_report = base.replace(
         "evidence/logs/c-004-integration-tests.txt",
@@ -285,6 +336,37 @@ dependencies:
         "dependency resolution report\n",
     )
     assert_dependency_error(invalid_root, "IK152D", dependency_report, "fresh parent-side evidence")
+
+    evidence_directory = base.replace(
+        "evidence/logs/c-004-integration-tests.txt",
+        "evidence/logs",
+    )
+    assert_dependency_error(invalid_root, "IK152D", evidence_directory, "must be a file")
+
+    issue_root = invalid_root / ".xflow" / "issues" / "issue-IK152D"
+    outside_evidence = invalid_root / "outside-evidence.txt"
+    write(outside_evidence, "outside issue workspace\n")
+    outside_link = issue_root / "evidence" / "logs" / "outside-link.txt"
+    broken_link = issue_root / "evidence" / "logs" / "broken-link.txt"
+    try:
+        outside_link.symlink_to(outside_evidence)
+        broken_link.symlink_to(issue_root / "evidence" / "logs" / "missing-target.txt")
+    except (OSError, NotImplementedError):
+        outside_link.unlink(missing_ok=True)
+        broken_link.unlink(missing_ok=True)
+    else:
+        assert_dependency_error(
+            invalid_root,
+            "IK152D",
+            base.replace("evidence/logs/c-004-integration-tests.txt", "evidence/logs/outside-link.txt"),
+            "inside the issue directory",
+        )
+        assert_dependency_error(
+            invalid_root,
+            "IK152D",
+            base.replace("evidence/logs/c-004-integration-tests.txt", "evidence/logs/broken-link.txt"),
+            "does not exist",
+        )
 
 
 def resolution_report_text(conclusion: str) -> str:
@@ -483,6 +565,27 @@ def test_commit_message_generator(repo: Path) -> None:
     assert positional.startswith("chore(feature.txt): 修复稳定端点定位[#IK152D]\n\n")
     check_commit_message(positional, branch_issue="IK152D")
 
+    git(repo, "commit", "-m", generated, "-q")
+    multi_file_names = (
+        "alpha-long-feature-name.py",
+        "beta-shared-service-layer.py",
+        "gamma-verification-entry-point.py",
+    )
+    for name in multi_file_names:
+        write(repo / name, f"# {name}\n")
+        git(repo, "add", name)
+    multi_default = summarize_commit_message(repo, None, None)
+    check_commit_message(multi_default, branch_issue="IK152D")
+    assert "3 个任务文件" in multi_default
+    multi_default_body = "\n".join(multi_default.splitlines()[2:])
+    assert all(name not in multi_default_body for name in multi_file_names)
+
+    multi_positional = summarize_commit_message(repo, None, "调整依赖检查行为")
+    check_commit_message(multi_positional, branch_issue="IK152D")
+    assert "- 修改范围包含 3 个任务文件" in multi_positional
+    multi_positional_body = "\n".join(multi_positional.splitlines()[2:])
+    assert all(name not in multi_positional_body for name in multi_file_names)
+
     full_message = (
         "fix(canvas): 修复稳定端点定位[#IK152D]\n\n"
         "- 调整统一端点计算\n"
@@ -533,6 +636,28 @@ def test_pr_backfill_commit_message_without_push(repo: Path) -> None:
     assert "- 记录合并请求编号与远端链接" in message
     assert "- 同步当前任务状态文件" in message
     check_commit_message(message, branch_issue="8")
+
+    write(repo / "business.py", "print('business change')\n")
+    git(repo, "add", "business.py")
+    write(suggestion, "PR: 43\n")
+    previous_head = git_text(repo, "rev-parse", "HEAD")
+    previous = os.environ.get("DEVCTL_SKIP_PUSH")
+    os.environ["DEVCTL_SKIP_PUSH"] = "1"
+    try:
+        try:
+            commit_and_push_pr_backfill(repo, "feature/8-pr-backfill", [suggestion], "43", "8")
+        except ValueError as exc:
+            assert "staged" in str(exc) or "index" in str(exc)
+        else:
+            raise AssertionError("PR backfill must reject a pre-populated index")
+    finally:
+        if previous is None:
+            os.environ.pop("DEVCTL_SKIP_PUSH", None)
+        else:
+            os.environ["DEVCTL_SKIP_PUSH"] = previous
+    assert git_text(repo, "rev-parse", "HEAD") == previous_head
+    assert git_text(repo, "diff", "--cached", "--name-only") == "business.py"
+    assert "business.py" not in git_text(repo, "show", "--format=", "--name-only", "HEAD")
 
 
 def test_python_core_git_and_app_commands(parent: Path) -> None:
@@ -833,6 +958,7 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "devctl check commit-msg --file .xflow/local/commit-message.txt --issue IK152D" in help_text
     assert "type(scope): 中文核心摘要[#Issue编号]" in help_text
     assert "active dependencies warn but do not block local development" in help_text
+    assert "removalCondition" in help_text
     assert "Problem/Gap Closure Loop" in help_text
     assert "resolved|reduced|blocked" in help_text
     assert "one evidence bundle per finding" in help_text
@@ -868,6 +994,7 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "devctl check commit-msg --file .xflow/local/commit-message.txt --issue IK152D" in readme_text
     assert "type(scope): 中文核心摘要[#Issue编号]" in readme_text
     assert "active dependencies warn but do not block local development" in readme_text
+    assert "removalCondition" in readme_text
     assert "Problem/Gap Closure Loop" in readme_text
     assert "resolved|reduced|blocked" in readme_text
     assert "numbered evidence bundle" in readme_text

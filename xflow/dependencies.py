@@ -116,9 +116,6 @@ def _validate_delivery(entry: dict[str, Any], dependency: str) -> None:
 def _validate_external_availability(entry: dict[str, Any], dependency: str) -> None:
     for field in ("provider", "availableVersion", "verificationEntry"):
         _non_empty(entry.get(field), f"dependency #{dependency} {field}")
-    delivery = entry.get("delivery")
-    if isinstance(delivery, dict) and any(str(delivery.get(field, "")).strip() for field in ("branch", "commit", "mergeRequest")):
-        raise ValueError(f"external dependency #{dependency} must not declare repository delivery commits")
 
 
 def _validate_integration(entry: dict[str, Any], dependency: str, issue_directory: Path) -> None:
@@ -131,7 +128,17 @@ def _validate_integration(entry: dict[str, Any], dependency: str, issue_director
     from .checks import check_issue_local_evidence
 
     raw_evidence = "\n".join(f"- {item}" for item in evidence)
-    check_issue_local_evidence(issue_directory, raw_evidence, f"dependency #{dependency} integration")
+    evidence_paths = check_issue_local_evidence(
+        issue_directory,
+        raw_evidence,
+        f"dependency #{dependency} integration",
+    )
+    for evidence_path in evidence_paths:
+        if not evidence_path.is_file():
+            raise ValueError(
+                f"dependency #{dependency} integration evidence must be a file: "
+                f"{evidence_path.relative_to(issue_directory)}"
+            )
     if any(Path(str(item)).name.lower() == "resolution-report.md" for item in evidence):
         raise ValueError(
             f"dependency #{dependency} integration evidence must be fresh parent-side evidence, not a dependency resolution-report"
@@ -170,6 +177,10 @@ def check_dependencies(
         entry["issue"] = dependency
         _non_empty(entry.get("repository"), f"dependency #{dependency} repository")
         dependency_type = _enum(entry.get("type"), DEPENDENCY_TYPES, f"dependency #{dependency} type")
+        if "delivery" in entry:
+            _mapping(entry["delivery"], f"dependency #{dependency} delivery")
+            if dependency_type == "external":
+                raise ValueError(f"external dependency #{dependency} must not declare delivery")
         _non_empty_list(entry.get("requiredFor"), f"dependency #{dependency} requiredFor")
         status = _enum(entry.get("status"), DEPENDENCY_STATUSES, f"dependency #{dependency} status")
         _enum(
@@ -182,6 +193,11 @@ def check_dependencies(
             DEVELOPMENT_DECISIONS,
             f"dependency #{dependency} development decision",
         )
+        if decision == "use-temporary-adapter":
+            _non_empty(
+                entry.get("removalCondition"),
+                f"dependency #{dependency} removalCondition",
+            )
         _non_empty(entry.get("rationale"), f"dependency #{dependency} rationale")
         _validate_closure_assessment(entry, dependency)
 

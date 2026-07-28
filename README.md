@@ -184,6 +184,11 @@ repository-local evidence; a dependency's own completion report is not parent
 integration evidence. Creating a remote dependency Issue remains protected by
 the normal human approval gate.
 
+When `decision: use-temporary-adapter` is selected, the dependency entry must
+also provide a non-empty `removalCondition` describing when the adapter will be
+removed. This records an exit condition without turning the dependency into a
+development gate.
+
 Search anchor: active dependencies warn but do not block local development.
 
 Dependency status remains advisory while work is in progress. When a

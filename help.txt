@@ -159,6 +159,8 @@ Advisory dependencies:
   active and available dependencies warn but do not block local development,
   commits, tests, or evidence collection.
   active dependencies warn but do not block local development.
+  decision: use-temporary-adapter requires a non-empty removalCondition that
+  records when the temporary adapter will be removed.
   integrated requires fresh parent-side verification and repository-local evidence.
   A dependency's own completion report is not parent integration evidence.
   Remote dependency Issue creation still requires the normal human approval gate.
