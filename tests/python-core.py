@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlparse
 OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
-from xflow.checks import write_pr_state_update_suggestion
+from xflow.checks import check_resolution_report, write_pr_state_update_suggestion
 from xflow.dependencies import DependencyCheckResult, check_dependencies
 from xflow.env import load_env_files
 from xflow.providers import (
@@ -274,6 +274,121 @@ dependencies:
         "      decision: superseded\n      rationale: ''",
     )
     assert_dependency_error(invalid_root, "IK152D", superseded, "closureAssessment.rationale")
+
+    dependency_report = base.replace(
+        "evidence/logs/c-004-integration-tests.txt",
+        "evidence/resolution-report.md",
+    )
+    write(
+        invalid_root / ".xflow" / "issues" / "issue-IK152D" / "evidence" / "resolution-report.md",
+        "dependency resolution report\n",
+    )
+    assert_dependency_error(invalid_root, "IK152D", dependency_report, "fresh parent-side evidence")
+
+
+def resolution_report_text(conclusion: str) -> str:
+    return f"""# Resolution Report
+
+## Source Problem Or Gap
+- gap-analysis.md
+
+## Actual Changes
+- Added dependency closure checks.
+
+## Evidence Index
+- [resolution note](evidence/resolution-note.txt)
+
+## Completion Verification
+
+### Criterion C-001: Dependency closure matches the report
+
+#### Verification Type
+non-ui
+
+#### Expected Result
+The report conclusion matches the parent dependency state.
+
+#### Evidence
+- [resolution note](evidence/resolution-note.txt)
+
+#### Actual Result
+The dependency closure matrix returned the expected result.
+
+#### Human Review
+- [ ] Confirm this evidence supports the reported closure.
+
+## Closure Conclusion
+{conclusion}: dependency impact is recorded.
+
+## AI Self-Review Result
+- [x] Dependency state and closure assessment are consistent.
+
+## Remaining Risks
+- none
+
+## Human Review Request
+- Please review the dependency conclusion.
+"""
+
+
+def closure_yaml(status: str, closure: str | None) -> str:
+    text = dependency_yaml().replace("status: integrated", f"status: {status}")
+    marker = "    closureAssessment:\n"
+    prefix = text.split(marker, 1)[0]
+    if closure is None:
+        return prefix
+    return prefix + marker + closure
+
+
+def assert_resolution_closure_error(repo: Path, dependencies: str, expected_issue: str = "IK17AW") -> None:
+    issue_root = repo / ".xflow" / "issues" / "issue-IK152D"
+    write(issue_root / "dependencies.yaml", dependencies)
+    try:
+        check_resolution_report(repo, "IK152D")
+    except ValueError as exc:
+        assert expected_issue in str(exc), str(exc)
+    else:
+        raise AssertionError(f"resolved report should reject dependency #{expected_issue}")
+
+
+def test_resolution_report_dependency_closure(repo: Path) -> None:
+    issue_root = repo / ".xflow" / "issues" / "issue-IK152D"
+    write(issue_root / "evidence" / "resolution-note.txt", "resolution evidence\n")
+    write(issue_root / "evidence" / "logs" / "c-004-integration-tests.txt", "integration evidence\n")
+    report = issue_root / "resolution-report.md"
+    write(report, resolution_report_text("resolved"))
+
+    integrated = dependency_yaml()
+    write(issue_root / "dependencies.yaml", integrated)
+    check_resolution_report(repo, "IK152D")
+
+    available = closure_yaml(
+        "available",
+        "      affectsClosure: true\n      decision: integrated\n      rationale: 最终验收依赖该能力。\n",
+    )
+    assert_resolution_closure_error(repo, available)
+
+    active_not_required = closure_yaml(
+        "active",
+        "      affectsClosure: false\n      decision: not-required\n      rationale: 当前验收条件不依赖后续增强。\n",
+    )
+    write(issue_root / "dependencies.yaml", active_not_required)
+    check_resolution_report(repo, "IK152D")
+
+    active_without_closure = closure_yaml("active", None)
+    assert_resolution_closure_error(repo, active_without_closure)
+
+    superseded = closure_yaml(
+        "superseded",
+        "      affectsClosure: true\n      decision: superseded\n      rationale: 经审核的设计变更已移除该依赖。\n",
+    )
+    write(issue_root / "dependencies.yaml", superseded)
+    check_resolution_report(repo, "IK152D")
+
+    for conclusion in ("reduced", "blocked"):
+        write(report, resolution_report_text(conclusion))
+        write(issue_root / "dependencies.yaml", active_without_closure)
+        check_resolution_report(repo, "IK152D")
 
 
 def test_python_core_git_and_app_commands(parent: Path) -> None:
@@ -798,6 +913,7 @@ def main() -> None:
         test_python_core_rejects_inline_remote_bodies(repo)
         test_issue_identifiers_are_portable(repo)
         test_dependency_parser(repo)
+        test_resolution_report_dependency_closure(repo / "dependency-closure")
         test_python_core_git_and_app_commands(repo / "core-routing")
         test_git_task_metadata_is_scoped_to_each_worktree(repo / "worktree-metadata")
         test_git_push_and_mr_are_separate_with_state_backfill(repo / "push-mr-state")

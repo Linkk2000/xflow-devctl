@@ -137,6 +137,9 @@ Advisory dependencies:
   integrated requires fresh parent-side verification and repository-local evidence.
   A dependency's own completion report is not parent integration evidence.
   Remote dependency Issue creation still requires the normal human approval gate.
+  During work these checks are advisory. A resolution-report claiming resolved
+  must have consistent closureAssessment data for every dependency; reduced and
+  blocked may retain active dependencies with their impact recorded.
 
 Approval:
   devctl approval prepare --issue draft|<id> --action ACTION --file F [--attachments manifest.json] [--command CMD] [--reviewer NAME] [--force]

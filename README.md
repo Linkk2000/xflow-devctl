@@ -183,6 +183,13 @@ repository-local evidence; a dependency's own completion report is not parent
 integration evidence. Creating a remote dependency Issue remains protected by
 the normal human approval gate.
 
+Dependency status remains advisory while work is in progress. When a
+resolution report claims `resolved`, however, every dependency must include a
+consistent `closureAssessment`: closure-affecting work must be `integrated` or
+reviewedly `superseded`, while excluded work uses `affectsClosure: false` with
+`decision: not-required` and a rationale. `reduced` and `blocked` may retain
+active dependencies with their impact recorded.
+
 `devctl attachment publish --backend github` is a legacy release-asset backend.
 It rejects image attachments and must not be used as issue/comment image
 storage. Use `--no-local-review` only when the user explicitly authorized an

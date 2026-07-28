@@ -21,6 +21,41 @@ class DependencyCheckResult:
     warnings: tuple[str, ...]
 
 
+def check_dependency_closure(
+    result: DependencyCheckResult,
+    conclusion: str,
+) -> tuple[str, ...]:
+    if conclusion not in {"resolved", "reduced", "blocked"}:
+        raise ValueError(f"unknown resolution conclusion: {conclusion}")
+    if conclusion != "resolved":
+        return ()
+
+    violations: list[str] = []
+    for entry in result.entries:
+        dependency = str(entry["issue"])
+        closure = entry.get("closureAssessment")
+        if not isinstance(closure, dict):
+            violations.append(f"dependency #{dependency} requires closureAssessment for resolved")
+            continue
+        affects_closure = closure.get("affectsClosure")
+        decision = closure.get("decision")
+        status = entry.get("status")
+        if affects_closure is False:
+            if decision != "not-required":
+                violations.append(
+                    f"dependency #{dependency} with affectsClosure false requires closure decision not-required"
+                )
+            continue
+        if status == "integrated" and decision == "integrated":
+            continue
+        if status == "superseded" and decision == "superseded":
+            continue
+        violations.append(
+            f"dependency #{dependency} affects closure but is {status} with closure decision {decision}"
+        )
+    return tuple(violations)
+
+
 def load_yaml(path: Path) -> object:
     try:
         import yaml

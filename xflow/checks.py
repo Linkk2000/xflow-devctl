@@ -486,6 +486,16 @@ def check_resolution_report(repo_root: Path, issue: str, file_path: Path | None 
     if not conclusion_match or conclusion_match.group(1).lower() not in RESOLUTION_CONCLUSIONS:
         raise ValueError("resolution-report Closure Conclusion must be resolved, reduced, or blocked with a reason")
     conclusion = conclusion_match.group(1).lower()
+    dependencies_path = current_issue_dir / "dependencies.yaml"
+    if dependencies_path.is_file():
+        from .dependencies import check_dependencies, check_dependency_closure
+
+        dependency_result = check_dependencies(repo_root, issue, dependencies_path)
+        closure_violations = check_dependency_closure(dependency_result, conclusion)
+        if closure_violations:
+            raise ValueError(
+                "resolution-report dependency closure is inconsistent: " + "; ".join(closure_violations)
+            )
     if conclusion in {"resolved", "reduced"} and has_unchecked_checklist_item(sections["## AI Self-Review Result"]):
         raise ValueError("resolved/reduced resolution-report must not contain unchecked AI self-review items")
     return path
