@@ -821,14 +821,16 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "devctl attachment publish --issue draft --backend aliyun-oss" in help_text
     assert "%USERPROFILE%\\.xflow\\env.local" in help_text
     assert "devctl git push --issue" in help_text
-    assert "type(scope): 中文摘要" in help_text
-    assert "关联 issue: #<id>" in help_text
     assert "state backfill commit" in help_text
     assert "Do not run bare bash/Git-Bash/WSL for normal XFlow validation on Windows" in help_text
     assert "devctl check subtask --issue" in help_text
     assert "devctl check issue-evidence --issue" in help_text
     assert "devctl check gap-analysis --issue" in help_text
     assert "devctl check resolution-report --issue" in help_text
+    assert "devctl check dependencies --issue IK152D" in help_text
+    assert "devctl check commit-msg --file .xflow/local/commit-message.txt --issue IK152D" in help_text
+    assert "type(scope): 中文核心摘要[#Issue编号]" in help_text
+    assert "active dependencies warn but do not block local development" in help_text
     assert "Problem/Gap Closure Loop" in help_text
     assert "resolved|reduced|blocked" in help_text
     assert "one evidence bundle per finding" in help_text
@@ -851,8 +853,6 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "ALIYUN_OSS_ACCESS_KEY_SECRET" in readme_text
     assert "must not be written to attachment manifests" in readme_text
     assert "devctl git push --issue" in readme_text
-    assert "type(scope): 中文摘要" in readme_text
-    assert "关联 issue: #<id>" in readme_text
     assert "state backfill commit" in readme_text
     assert "Normal Git, Issue, Attachment, Approval, Rules, and Migration commands route" in readme_text
     assert "App commands route" not in readme_text
@@ -862,6 +862,10 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "devctl check issue-evidence --issue" in readme_text
     assert "devctl check gap-analysis --issue" in readme_text
     assert "devctl check resolution-report --issue" in readme_text
+    assert "devctl check dependencies --issue IK152D" in readme_text
+    assert "devctl check commit-msg --file .xflow/local/commit-message.txt --issue IK152D" in readme_text
+    assert "type(scope): 中文核心摘要[#Issue编号]" in readme_text
+    assert "active dependencies warn but do not block local development" in readme_text
     assert "Problem/Gap Closure Loop" in readme_text
     assert "resolved|reduced|blocked" in readme_text
     assert "numbered evidence bundle" in readme_text

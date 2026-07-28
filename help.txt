@@ -66,9 +66,28 @@ Git:
   devctl git status
   devctl git done [--base BRANCH] [--force]
   Commit messages must be portable, scoped, Chinese-dominant, multi-line, and issue-linked.
-  Use first line: type(scope): 中文摘要
-  Include body line: 关联 issue: #<id>
+  Use first line: type(scope): 中文核心摘要[#Issue编号]
+  Require at least two non-empty Chinese-dominant body lines after a blank line.
+  The positional summary is only the core summary; devctl generates the full message.
+  -m/--message is a complete multi-line message and must pass validation unchanged.
   Do not add AI-client trailers, local absolute paths, or provider-only metadata.
+
+  Main feature:
+    feat(canvas): 修复稳定端点定位[#IK152D]
+    - 调整统一端点计算
+    - 覆盖 C-004 并记录测试证据
+  Child feature (body links parent):
+    feat(anchor): 实现统一端点能力[#IK17AW]
+    - 完成子功能端点归一化实现
+    - 关联父 Issue #IK152D 并覆盖 C-004
+  Shared infrastructure (body lists consumers):
+    feat(transaction): 增加统一容器事务[#456]
+    - 提供可复用的容器事务基础能力
+    - 已知使用方为 #123 与 #IK152D
+  Integration:
+    merge(canvas): 集成统一容器事务能力[#IK152D][#IK17AW]
+    - 合并主功能与依赖能力的实现
+    - 完成联合回归并记录父级本地证据
 
 Core remote-write rule:
   Remote writes require local human review of the exact body/evidence file.
@@ -95,6 +114,7 @@ Check:
   devctl check gap-analysis --issue draft|<id> [--file F]
   devctl check resolution-report --issue <id> [--file F]
   devctl check dependencies --issue IK152D [--file .xflow/issues/issue-IK152D/dependencies.yaml]
+  devctl check commit-msg --file .xflow/local/commit-message.txt --issue IK152D
   devctl check local-review --issue draft|<id> --file F --action issue-create|issue-comment|issue-close|git-mr [--attachments manifest.json]
   devctl check submodule-hygiene
 
@@ -134,12 +154,16 @@ Advisory dependencies:
   devctl check dependencies --issue 123
   active and available dependencies warn but do not block local development,
   commits, tests, or evidence collection.
+  active dependencies warn but do not block local development.
   integrated requires fresh parent-side verification and repository-local evidence.
   A dependency's own completion report is not parent integration evidence.
   Remote dependency Issue creation still requires the normal human approval gate.
   During work these checks are advisory. A resolution-report claiming resolved
   must have consistent closureAssessment data for every dependency; reduced and
   blocked may retain active dependencies with their impact recorded.
+  After integration, run:
+    devctl check dependencies --issue IK152D
+    devctl check resolution-report --issue IK152D
 
 Approval:
   devctl approval prepare --issue draft|<id> --action ACTION --file F [--attachments manifest.json] [--command CMD] [--reviewer NAME] [--force]

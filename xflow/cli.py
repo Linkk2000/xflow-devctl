@@ -96,7 +96,14 @@ written to attachment manifests.
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="devctl")
+    parser = argparse.ArgumentParser(
+        prog="devctl",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Focused checks:
+  devctl check dependencies --issue IK152D
+  devctl check commit-msg --file .xflow/local/commit-message.txt --issue IK152D
+""",
+    )
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("preflight")
 

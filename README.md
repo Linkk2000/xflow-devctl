@@ -35,6 +35,7 @@ devctl check subtask --issue 1 --path .xflow/issues/issue-1/subtask-001
 devctl check gap-analysis --issue 1
 devctl check resolution-report --issue 1
 devctl check dependencies --issue IK152D
+devctl check commit-msg --file .xflow/local/commit-message.txt --issue IK152D
 devctl git push --issue 1 --file .xflow/issues/issue-1/walkthrough.md
 devctl git mr --title "Title" --body-file .xflow/issues/issue-1/mr-draft.md --issue 1
 devctl check submodule-hygiene
@@ -183,6 +184,8 @@ repository-local evidence; a dependency's own completion report is not parent
 integration evidence. Creating a remote dependency Issue remains protected by
 the normal human approval gate.
 
+Search anchor: active dependencies warn but do not block local development.
+
 Dependency status remains advisory while work is in progress. When a
 resolution report claims `resolved`, however, every dependency must include a
 consistent `closureAssessment`: closure-affecting work must be `integrated` or
@@ -211,12 +214,59 @@ Commit messages must be portable, scoped, Chinese-dominant, multi-line, and
 issue-linked:
 
 ```text
-type(scope): 中文摘要
-
-关联 issue: #<id>
+type(scope): 中文核心摘要[#Issue编号]
 
 - 中文说明关键变化
 - 中文说明验证或证据
+```
+
+`devctl check commit-msg --file .xflow/local/commit-message.txt --issue IK152D`
+is a real mechanical check. `devctl git commit-msg 修复稳定端点定位` treats
+the positional value as the Chinese core summary and generates the owner tag
+and body. `-m/--message` is a complete multi-line message and is validated
+unchanged.
+
+Main-feature commit:
+
+```text
+feat(canvas): 修复稳定端点定位[#IK152D]
+
+- 调整统一端点计算
+- 覆盖 C-004 并记录测试证据
+```
+
+Child-feature commit, owned by the child and linking its parent in the body:
+
+```text
+feat(anchor): 实现统一端点能力[#IK17AW]
+
+- 完成子功能端点归一化实现
+- 关联父 Issue #IK152D 并覆盖 C-004
+```
+
+Shared-infrastructure commit, owned by the shared Issue and naming consumers:
+
+```text
+feat(transaction): 增加统一容器事务[#456]
+
+- 提供可复用的容器事务基础能力
+- 已知使用方为 #123 与 #IK152D
+```
+
+Two-Issue integration commit:
+
+```text
+merge(canvas): 集成统一容器事务能力[#IK152D][#IK17AW]
+
+- 合并主功能与依赖能力的实现
+- 完成联合回归并记录父级本地证据
+```
+
+After dependency integration, run both consistency checks:
+
+```text
+devctl check dependencies --issue IK152D
+devctl check resolution-report --issue IK152D
 ```
 
 Portable means plain Git text that travels across GitHub/Gitee. Do not add
