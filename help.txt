@@ -74,18 +74,22 @@ Git:
 
   Main feature:
     feat(canvas): 修复稳定端点定位[#IK152D]
+
     - 调整统一端点计算
     - 覆盖 C-004 并记录测试证据
   Child feature (body links parent):
     feat(anchor): 实现统一端点能力[#IK17AW]
+
     - 完成子功能端点归一化实现
     - 关联父 Issue #IK152D 并覆盖 C-004
   Shared infrastructure (body lists consumers):
     feat(transaction): 增加统一容器事务[#456]
+
     - 提供可复用的容器事务基础能力
     - 已知使用方为 #123 与 #IK152D
   Integration:
     merge(canvas): 集成统一容器事务能力[#IK152D][#IK17AW]
+
     - 合并主功能与依赖能力的实现
     - 完成联合回归并记录父级本地证据
 

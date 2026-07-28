@@ -59,8 +59,12 @@ def check_commit_message(
         raise ValueError(
             "commit subject must use type(scope): Chinese-dominant summary[#Issue] with a non-empty scope and Issue tag"
         )
+    if not match.group("scope").strip():
+        raise ValueError("commit subject scope must be non-empty")
 
     summary = match.group("summary").strip()
+    if "[#" in summary:
+        raise ValueError("commit subject must contain one or two Issue IDs only in the suffix")
     if not _is_chinese_dominant(summary):
         raise ValueError("commit subject summary must be Chinese-dominant")
     issue_ids = tuple(ISSUE_TAG_RE.findall(match.group("tags")))

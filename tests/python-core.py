@@ -425,12 +425,14 @@ def test_commit_message_validator() -> None:
 
     cases = (
         (gitee.replace("feat(canvas)", "feat"), "scope"),
+        (gitee.replace("feat(canvas)", "feat(   )"), "scope"),
         (gitee.replace("[#IK152D]", ""), "Issue"),
         (gitee.replace("修复稳定端点定位", "fix stable endpoint"), "Chinese-dominant"),
         ("feat(canvas): 修复稳定端点定位[#IK152D]", "blank separator"),
         (gitee.rsplit("\n- ", 1)[0] + "\n", "at least two"),
         (gitee.replace("- 覆盖 C-004 并记录测试证据", "- verify C-004 with tests"), "Chinese-dominant"),
         (gitee.replace("[#IK152D]", "[#IK152D][#IK17AW]"), "only merge"),
+        (merge.replace("[#IK152D][#IK17AW]", "[#IK152D][#IK17AW][#789]"), "one or two"),
         (gitee + "Co-authored-by: Claude <bot@example.test>\n", "AI-client trailer"),
         (gitee + "Generated-by: tool\n", "AI-client trailer"),
         (gitee + "OpenAI-Codex\n", "AI-client trailer"),
