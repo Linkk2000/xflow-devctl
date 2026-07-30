@@ -1726,7 +1726,7 @@ def test_python_core_git_and_app_commands(parent: Path) -> None:
     git(work, "checkout", "main", "-q")
     write(
         work / ".git" / "info" / "exclude",
-        ".xflow/local/\n.xflow/issues/**/approvals/\n",
+        ".xflow/local/\n.xflow/current-task.md\n.xflow/issues/**/approvals/\n",
     )
 
     status = run_devctl(work, "git", "status").stdout
@@ -1773,6 +1773,7 @@ def test_python_core_git_and_app_commands(parent: Path) -> None:
 
     cleanup_evidence = work / ".xflow" / "issues" / "issue-9" / "resolution-report.md"
     write(cleanup_evidence, "# Resolution Report\n\nCleanup reviewed by the human.\n")
+    write(work / ".xflow" / "current-task.md", current_task_text("9"))
     git(work, "add", str(cleanup_evidence.relative_to(work)))
     git(work, "commit", "-m", "record cleanup evidence", "-q")
     enable(work, "9", "XFLOW_HUMAN_UNATTENDED_ALL")
@@ -1793,11 +1794,37 @@ def test_python_core_git_and_app_commands(parent: Path) -> None:
     assert "local review approval required" in unattended_cleanup.stderr
     assert git_text(work, "branch", "--show-current") == "feat/9-wsl-free"
     assert require_active(work, "9").issue == "9"
+    wrong_cleanup_review = approval_gate.prepare(
+        work,
+        "9",
+        "git-cleanup",
+        cleanup_evidence,
+    )
+    wrong_cleanup_review.write_text(
+        wrong_cleanup_review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"),
+        encoding="utf-8",
+        newline="\n",
+    )
+    wrong_cleanup = run_devctl(
+        work,
+        "git",
+        "done",
+        "--force",
+        "--base",
+        "main",
+        "--issue",
+        "9",
+        "--file",
+        str(cleanup_evidence),
+        expect=1,
+    )
+    assert "action mismatch: expected git-cleanup-force, got git-cleanup" in wrong_cleanup.stderr
     cleanup_review = approval_gate.prepare(
         work,
         "9",
         "git-cleanup-force",
         cleanup_evidence,
+        force=True,
     )
     cleanup_review_text = cleanup_review.read_text(encoding="utf-8")
     assert (
@@ -1850,10 +1877,11 @@ def test_git_done_requires_exact_human_cleanup_approval(parent: Path) -> None:
     git(work, "push", "-u", "origin", "main", "-q")
     write(
         work / ".git" / "info" / "exclude",
-        ".xflow/local/\n.xflow/issues/**/approvals/\n",
+        ".xflow/local/\n.xflow/current-task.md\n.xflow/issues/**/approvals/\n",
     )
 
     run_devctl(work, "git", "start", "safe-cleanup", "--issue", "8", "--base", "main")
+    write(work / ".xflow" / "current-task.md", current_task_text("8"))
     enable(work, "8", "XFLOW_HUMAN_UNATTENDED_ALL")
     assert_value_error(
         "invalid approval action",
@@ -1877,7 +1905,7 @@ def test_git_done_requires_exact_human_cleanup_approval(parent: Path) -> None:
         str(evidence),
         expect=1,
     )
-    assert "expected exact git-cleanup" in rejected.stderr
+    assert "action mismatch: expected git-cleanup, got git-push" in rejected.stderr
     assert git_text(work, "branch", "--show-current") == "feat/8-safe-cleanup"
     assert require_active(work, "8").issue == "8"
 
@@ -1907,6 +1935,7 @@ def test_git_done_requires_exact_human_cleanup_approval(parent: Path) -> None:
     assert load(work) is None
 
     run_devctl(work, "git", "start", "unmerged-cleanup", "--issue", "9", "--base", "main")
+    write(work / ".xflow" / "current-task.md", current_task_text("9"))
     unmerged_evidence = work / ".xflow" / "issues" / "issue-9" / "resolution-report.md"
     write(unmerged_evidence, "# Resolution Report\n\nUnmerged cleanup evidence.\n")
     write(work / "unmerged.txt", "unmerged task work\n")
