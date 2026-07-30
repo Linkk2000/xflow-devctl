@@ -24,7 +24,7 @@ from .commit_message import check_commit_message
 from .bindings import resolve_bindings
 from .env import RuntimeContext, load_env_files, python_version, token_status_lines
 from .dependencies import check_dependencies
-from .migration import inspect, write_wrappers
+from .migration import apply_issue_workspace_migration, inspect, inspect_issue_workspace_migration, write_wrappers
 from .paths import default_issue_file, normalized_issue
 from .task_state import activate_task, list_task_states, load_active_task, migrate_legacy_current_task
 
@@ -284,6 +284,11 @@ def build_parser() -> argparse.ArgumentParser:
     migrate_sub = migrate.add_subparsers(dest="migrate_command")
     migrate_sub.add_parser("inspect")
     migrate_sub.add_parser("wrappers")
+    issue_workspace = migrate_sub.add_parser("issue-workspace")
+    issue_workspace.add_argument("--mode", choices=("tracked", "local"), required=True)
+    issue_workspace_action = issue_workspace.add_mutually_exclusive_group(required=True)
+    issue_workspace_action.add_argument("--check", action="store_true")
+    issue_workspace_action.add_argument("--apply", action="store_true")
     return parser
 
 
@@ -1244,6 +1249,30 @@ def run_migrate(args: argparse.Namespace) -> int:
     if args.migrate_command == "wrappers":
         written = write_wrappers(ctx.repo_root)
         print("[INFO] wrote devctl wrappers: " + ", ".join(path.name for path in written))
+        return 0
+    if args.migrate_command == "issue-workspace":
+        report = (
+            apply_issue_workspace_migration(ctx.repo_root, args.mode)
+            if args.apply
+            else inspect_issue_workspace_migration(ctx.repo_root, args.mode)
+        )
+        print(f"mode: {report.mode}")
+        print(f"contract root: {report.contract_root.as_posix()}")
+        print(f"git ignore source: {report.git_ignore_source or '<none>'}")
+        for line in report.exact_ignore_lines:
+            print(f"exact issue workspace ignore line: {line}")
+        for path in report.active_approvals:
+            print(f"active approval: {path}")
+        for path in report.oversized_files:
+            print(f"file over 10 MiB: {path}")
+        for path in report.absolute_path_files:
+            print(f"local absolute path: {path}")
+        for path in report.credential_files:
+            print(f"credential-like text: {path}")
+        if args.apply:
+            if args.mode == "tracked" and report.exact_ignore_lines:
+                print("[INFO] removed exact .gitignore lines: " + ", ".join(report.exact_ignore_lines))
+            print(f"[INFO] issue workspace migration applied: {report.mode}")
         return 0
     raise ValueError(f"unknown migrate subcommand: {args.migrate_command}")
 

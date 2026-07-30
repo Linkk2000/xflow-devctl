@@ -13,6 +13,15 @@ sys.path.insert(0, str(OPS_ROOT))
 from xflow import approval as approval_gate
 
 
+def test_env() -> dict[str, str]:
+    return {
+        **os.environ,
+        "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""),
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONPATH": str(OPS_ROOT),
+    }
+
+
 def git(repo_root: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(repo_root), *args], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -168,7 +177,7 @@ def assert_powershell_help_alias() -> None:
 
 
 def assert_check_commands_are_discoverable() -> None:
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONPATH": str(OPS_ROOT)}
+    env = test_env()
     commands = (
         [sys.executable, "-m", "xflow", "--help"],
         [sys.executable, "-m", "xflow", "check", "--help"],
@@ -207,7 +216,7 @@ def assert_check_commands_are_discoverable() -> None:
 
 
 def assert_unattended_commands_are_discoverable() -> None:
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONPATH": str(OPS_ROOT)}
+    env = test_env()
     commands = (
         [sys.executable, "-m", "xflow", "unattended", "--help"],
         [
@@ -237,7 +246,7 @@ def assert_unattended_commands_are_discoverable() -> None:
 
 
 def assert_task_commands_are_discoverable() -> None:
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "PYTHONPATH": str(OPS_ROOT)}
+    env = test_env()
     commands = (
         [sys.executable, "-m", "xflow", "task", "--help"],
         [
@@ -258,11 +267,35 @@ def assert_task_commands_are_discoverable() -> None:
             assert name in result.stdout, (command, name, result.stdout)
 
 
+def assert_issue_workspace_migration_is_discoverable() -> None:
+    env = test_env()
+    commands = (
+        [sys.executable, "-m", "xflow", "migrate", "--help"],
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(OPS_ROOT / "devctl.ps1"),
+            "migrate",
+            "issue-workspace",
+            "--help",
+        ],
+    )
+    for command in commands:
+        result = subprocess.run(command, cwd=OPS_ROOT, env=env, text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert result.returncode == 0, result.stderr
+        assert "issue-workspace" in result.stdout, (command, result.stdout)
+    assert "--mode {tracked,local}" in subprocess.run(
+        commands[1], cwd=OPS_ROOT, env=env, text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    ).stdout
+
+
 def run_powershell_devctl(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = {
-        **os.environ,
+        **test_env(),
         "DEVCTL_REPO_ROOT": str(repo_root),
-        "PYTHONIOENCODING": "utf-8",
         "PYTHONDONTWRITEBYTECODE": "1",
     }
     result = subprocess.run(
@@ -316,6 +349,7 @@ def main() -> None:
     assert_check_commands_are_discoverable()
     assert_unattended_commands_are_discoverable()
     assert_task_commands_are_discoverable()
+    assert_issue_workspace_migration_is_discoverable()
 
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
