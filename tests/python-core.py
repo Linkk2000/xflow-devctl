@@ -15,6 +15,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import yaml
+
 
 OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
@@ -635,7 +637,6 @@ def test_remote_gate_matrix(parent: Path) -> None:
         "git-push",
         "git-mr",
         "git-pr-merge",
-        "git-state-backfill",
     )
     output = io.StringIO()
     with redirect_stdout(output):
@@ -647,9 +648,13 @@ def test_remote_gate_matrix(parent: Path) -> None:
                 issue_id,
                 manifest if action in {"issue-create", "issue-comment", "git-mr"} else None,
             )
-            assert selected == "unattended"
+            assert selected.source == "unattended"
     expected_log = f"[UNATTENDED] Human approval gate bypassed for current task {issue_id}."
     assert output.getvalue().count(expected_log) == len(actions)
+    assert_value_error(
+        "not eligible",
+        lambda: approval_gate.require_remote_or_unattended(repo, "git-state-backfill", approved_file, issue_id),
+    )
 
     assert_value_error(
         "not eligible",
@@ -1005,6 +1010,7 @@ def test_draft_state_migrates_only_after_confirmed_issue_creation(parent: Path) 
     skipped = run_devctl(repo, "issue", "create", "Skipped provider", "--body-file", str(draft))
     assert "provider skipped" in skipped.stdout
     assert require_active(repo, "draft").issue == "draft"
+    assert not tuple((repo / ".xflow" / "issues").glob("issue-*/approvals/history/*.yaml"))
 
     with RecordingApiServer() as server:
         env = {
@@ -1025,6 +1031,9 @@ def test_draft_state_migrates_only_after_confirmed_issue_creation(parent: Path) 
         assert "Issue #42 created" in created.stdout
         assert require_active(repo, "42").issue == "42"
         assert not list((repo / ".xflow" / "local").glob("unattended.json.*.tmp"))
+        created_history = tuple((repo / ".xflow" / "issues" / "issue-42").glob("approvals/history/*.yaml"))
+        assert len(created_history) == 1
+        assert not tuple((repo / ".xflow" / "issues" / "issue-draft").glob("approvals/history/*.yaml"))
 
     failed_repo = parent / "failed-repo"
     init_test_repo(failed_repo)
@@ -1049,6 +1058,7 @@ def test_draft_state_migrates_only_after_confirmed_issue_creation(parent: Path) 
     )
     assert "request failed" in failed.stderr.lower()
     assert require_active(failed_repo, "draft").issue == "draft"
+    assert not tuple((failed_repo / ".xflow" / "issues").glob("issue-*/approvals/history/*.yaml"))
 
     ambiguous_repo = parent / "ambiguous-repo"
     init_test_repo(ambiguous_repo)
@@ -1074,6 +1084,7 @@ def test_draft_state_migrates_only_after_confirmed_issue_creation(parent: Path) 
         )
         assert "response missing number" in ambiguous.stderr.lower()
     assert require_active(ambiguous_repo, "draft").issue == "draft"
+    assert not tuple((ambiguous_repo / ".xflow" / "issues").glob("issue-*/approvals/history/*.yaml"))
 
 
 def test_env_loading_policy(repo: Path) -> None:
@@ -1653,7 +1664,10 @@ def test_pr_backfill_commit_message_without_push(repo: Path) -> None:
     previous = os.environ.get("DEVCTL_SKIP_PUSH")
     os.environ["DEVCTL_SKIP_PUSH"] = "1"
     try:
-        assert commit_and_push_pr_backfill(repo, "feature/8-pr-backfill", [suggestion], "42", "8")
+        skipped_push = commit_and_push_pr_backfill(repo, "feature/8-pr-backfill", [suggestion], "42", "8")
+        assert skipped_push is not None
+        assert not skipped_push.performed
+        assert not skipped_push.success
     finally:
         if previous is None:
             os.environ.pop("DEVCTL_SKIP_PUSH", None)
@@ -1841,10 +1855,13 @@ def test_git_done_requires_exact_human_cleanup_approval(parent: Path) -> None:
 
     run_devctl(work, "git", "start", "safe-cleanup", "--issue", "8", "--base", "main")
     enable(work, "8", "XFLOW_HUMAN_UNATTENDED_ALL")
-    umbrella = approval_gate.prepare(work, "8", "remote-write", evidence)
-    assert "devctl <remote-write-command>" in umbrella.read_text(encoding="utf-8")
-    umbrella.write_text(
-        umbrella.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"),
+    assert_value_error(
+        "invalid approval action",
+        lambda: approval_gate.prepare(work, "8", "remote-write", evidence),
+    )
+    wrong_action = approval_gate.prepare(work, "8", "git-push", evidence)
+    wrong_action.write_text(
+        wrong_action.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"),
         encoding="utf-8",
         newline="\n",
     )
@@ -2130,6 +2147,8 @@ Closes #8
     history_text = "\n".join(path.read_text(encoding="utf-8") for path in history.glob("*.yaml"))
     assert "action: git-mr" in history_text
     assert "action: git-state-backfill" in history_text
+    assert "source: effect" in history_text
+    assert "parentAction: git-mr" in history_text
     assert "Approved: yes" not in history_text
 
 
@@ -3182,6 +3201,14 @@ Create a plain issue without manual approval when explicitly requested.
                 "--no-local-review",
             )
             assert "Issue #42 created" in plain_result.stdout
+            created_history = repo / ".xflow" / "issues" / "issue-42" / "approvals" / "history"
+            created_payloads = [yaml.safe_load(path.read_text(encoding="utf-8")) for path in created_history.glob("*.yaml")]
+            assert len(created_payloads) == 1
+            assert created_payloads[0]["source"] == "unattended"
+            assert created_payloads[0]["issue"] == "42"
+            assert created_payloads[0]["approvalIssue"] == "draft"
+            draft_history = repo / ".xflow" / "issues" / "issue-draft" / "approvals" / "history"
+            assert not any("action: issue-create" in path.read_text(encoding="utf-8") for path in draft_history.glob("*.yaml"))
             plain_issue_requests = [item for item in plain_server.requests if item["method"] == "POST" and item["path"].endswith("/issues")]
             assert plain_issue_requests
             assert "Need unattended plain issue creation." in str(plain_issue_requests[-1]["json"])

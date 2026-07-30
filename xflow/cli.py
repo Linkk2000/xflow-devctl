@@ -4,6 +4,7 @@ import argparse
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import approval, attachment, providers, rules, unattended
@@ -499,7 +500,7 @@ def run_issue(args: argparse.Namespace) -> int:
         check_action_current_task(ctx.repo_root, issue_id)
         require_requested_unattended(ctx.repo_root, issue_id, args.no_local_review)
         body, file_path, manifest_path = prepare_attachment_body(ctx.repo_root, issue_id, file_path, args)
-        gate_source = approval.require_remote_or_unattended(
+        grant = approval.require_remote_or_unattended(
             ctx.repo_root,
             "issue-comment",
             file_path,
@@ -511,9 +512,7 @@ def run_issue(args: argparse.Namespace) -> int:
             print("[INFO] issue-comment gate passed; provider skipped")
             return 0
         result = providers.comment_issue(ctx.repo_root, issue_id, body, os.environ)
-        approval.record_consumed_approval(
-            ctx.repo_root, issue_id, "issue-comment", file_path, gate_source, "human reviewer", "success"
-        )
+        approval.record_consumed_approval(ctx.repo_root, grant, "success")
         print(f"[INFO] Comment posted on Issue #{issue_id}")
         if result.get("html_url"):
             print(f"[INFO] {result['html_url']}")
@@ -522,14 +521,12 @@ def run_issue(args: argparse.Namespace) -> int:
         issue_id = resolve_action_issue(ctx, args.number)
         file_path = Path(os.environ.get("DEVCTL_APPROVED_FILE", default_issue_file(ctx.repo_root, issue_id, "walkthrough.md")))
         check_action_current_task(ctx.repo_root, issue_id)
-        gate_source = approval.require_remote_or_unattended(ctx.repo_root, "issue-close", file_path, issue_id)
+        grant = approval.require_remote_or_unattended(ctx.repo_root, "issue-close", file_path, issue_id)
         if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
             print("[INFO] issue-close gate passed; provider skipped")
             return 0
         result = providers.close_issue(ctx.repo_root, issue_id, os.environ)
-        approval.record_consumed_approval(
-            ctx.repo_root, issue_id, "issue-close", file_path, gate_source, "human reviewer", "success"
-        )
+        approval.record_consumed_approval(ctx.repo_root, grant, "success")
         unattended.disable(ctx.repo_root)
         print(f"[INFO] Issue #{result.get('number', issue_id)} closed")
         return 0
@@ -540,7 +537,7 @@ def run_issue(args: argparse.Namespace) -> int:
     check_issue_draft(file_path)
     require_requested_unattended(ctx.repo_root, issue_id, args.no_local_review)
     body, file_path, manifest_path = prepare_attachment_body(ctx.repo_root, issue_id, file_path, args)
-    gate_source = approval.require_remote_or_unattended(
+    grant = approval.require_remote_or_unattended(
         ctx.repo_root,
         "issue-create",
         file_path,
@@ -552,10 +549,9 @@ def run_issue(args: argparse.Namespace) -> int:
         print("[INFO] issue-create gate passed; provider skipped")
         return 0
     result = providers.create_issue(ctx.repo_root, args.title, body, args.labels, os.environ)
-    approval.record_consumed_approval(
-        ctx.repo_root, issue_id, "issue-create", file_path, gate_source, "human reviewer", "success"
-    )
-    if gate_source == "unattended":
+    created_issue = normalized_issue(result.number)
+    approval.record_consumed_approval(ctx.repo_root, grant, "success", target_issue=created_issue)
+    if grant.source == "unattended":
         unattended.migrate_issue(ctx.repo_root, issue_id, result.number)
     print(f"[INFO] Issue #{result.number} created")
     if result.html_url:
@@ -748,9 +744,25 @@ def summarize_commit_message(
     return message
 
 
-def push_branch(repo_root: Path, branch: str) -> None:
+@dataclass(frozen=True)
+class PushResult:
+    performed: bool
+    success: bool
+
+
+def record_backfill_effect_if_confirmed(
+    repo_root: Path,
+    grant: approval.ApprovalGrant,
+    push_result: PushResult | None,
+) -> Path | None:
+    if push_result is None or not push_result.performed or not push_result.success:
+        return None
+    return approval.record_subordinate_effect(repo_root, grant, "git-state-backfill", "success")
+
+
+def push_branch(repo_root: Path, branch: str) -> PushResult:
     if os.environ.get("DEVCTL_SKIP_PUSH") == "1":
-        return
+        return PushResult(performed=False, success=False)
     upstream = git_output(repo_root, ["rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}"])
     command = ["push", "origin", branch] if upstream else ["push", "-u", "origin", branch]
     result = subprocess.run(
@@ -764,6 +776,7 @@ def push_branch(repo_root: Path, branch: str) -> None:
     )
     if result.returncode != 0:
         raise ValueError(f"git push failed: {result.stderr.strip() or result.stdout.strip()}")
+    return PushResult(performed=True, success=True)
 
 
 def require_branch_ready_for_mr(repo_root: Path, branch: str) -> None:
@@ -823,7 +836,7 @@ def commit_and_push_pr_backfill(
     paths: list[Path],
     pr_number: str,
     issue: str,
-) -> bool:
+) -> PushResult | None:
     staged_before = {
         line
         for line in git_run(repo_root, ["diff", "--cached", "--name-only"]).splitlines()
@@ -835,7 +848,7 @@ def commit_and_push_pr_backfill(
             + ", ".join(sorted(staged_before))
         )
     if not paths:
-        return False
+        return None
     expected_paths = {
         path.relative_to(repo_root).as_posix()
         for path in paths
@@ -854,7 +867,7 @@ def commit_and_push_pr_backfill(
             f"expected {sorted(expected_paths)}, found {sorted(staged_after)}"
         )
     if not staged_after:
-        return False
+        return None
     message = (
         f"chore(xflow): 回填合并请求状态[#{normalized_issue(issue)}]\n\n"
         "- 记录合并请求编号与远端链接\n"
@@ -862,8 +875,7 @@ def commit_and_push_pr_backfill(
     )
     check_commit_message(message, branch_issue=issue)
     git_run(repo_root, ["commit", "-m", message])
-    push_branch(repo_root, branch)
-    return True
+    return push_branch(repo_root, branch)
 
 
 def run_git_push(ctx: RuntimeContext, args: argparse.Namespace) -> int:
@@ -878,12 +890,13 @@ def run_git_push(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     base = branch_meta(ctx.repo_root, "base") or default_base(ctx.repo_root)
     if branch == base:
         raise ValueError(f"current branch is {base}; start a task branch before pushing")
-    gate_source = approval.require_remote_or_unattended(ctx.repo_root, "git-push", approved_file, issue)
-    push_branch(ctx.repo_root, branch)
-    approval.record_consumed_approval(
-        ctx.repo_root, issue, "git-push", approved_file, gate_source, "human reviewer", "success"
-    )
-    print(f"[INFO] pushed {branch}")
+    grant = approval.require_remote_or_unattended(ctx.repo_root, "git-push", approved_file, issue)
+    push_result = push_branch(ctx.repo_root, branch)
+    if push_result.performed and push_result.success:
+        approval.record_consumed_approval(ctx.repo_root, grant, "success")
+        print(f"[INFO] pushed {branch}")
+    else:
+        print(f"[INFO] push skipped for {branch}")
     return 0
 
 
@@ -1040,7 +1053,7 @@ def run_git(args: argparse.Namespace) -> int:
             raise ValueError(f"pull request head branch mismatch: expected {branch}, got {remote_pr.head}")
         if remote_pr.base != base:
             raise ValueError(f"pull request base branch mismatch: expected {base}, got {remote_pr.base}")
-        gate_source = approval.require_remote_or_unattended(ctx.repo_root, "git-pr-merge", approved_file, issue)
+        grant = approval.require_remote_or_unattended(ctx.repo_root, "git-pr-merge", approved_file, issue)
         result = providers.merge_pull_request(
             ctx.repo_root,
             requested_pr,
@@ -1049,9 +1062,7 @@ def run_git(args: argparse.Namespace) -> int:
             args.commit_message,
             os.environ,
         )
-        approval.record_consumed_approval(
-            ctx.repo_root, issue, "git-pr-merge", approved_file, gate_source, "human reviewer", "success"
-        )
+        approval.record_consumed_approval(ctx.repo_root, grant, "success")
         print(f"[INFO] PR #{args.number} merged")
         if result.get("sha"):
             print(f"[INFO] merge sha: {result['sha']}")
@@ -1077,7 +1088,7 @@ def run_git(args: argparse.Namespace) -> int:
         raise ValueError(f"current branch is {base}; start a task branch before creating an MR")
     require_branch_ready_for_mr(ctx.repo_root, branch)
     require_branch_contains_remote_base(ctx.repo_root, base)
-    gate_source = approval.require_remote_or_unattended(
+    grant = approval.require_remote_or_unattended(
         ctx.repo_root,
         "git-mr",
         body_file,
@@ -1089,33 +1100,22 @@ def run_git(args: argparse.Namespace) -> int:
         print("[INFO] git-mr gate passed; provider skipped")
         return 0
     result = providers.create_pull_request(ctx.repo_root, title, body_file.read_text(encoding="utf-8"), branch, base, os.environ)
-    approval.record_consumed_approval(
-        ctx.repo_root, issue, "git-mr", body_file, gate_source, "human reviewer", "success"
-    )
+    approval.record_consumed_approval(ctx.repo_root, grant, "success")
     set_branch_meta(ctx.repo_root, "pr", result.number)
     if result.html_url:
         set_branch_meta(ctx.repo_root, "pr-url", result.html_url)
-    if gate_source == "unattended":
-        approval.require_remote_or_unattended(
-            ctx.repo_root,
-            "git-state-backfill",
-            body_file,
-            issue,
-            args.attachments,
-        )
     suggestion = write_pr_state_update_suggestion(ctx.repo_root, issue, result.number, result.html_url)
     backfill_paths = [suggestion, *update_current_task_for_pr(ctx.repo_root, issue, result.number, result.html_url)]
     backfill_pushed = commit_and_push_pr_backfill(ctx.repo_root, branch, backfill_paths, result.number, issue)
-    if backfill_pushed:
-        approval.record_consumed_approval(
-            ctx.repo_root, issue, "git-state-backfill", body_file, gate_source, "human reviewer", "success"
-        )
+    record_backfill_effect_if_confirmed(ctx.repo_root, grant, backfill_pushed)
     print(f"[INFO] PR #{result.number} created")
     if result.html_url:
         print(f"[INFO] {result.html_url}")
     print(f"[INFO] state update suggestion: {suggestion}")
-    if backfill_pushed:
+    if backfill_pushed is not None and backfill_pushed.performed and backfill_pushed.success:
         print("[INFO] state backfill pushed")
+    elif backfill_pushed is not None:
+        print("[INFO] state backfill push skipped")
     print(result.number)
     return 0
 

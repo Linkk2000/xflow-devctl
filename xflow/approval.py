@@ -6,17 +6,20 @@ import os
 import re
 import subprocess
 import tempfile
+import uuid
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
-from .bindings import resolve_bindings
+import yaml
+
+from .bindings import GitBindings, resolve_bindings
 from .io import read_text
-from .paths import default_approval_file
+from .paths import default_approval_file, issue_dir, normalized_issue
 from .unattended import require_active
 
 
-UMBRELLA_ACTIONS = {"remote-write", "remote write", "all-remote-writes"}
 UNATTENDED_ACTIONS = {
     "issue-create",
     "issue-comment",
@@ -24,13 +27,19 @@ UNATTENDED_ACTIONS = {
     "git-push",
     "git-mr",
     "git-pr-merge",
-    "git-state-backfill",
 }
+APPROVAL_ACTIONS = UNATTENDED_ACTIONS | {
+    "contract-acceptance",
+    "git-cleanup",
+    "git-cleanup-force",
+}
+HISTORY_ACTIONS = UNATTENDED_ACTIONS | {"git-state-backfill"}
 REQUIRED_TEXT = (
     "# Local Review Approval",
     "Issue:",
     "Reviewer:",
     "Approved At:",
+    "Approval ID:",
     "Repository ID:",
     "Worktree ID:",
     "Branch:",
@@ -39,6 +48,54 @@ REQUIRED_TEXT = (
     "Approved SHA256:",
     "## Decision",
 )
+HISTORY_COMMON_FIELDS = {
+    "version", "reusable", "source", "approvalId", "repository", "worktree", "branch", "issue",
+    "approvalIssue", "action", "approvedFile", "approvedSha256", "reviewerSummary", "result", "recordedAt",
+}
+HISTORY_EFFECT_FIELDS = HISTORY_COMMON_FIELDS | {"parentAction", "parentApprovalId"}
+FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
+APPROVAL_ID_RE = re.compile(r"[0-9a-f]{32,64}")
+CREDENTIAL_PATTERNS = (
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"(?i)\bgh[pousr]_[A-Za-z0-9_]{8,}"),
+    re.compile(r"(?i)(?:^|[^A-Za-z0-9])api[_-]?key\s*[:=]"),
+    re.compile(r"(?i)(?:^|[^A-Za-z0-9])(?:token|secret|password|credential|access[_-]?key)\s*[:=]"),
+)
+
+
+@dataclass(frozen=True)
+class ApprovalGrant:
+    source: Literal["local-review", "unattended"]
+    approval_id: str
+    repository: str
+    worktree: str
+    branch: str
+    approval_issue: str
+    action: str
+    approved_file: str
+    approved_sha256: str
+    reviewer_summary: str
+
+
+def validate_action(action: str, *, history: bool = False) -> str:
+    allowed = HISTORY_ACTIONS if history else APPROVAL_ACTIONS
+    if not isinstance(action, str) or action not in allowed:
+        raise ValueError(f"invalid approval action: {action}")
+    return action
+
+
+def reject_credentials(value: str) -> None:
+    if any(pattern.search(value) for pattern in CREDENTIAL_PATTERNS):
+        raise ValueError("credential-like text is not allowed in approval history")
+
+
+def safe_reviewer_summary(value: str) -> str:
+    candidate = value.strip()
+    if not candidate or len(candidate) > 120 or not re.fullmatch(r"[A-Za-z0-9 .@()_+\-]+", candidate):
+        return "human reviewer"
+    if any(pattern.search(candidate) for pattern in CREDENTIAL_PATTERNS):
+        return "human reviewer"
+    return candidate
 
 
 def sha256_file(path: Path) -> str:
@@ -154,6 +211,8 @@ def prepare(
     attachment_manifest: Path | None = None,
 ) -> Path:
     repo_root = repo_root.resolve()
+    issue = normalized_issue(issue)
+    action = validate_action(action)
     bindings = resolve_bindings(repo_root)
     approved_path = resolve_path(repo_root, approved_file)
     if not approved_path.is_file():
@@ -179,6 +238,7 @@ def prepare(
             f"Attachment Manifest SHA256: {manifest_digest}\n"
         )
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    approval_id = uuid.uuid4().hex
     command = command or suggested_command(action, Path(relative_file), issue, Path(relative_manifest) if relative_manifest else None)
     reviewer = reviewer or default_reviewer(repo_root)
     text = (
@@ -186,6 +246,7 @@ def prepare(
         f"Issue: {issue}\n"
         f"Reviewer: {reviewer}\n"
         f"Approved At: {now}\n"
+        f"Approval ID: {approval_id}\n"
         f"Repository ID: {bindings.repository}\n"
         f"Worktree ID: {bindings.worktree}\n"
         f"Branch: {bindings.branch}\n"
@@ -210,13 +271,14 @@ def prepare(
     return review_file
 
 
-def check(repo_root: Path, issue: str, approved_file: Path, attachment_manifest: Path | None = None) -> None:
-    repo_root = repo_root.resolve()
-    bindings = resolve_bindings(repo_root)
-    review_file = default_approval_file(repo_root, issue)
-    if not review_file.is_file():
-        raise ValueError(f"local review approval required: {review_file}")
-    text = read_text(review_file)
+def _validate_review_text(
+    repo_root: Path,
+    issue: str,
+    approved_file: Path,
+    attachment_manifest: Path | None,
+    text: str,
+    bindings: GitBindings,
+) -> tuple[Path, str]:
     for needle in REQUIRED_TEXT:
         if needle not in text:
             raise ValueError(f"missing required text '{needle}'")
@@ -262,33 +324,90 @@ def check(repo_root: Path, issue: str, approved_file: Path, attachment_manifest:
                 f"hash mismatch for attachment manifest {attachment_manifest}: "
                 f"expected {expected_manifest}, actual {actual_manifest_hash}"
             )
+    return actual, actual_hash
 
 
-def reject_consumed_approval(repo_root: Path, issue: str, action: str, approved_file: Path) -> None:
+def check(repo_root: Path, issue: str, approved_file: Path, attachment_manifest: Path | None = None) -> None:
+    repo_root = repo_root.resolve()
+    issue = normalized_issue(issue)
     bindings = resolve_bindings(repo_root)
-    approved_path = resolve_path(repo_root, approved_file)
-    expected = {
-        "reusable": "false",
-        "repository": bindings.repository,
-        "worktree": bindings.worktree,
-        "branch": bindings.branch,
-        "issue": issue,
-        "action": action,
-        "approvedFile": display_path(repo_root, approved_path),
-        "approvedSha256": sha256_file(approved_path).lower(),
-        "result": "success",
-    }
-    history = repo_root / ".xflow" / "issues" / f"issue-{issue}" / "approvals" / "history"
-    if not history.is_dir():
-        return
-    for record in history.glob("*.yaml"):
-        text = read_text(record)
-        try:
-            if all(field(text, name).strip('"') == value for name, value in expected.items()):
-                raise ValueError(f"approval already consumed: {record}")
-        except ValueError as exc:
-            if str(exc).startswith("approval already consumed:"):
-                raise
+    review_file = default_approval_file(repo_root, issue)
+    if not review_file.is_file():
+        raise ValueError(f"local review approval required: {review_file}")
+    _validate_review_text(
+        repo_root,
+        issue,
+        approved_file,
+        attachment_manifest,
+        read_text(review_file),
+        bindings,
+    )
+
+
+def _timestamp(value: str, label: str) -> None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError) as exc:
+        raise ValueError(f"{label} must be an ISO timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"{label} must include a timezone")
+
+
+def _parse_history(path: Path) -> dict[str, object]:
+    try:
+        payload = yaml.safe_load(read_text(path))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"approval history integrity error in {path}: invalid YAML: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"approval history integrity error in {path}: expected a mapping")
+    source = payload.get("source")
+    expected_fields = HISTORY_EFFECT_FIELDS if source == "effect" else HISTORY_COMMON_FIELDS
+    if set(payload) != expected_fields:
+        raise ValueError(f"approval history integrity error in {path}: unexpected or missing fields")
+    try:
+        if payload["version"] != "0.1.0" or payload["reusable"] is not False or payload["result"] != "success":
+            raise ValueError("invalid fixed fields")
+        if source not in {"local-review", "unattended", "effect"}:
+            raise ValueError("invalid source")
+        for name in ("repository", "worktree"):
+            if not isinstance(payload[name], str) or not FINGERPRINT_RE.fullmatch(payload[name]):
+                raise ValueError(f"invalid {name}")
+        for name in ("issue", "approvalIssue"):
+            if payload[name] != normalized_issue(payload[name]):
+                raise ValueError(f"invalid {name}")
+        if not isinstance(payload["approvalId"], str) or not APPROVAL_ID_RE.fullmatch(payload["approvalId"]):
+            raise ValueError("invalid approvalId")
+        validate_action(payload["action"], history=True)
+        if not isinstance(payload["approvedSha256"], str) or not FINGERPRINT_RE.fullmatch(payload["approvedSha256"]):
+            raise ValueError("invalid approvedSha256")
+        for name in ("branch", "approvedFile", "reviewerSummary", "recordedAt"):
+            if not isinstance(payload[name], str) or not payload[name]:
+                raise ValueError(f"invalid {name}")
+        _timestamp(payload["recordedAt"], "recordedAt")
+        if source == "effect":
+            validate_action(payload["parentAction"])
+            if not isinstance(payload["parentApprovalId"], str) or not APPROVAL_ID_RE.fullmatch(payload["parentApprovalId"]):
+                raise ValueError("invalid parentApprovalId")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"approval history integrity error in {path}: {exc}") from exc
+    reject_credentials(yaml.safe_dump(payload, sort_keys=True, allow_unicode=False))
+    return payload
+
+
+def _history_records(repo_root: Path) -> tuple[dict[str, object], ...]:
+    issues_root = repo_root.resolve() / ".xflow" / "issues"
+    if not issues_root.is_dir():
+        return ()
+    records = []
+    for path in sorted(issues_root.glob("issue-*/approvals/history/*.yaml")):
+        records.append(_parse_history(path))
+    return tuple(records)
+
+
+def reject_consumed_approval(repo_root: Path, approval_id: str) -> None:
+    for record in _history_records(repo_root):
+        if record["source"] in {"local-review", "unattended"} and record["approvalId"] == approval_id:
+            raise ValueError(f"approval already consumed: {approval_id}")
 
 
 def check_reviewed_task_binding(repo_root: Path, issue: str, action: str) -> None:
@@ -298,25 +417,72 @@ def check_reviewed_task_binding(repo_root: Path, issue: str, action: str) -> Non
     check_current_task(repo_root, issue, check_stale_pr=not (issue == "draft" and action == "issue-create"))
 
 
+def _validate_grant(grant: ApprovalGrant) -> None:
+    if grant.source not in {"local-review", "unattended"}:
+        raise ValueError(f"unknown approval source: {grant.source}")
+    if not APPROVAL_ID_RE.fullmatch(grant.approval_id):
+        raise ValueError("invalid approval identity")
+    if not FINGERPRINT_RE.fullmatch(grant.repository) or not FINGERPRINT_RE.fullmatch(grant.worktree):
+        raise ValueError("invalid approval bindings")
+    normalized_issue(grant.approval_issue)
+    validate_action(grant.action)
+    if not FINGERPRINT_RE.fullmatch(grant.approved_sha256):
+        raise ValueError("invalid approved SHA256")
+    reject_credentials(json.dumps(asdict(grant), ensure_ascii=True, sort_keys=True))
+
+
+def _local_grant(
+    repo_root: Path,
+    action: str,
+    approved_file: Path,
+    issue: str,
+    attachment_manifest: Path | None = None,
+) -> ApprovalGrant:
+    action = validate_action(action)
+    issue = normalized_issue(issue)
+    review_file = default_approval_file(repo_root, issue)
+    if not review_file.is_file():
+        raise ValueError(f"local review approval required: {review_file}")
+    text = read_text(review_file)
+    approved_action = field(text, "Approved Action")
+    if approved_action != action:
+        qualifier = "exact " if action == "contract-acceptance" else ""
+        raise ValueError(f"action mismatch: expected {qualifier}{action}, got {approved_action}")
+    bindings = resolve_bindings(repo_root)
+    approved_path, approved_hash = _validate_review_text(
+        repo_root,
+        issue,
+        approved_file,
+        attachment_manifest,
+        text,
+        bindings,
+    )
+    check_reviewed_task_binding(repo_root, issue, action)
+    grant = ApprovalGrant(
+        source="local-review",
+        approval_id=field(text, "Approval ID"),
+        repository=bindings.repository,
+        worktree=bindings.worktree,
+        branch=bindings.branch,
+        approval_issue=issue,
+        action=action,
+        approved_file=display_path(repo_root, approved_path),
+        approved_sha256=approved_hash,
+        reviewer_summary=safe_reviewer_summary(field(text, "Reviewer")),
+    )
+    _validate_grant(grant)
+    reject_consumed_approval(repo_root, grant.approval_id)
+    return grant
+
+
 def require_remote(
     repo_root: Path,
     action: str,
     approved_file: Path,
     issue: str,
     attachment_manifest: Path | None = None,
-) -> None:
-    review_file = default_approval_file(repo_root, issue)
-    if not review_file.is_file():
-        raise ValueError(f"local review approval required: {review_file}")
-    text = read_text(review_file)
-    approved_action = field(text, "Approved Action")
-    if action == "contract-acceptance" and approved_action != action:
-        raise ValueError(f"action mismatch: expected exact {action}, got {approved_action}")
-    if action != "contract-acceptance" and approved_action != action and approved_action.lower() not in UMBRELLA_ACTIONS:
-        raise ValueError(f"action mismatch: expected {action}, got {approved_action}")
-    check(repo_root, issue, approved_file, attachment_manifest)
-    check_reviewed_task_binding(repo_root, issue, action)
-    reject_consumed_approval(repo_root, issue, action, approved_file)
+) -> ApprovalGrant:
+    return _local_grant(repo_root, action, approved_file, issue, attachment_manifest)
 
 
 def require_exact_remote(
@@ -324,14 +490,8 @@ def require_exact_remote(
     action: str,
     approved_file: Path,
     issue: str,
-) -> None:
-    review_file = default_approval_file(repo_root, issue)
-    if not review_file.is_file():
-        raise ValueError(f"local review approval required: {review_file}")
-    approved_action = field(read_text(review_file), "Approved Action")
-    if approved_action != action:
-        raise ValueError(f"action mismatch: expected exact {action}, got {approved_action}")
-    check(repo_root, issue, approved_file)
+) -> ApprovalGrant:
+    return _local_grant(repo_root, action, approved_file, issue)
 
 
 def require_remote_or_unattended(
@@ -341,13 +501,11 @@ def require_remote_or_unattended(
     issue: str,
     attachment_manifest: Path | None = None,
     request_unattended: bool = False,
-) -> str:
+) -> ApprovalGrant:
     if action == "contract-acceptance":
         if request_unattended:
             raise ValueError("contract-acceptance is not eligible for unattended mode")
-        check_reviewed_task_binding(repo_root, issue, action)
-        require_exact_remote(repo_root, action, approved_file, issue)
-        return "local-review"
+        return require_exact_remote(repo_root, action, approved_file, issue)
     if action not in UNATTENDED_ACTIONS:
         raise ValueError(f"remote action {action} is not eligible for unattended mode")
 
@@ -360,22 +518,27 @@ def require_remote_or_unattended(
     except ValueError:
         if request_unattended:
             raise ValueError("--no-local-review requires active task-scoped unattended mode") from None
-        require_remote(repo_root, action, approved_file, issue, attachment_manifest)
-        return "local-review"
+        return require_remote(repo_root, action, approved_file, issue, attachment_manifest)
 
     print(f"[UNATTENDED] Human approval gate bypassed for current task {state.issue}.")
-    return "unattended"
-
-
-def _history_scalar(value: str) -> str:
-    if value and all(character.isalnum() or character in "._/-:@+" for character in value):
-        return value
-    return json.dumps(value, ensure_ascii=True)
-
-
-def reject_credential_text(value: str) -> None:
-    if re.search(r"(?i)(?:^|[^A-Za-z0-9])(?:token|secret|password|credential)\s*[:=]", value):
-        raise ValueError("credential-like text is not allowed in approval history")
+    bindings = resolve_bindings(repo_root)
+    approved_path = resolve_path(repo_root, approved_file)
+    approved_hash = sha256_file(approved_path).lower()
+    grant = ApprovalGrant(
+        source="unattended",
+        approval_id=uuid.uuid4().hex,
+        repository=bindings.repository,
+        worktree=bindings.worktree,
+        branch=bindings.branch,
+        approval_issue=normalized_issue(issue),
+        action=action,
+        approved_file=display_path(repo_root, approved_path),
+        approved_sha256=approved_hash,
+        reviewer_summary="task-scoped-unattended",
+    )
+    _validate_grant(grant)
+    reject_consumed_approval(repo_root, grant.approval_id)
+    return grant
 
 
 def _write_history_atomic(path: Path, content: str) -> None:
@@ -396,55 +559,126 @@ def _write_history_atomic(path: Path, content: str) -> None:
             temporary.unlink()
 
 
+def _history_path(repo_root: Path, issue: str, action: str, recorded_at: str) -> Path:
+    issue = normalized_issue(issue)
+    action = validate_action(action, history=True)
+    issue_root = issue_dir(repo_root.resolve(), issue).resolve()
+    history_root = (issue_root / "approvals" / "history").resolve()
+    try:
+        history_root.relative_to(issue_root)
+    except ValueError as exc:
+        raise ValueError("approval history path escapes Issue directory") from exc
+    timestamp = recorded_at.replace("-", "").replace(":", "").replace(".", "")
+    target = (history_root / f"{timestamp}-{action}.yaml").resolve()
+    if target.parent != history_root:
+        raise ValueError("approval history path escapes history directory")
+    return target
+
+
+def _record_payload(
+    grant: ApprovalGrant,
+    target_issue: str,
+    recorded_at: str,
+    *,
+    source: Literal["local-review", "unattended", "effect"] | None = None,
+    action: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "version": "0.1.0",
+        "reusable": False,
+        "source": source or grant.source,
+        "approvalId": grant.approval_id,
+        "repository": grant.repository,
+        "worktree": grant.worktree,
+        "branch": grant.branch,
+        "issue": normalized_issue(target_issue),
+        "approvalIssue": grant.approval_issue,
+        "action": action or grant.action,
+        "approvedFile": grant.approved_file,
+        "approvedSha256": grant.approved_sha256,
+        "reviewerSummary": grant.reviewer_summary,
+        "result": "success",
+        "recordedAt": recorded_at,
+    }
+    return payload
+
+
 def record_consumed_approval(
     repo_root: Path,
-    issue: str,
-    action: str,
-    approved_file: Path,
-    source: Literal["local-review", "unattended"],
-    reviewer_summary: str,
+    grant: ApprovalGrant,
     result: Literal["success"],
+    *,
+    target_issue: str | None = None,
 ) -> Path:
-    if source not in {"local-review", "unattended"}:
-        raise ValueError(f"unknown approval source: {source}")
     if result != "success":
         raise ValueError("consumed approval records require confirmed success")
     repo_root = repo_root.resolve()
-    bindings = resolve_bindings(repo_root)
-    if source == "local-review":
-        check_reviewed_task_binding(repo_root, issue, action)
-    approved_path = resolve_path(repo_root, approved_file)
-    approved_hash = sha256_file(approved_path).lower()
-    if source == "local-review":
-        review_file = default_approval_file(repo_root, issue)
-        review_text = read_text(review_file)
-        reviewer_summary = field(review_text, "Reviewer")
-        reject_placeholder(review_text, "Reviewer")
-        reject_credential_text(reviewer_summary)
-    else:
-        reviewer_summary = "task-scoped-unattended"
+    _validate_grant(grant)
+    reject_consumed_approval(repo_root, grant.approval_id)
     recorded_at = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
-    timestamp = recorded_at.replace("-", "").replace(":", "").replace(".", "")
-    history_file = (
-        repo_root / ".xflow" / "issues" / f"issue-{issue}" / "approvals" / "history" / f"{timestamp}-{action}.yaml"
+    issue = target_issue or grant.approval_issue
+    history_file = _history_path(repo_root, issue, grant.action, recorded_at)
+    payload = _record_payload(grant, issue, recorded_at)
+    content = yaml.safe_dump(payload, sort_keys=False, allow_unicode=False)
+    reject_credentials(content)
+    _write_history_atomic(history_file, content)
+    return history_file
+
+
+def record_subordinate_effect(
+    repo_root: Path,
+    parent_grant: ApprovalGrant,
+    action: Literal["git-state-backfill"],
+    result: Literal["success"],
+) -> Path:
+    if result != "success":
+        raise ValueError("subordinate effect records require confirmed success")
+    if action != "git-state-backfill" or parent_grant.action != "git-mr":
+        raise ValueError("git-state-backfill must be a subordinate effect of git-mr")
+    repo_root = repo_root.resolve()
+    _validate_grant(parent_grant)
+    records = _history_records(repo_root)
+    parent_records = [
+        record
+        for record in records
+        if record["source"] in {"local-review", "unattended"}
+        and record["approvalId"] == parent_grant.approval_id
+    ]
+    if not parent_records:
+        raise ValueError("git-state-backfill requires a consumed git-mr parent approval")
+    expected_parent = _record_payload(
+        parent_grant,
+        parent_grant.approval_issue,
+        str(parent_records[0]["recordedAt"]),
     )
-    content = "\n".join(
-        (
-            "version: 0.1.0",
-            "reusable: false",
-            f"source: {source}",
-            f"repository: {bindings.repository}",
-            f"worktree: {bindings.worktree}",
-            f"branch: {_history_scalar(bindings.branch)}",
-            f"issue: {json.dumps(issue, ensure_ascii=True)}",
-            f"action: {_history_scalar(action)}",
-            f"approvedFile: {_history_scalar(display_path(repo_root, approved_path))}",
-            f"approvedSha256: {approved_hash}",
-            f"reviewerSummary: {_history_scalar(reviewer_summary)}",
-            "result: success",
-            f"recordedAt: {recorded_at}",
-            "",
-        )
+    if len(parent_records) != 1 or parent_records[0] != expected_parent:
+        raise ValueError("git-state-backfill parent approval snapshot mismatch")
+    if any(
+        record["source"] == "effect"
+        and record["parentApprovalId"] == parent_grant.approval_id
+        and record["action"] == action
+        for record in records
+    ):
+        raise ValueError("git-state-backfill effect already recorded")
+    recorded_at = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    effect_id = hashlib.sha256(f"effect\0{parent_grant.approval_id}\0{action}".encode("utf-8")).hexdigest()
+    effect_grant = ApprovalGrant(
+        source=parent_grant.source,
+        approval_id=effect_id,
+        repository=parent_grant.repository,
+        worktree=parent_grant.worktree,
+        branch=parent_grant.branch,
+        approval_issue=parent_grant.approval_issue,
+        action=parent_grant.action,
+        approved_file=parent_grant.approved_file,
+        approved_sha256=parent_grant.approved_sha256,
+        reviewer_summary="subordinate-effect",
     )
+    payload = _record_payload(effect_grant, parent_grant.approval_issue, recorded_at, source="effect", action=action)
+    payload["parentAction"] = parent_grant.action
+    payload["parentApprovalId"] = parent_grant.approval_id
+    history_file = _history_path(repo_root, parent_grant.approval_issue, action, recorded_at)
+    content = yaml.safe_dump(payload, sort_keys=False, allow_unicode=False)
+    reject_credentials(content)
     _write_history_atomic(history_file, content)
     return history_file
