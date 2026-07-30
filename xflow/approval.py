@@ -53,6 +53,9 @@ HISTORY_COMMON_FIELDS = {
     "approvalIssue", "action", "approvedFile", "approvedSha256", "reviewerSummary", "result", "recordedAt",
 }
 HISTORY_EFFECT_FIELDS = HISTORY_COMMON_FIELDS | {"parentAction", "parentApprovalId"}
+EFFECT_ACTION = "git-state-backfill"
+EFFECT_PARENT_ACTION = "git-mr"
+EFFECT_REVIEWER_SUMMARY = "subordinate-effect"
 FINGERPRINT_RE = re.compile(r"[0-9a-f]{64}")
 APPROVAL_ID_RE = re.compile(r"[0-9a-f]{32,64}")
 CREDENTIAL_PATTERNS = (
@@ -353,7 +356,16 @@ def _timestamp(value: str, label: str) -> None:
         raise ValueError(f"{label} must include a timezone")
 
 
-def _parse_history(path: Path) -> dict[str, object]:
+def _effect_identity(payload: dict[str, object]) -> str:
+    identity_fields = {
+        name: payload[name]
+        for name in sorted(HISTORY_EFFECT_FIELDS - {"approvalId"})
+    }
+    material = json.dumps(identity_fields, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(f"xflow-approval-effect-v1\0{material}".encode("utf-8")).hexdigest()
+
+
+def _parse_history(repo_root: Path, path: Path) -> dict[str, object]:
     try:
         payload = yaml.safe_load(read_text(path))
     except (OSError, UnicodeError, yaml.YAMLError) as exc:
@@ -377,7 +389,6 @@ def _parse_history(path: Path) -> dict[str, object]:
                 raise ValueError(f"invalid {name}")
         if not isinstance(payload["approvalId"], str) or not APPROVAL_ID_RE.fullmatch(payload["approvalId"]):
             raise ValueError("invalid approvalId")
-        validate_action(payload["action"], history=True)
         if not isinstance(payload["approvedSha256"], str) or not FINGERPRINT_RE.fullmatch(payload["approvedSha256"]):
             raise ValueError("invalid approvedSha256")
         for name in ("branch", "approvedFile", "reviewerSummary", "recordedAt"):
@@ -385,9 +396,32 @@ def _parse_history(path: Path) -> dict[str, object]:
                 raise ValueError(f"invalid {name}")
         _timestamp(payload["recordedAt"], "recordedAt")
         if source == "effect":
-            validate_action(payload["parentAction"])
+            if payload["action"] != EFFECT_ACTION:
+                raise ValueError(f"effect action must be {EFFECT_ACTION}")
+            if payload["parentAction"] != EFFECT_PARENT_ACTION:
+                raise ValueError(f"effect parentAction must be {EFFECT_PARENT_ACTION}")
+            if payload["reviewerSummary"] != EFFECT_REVIEWER_SUMMARY:
+                raise ValueError(f"effect reviewerSummary must be {EFFECT_REVIEWER_SUMMARY}")
+            if payload["issue"] != payload["approvalIssue"]:
+                raise ValueError("effect Issue must match approvalIssue")
             if not isinstance(payload["parentApprovalId"], str) or not APPROVAL_ID_RE.fullmatch(payload["parentApprovalId"]):
                 raise ValueError("invalid parentApprovalId")
+            if payload["approvalId"] != _effect_identity(payload):
+                raise ValueError("invalid effect approvalId")
+        else:
+            validate_action(payload["action"])
+            if source == "unattended" and payload["reviewerSummary"] != "task-scoped-unattended":
+                raise ValueError("invalid unattended reviewerSummary")
+            if source == "local-review" and payload["reviewerSummary"] == EFFECT_REVIEWER_SUMMARY:
+                raise ValueError("reserved local-review reviewerSummary")
+        expected_path = _history_path(
+            repo_root,
+            str(payload["issue"]),
+            str(payload["action"]),
+            str(payload["recordedAt"]),
+        )
+        if path.resolve() != expected_path:
+            raise ValueError("history path does not match record Issue, action, and timestamp")
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"approval history integrity error in {path}: {exc}") from exc
     reject_credentials(yaml.safe_dump(payload, sort_keys=True, allow_unicode=False))
@@ -398,10 +432,47 @@ def _history_records(repo_root: Path) -> tuple[dict[str, object], ...]:
     issues_root = repo_root.resolve() / ".xflow" / "issues"
     if not issues_root.is_dir():
         return ()
-    records = []
+    located_records: list[tuple[Path, dict[str, object]]] = []
     for path in sorted(issues_root.glob("issue-*/approvals/history/*.yaml")):
-        records.append(_parse_history(path))
-    return tuple(records)
+        located_records.append((path, _parse_history(repo_root, path)))
+
+    direct_by_id: dict[str, tuple[Path, dict[str, object]]] = {}
+    for path, record in located_records:
+        if record["source"] == "effect":
+            continue
+        approval_id = str(record["approvalId"])
+        if approval_id in direct_by_id:
+            raise ValueError(f"approval history integrity error in {path}: duplicate direct approvalId")
+        direct_by_id[approval_id] = (path, record)
+
+    seen_effects: set[tuple[str, str]] = set()
+    inherited_fields = (
+        "repository",
+        "worktree",
+        "branch",
+        "issue",
+        "approvalIssue",
+        "approvedFile",
+        "approvedSha256",
+    )
+    for path, record in located_records:
+        if record["source"] != "effect":
+            continue
+        parent_id = str(record["parentApprovalId"])
+        parent_entry = direct_by_id.get(parent_id)
+        if parent_entry is None:
+            raise ValueError(f"approval history integrity error in {path}: missing direct parent approval")
+        _, parent = parent_entry
+        if parent["action"] != EFFECT_PARENT_ACTION:
+            raise ValueError(f"approval history integrity error in {path}: parent is not a git-mr approval")
+        if any(record[name] != parent[name] for name in inherited_fields):
+            raise ValueError(f"approval history integrity error in {path}: effect parent snapshot mismatch")
+        effect_key = (parent_id, str(record["action"]))
+        if effect_key in seen_effects:
+            raise ValueError(f"approval history integrity error in {path}: duplicate subordinate effect")
+        seen_effects.add(effect_key)
+
+    return tuple(record for _, record in located_records)
 
 
 def reject_consumed_approval(repo_root: Path, approval_id: str) -> None:
@@ -428,6 +499,13 @@ def _validate_grant(grant: ApprovalGrant) -> None:
     validate_action(grant.action)
     if not FINGERPRINT_RE.fullmatch(grant.approved_sha256):
         raise ValueError("invalid approved SHA256")
+    if grant.source == "unattended" and grant.reviewer_summary != "task-scoped-unattended":
+        raise ValueError("invalid unattended reviewer summary")
+    if grant.source == "local-review" and grant.reviewer_summary in {
+        "task-scoped-unattended",
+        EFFECT_REVIEWER_SUMMARY,
+    }:
+        raise ValueError("reserved local-review reviewer summary")
     reject_credentials(json.dumps(asdict(grant), ensure_ascii=True, sort_keys=True))
 
 
@@ -603,6 +681,22 @@ def _record_payload(
     return payload
 
 
+def _record_target_issue(grant: ApprovalGrant, target_issue: str | None) -> str:
+    approval_issue = normalized_issue(grant.approval_issue)
+    if grant.action == "issue-create" and approval_issue == "draft":
+        if target_issue is None:
+            raise ValueError("draft issue-create history requires a provider-confirmed non-draft target")
+        target = normalized_issue(target_issue)
+        if target == "draft":
+            raise ValueError("draft issue-create history requires a provider-confirmed non-draft target")
+        return target
+
+    target = approval_issue if target_issue is None else normalized_issue(target_issue)
+    if target != approval_issue:
+        raise ValueError(f"approval history target Issue mismatch: expected {approval_issue}, got {target}")
+    return target
+
+
 def record_consumed_approval(
     repo_root: Path,
     grant: ApprovalGrant,
@@ -616,7 +710,7 @@ def record_consumed_approval(
     _validate_grant(grant)
     reject_consumed_approval(repo_root, grant.approval_id)
     recorded_at = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
-    issue = target_issue or grant.approval_issue
+    issue = _record_target_issue(grant, target_issue)
     history_file = _history_path(repo_root, issue, grant.action, recorded_at)
     payload = _record_payload(grant, issue, recorded_at)
     content = yaml.safe_dump(payload, sort_keys=False, allow_unicode=False)
@@ -633,7 +727,7 @@ def record_subordinate_effect(
 ) -> Path:
     if result != "success":
         raise ValueError("subordinate effect records require confirmed success")
-    if action != "git-state-backfill" or parent_grant.action != "git-mr":
+    if action != EFFECT_ACTION or parent_grant.action != EFFECT_PARENT_ACTION:
         raise ValueError("git-state-backfill must be a subordinate effect of git-mr")
     repo_root = repo_root.resolve()
     _validate_grant(parent_grant)
@@ -661,22 +755,26 @@ def record_subordinate_effect(
     ):
         raise ValueError("git-state-backfill effect already recorded")
     recorded_at = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
-    effect_id = hashlib.sha256(f"effect\0{parent_grant.approval_id}\0{action}".encode("utf-8")).hexdigest()
-    effect_grant = ApprovalGrant(
-        source=parent_grant.source,
-        approval_id=effect_id,
-        repository=parent_grant.repository,
-        worktree=parent_grant.worktree,
-        branch=parent_grant.branch,
-        approval_issue=parent_grant.approval_issue,
-        action=parent_grant.action,
-        approved_file=parent_grant.approved_file,
-        approved_sha256=parent_grant.approved_sha256,
-        reviewer_summary="subordinate-effect",
-    )
-    payload = _record_payload(effect_grant, parent_grant.approval_issue, recorded_at, source="effect", action=action)
-    payload["parentAction"] = parent_grant.action
-    payload["parentApprovalId"] = parent_grant.approval_id
+    payload: dict[str, object] = {
+        "version": "0.1.0",
+        "reusable": False,
+        "source": "effect",
+        "approvalId": "",
+        "repository": parent_grant.repository,
+        "worktree": parent_grant.worktree,
+        "branch": parent_grant.branch,
+        "issue": parent_grant.approval_issue,
+        "approvalIssue": parent_grant.approval_issue,
+        "action": EFFECT_ACTION,
+        "approvedFile": parent_grant.approved_file,
+        "approvedSha256": parent_grant.approved_sha256,
+        "reviewerSummary": EFFECT_REVIEWER_SUMMARY,
+        "result": "success",
+        "recordedAt": recorded_at,
+        "parentAction": EFFECT_PARENT_ACTION,
+        "parentApprovalId": parent_grant.approval_id,
+    }
+    payload["approvalId"] = _effect_identity(payload)
     history_file = _history_path(repo_root, parent_grant.approval_issue, action, recorded_at)
     content = yaml.safe_dump(payload, sort_keys=False, allow_unicode=False)
     reject_credentials(content)

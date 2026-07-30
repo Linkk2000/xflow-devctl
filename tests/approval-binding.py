@@ -211,6 +211,31 @@ def test_history_integrity(repo_root: Path, approved_file: Path) -> None:
     )
 
 
+def test_effect_masquerade_fails_closed(repo_root: Path, approved_file: Path) -> None:
+    review = approval.prepare(repo_root, "202", "git-push", approved_file, force=True)
+    approve(review)
+    grant = approval.require_remote(repo_root, "git-push", approved_file, "202")
+    record = approval.record_consumed_approval(repo_root, grant, "success")
+    payload = yaml.safe_load(record.read_text(encoding="utf-8"))
+    payload["source"] = "effect"
+    payload["parentAction"] = "git-mr"
+    payload["parentApprovalId"] = "a" * 32
+    record.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+    assert_value_error(
+        "approval history integrity error",
+        lambda: approval.require_remote(repo_root, "git-push", approved_file, "202"),
+    )
+    assert_value_error(
+        "approval history integrity error",
+        lambda: approval.record_consumed_approval(
+            repo_root,
+            replace(grant, approval_id="b" * 32, action="git-mr"),
+            "success",
+        ),
+    )
+
+
 def test_history_path_validation(repo_root: Path, approved_file: Path) -> None:
     review = approval.prepare(repo_root, "202", "git-push", approved_file, force=True)
     approve(review)
@@ -229,7 +254,25 @@ def test_history_path_validation(repo_root: Path, approved_file: Path) -> None:
                 repo_root, replace(grant, action=invalid_action), "success"
             ),
         )
+    assert_value_error(
+        "target Issue mismatch",
+        lambda: approval.record_consumed_approval(repo_root, grant, "success", target_issue="303"),
+    )
+    for action in ("issue-comment", "git-mr"):
+        review = approval.prepare(repo_root, "202", action, approved_file, force=True)
+        approve(review)
+        action_grant = approval.require_remote(repo_root, action, approved_file, "202")
+        assert_value_error(
+            "target Issue mismatch",
+            lambda action_grant=action_grant: approval.record_consumed_approval(
+                repo_root,
+                action_grant,
+                "success",
+                target_issue="303",
+            ),
+        )
     assert not (repo_root / ".xflow" / "escape").exists()
+    assert not (repo_root / ".xflow" / "issues" / "issue-303" / "approvals" / "history").exists()
 
 
 def test_credential_safety(repo_root: Path, approved_file: Path) -> None:
@@ -352,7 +395,15 @@ State: G1_APPROVE_ISSUE_CREATE
     review = approval.prepare(repo_root, "draft", "issue-create", draft_file, force=True)
     approve(review)
     create_grant = approval.require_remote(repo_root, "issue-create", draft_file, "draft")
-    record = approval.record_consumed_approval(repo_root, create_grant, "success", target_issue="42")
+    assert_value_error(
+        "provider-confirmed non-draft target",
+        lambda: approval.record_consumed_approval(repo_root, create_grant, "success"),
+    )
+    assert_value_error(
+        "provider-confirmed non-draft target",
+        lambda: approval.record_consumed_approval(repo_root, create_grant, "success", target_issue="draft"),
+    )
+    record = approval.record_consumed_approval(repo_root, create_grant, "success", target_issue="#42")
     payload = yaml.safe_load(record.read_text(encoding="utf-8"))
     assert record.parent == repo_root / ".xflow" / "issues" / "issue-42" / "approvals" / "history"
     assert payload["issue"] == "42"
@@ -392,6 +443,21 @@ State: S9_REMOTE_REVIEW_AND_CI
         "effect already recorded",
         lambda: approval.record_subordinate_effect(repo_root, mr_grant, "git-state-backfill", "success"),
     )
+    for field_name, invalid_value in (
+        ("action", "git-push"),
+        ("parentAction", "git-push"),
+        ("reviewerSummary", "human reviewer"),
+        ("approvalId", "c" * 64),
+        ("approvedFile", "different-parent-artifact.md"),
+    ):
+        invalid_effect = dict(effect_payload)
+        invalid_effect[field_name] = invalid_value
+        effect.write_text(yaml.safe_dump(invalid_effect, sort_keys=False), encoding="utf-8")
+        assert_value_error(
+            "approval history integrity error",
+            lambda: approval.require_remote(repo_root, "git-mr", approved_file, "202"),
+        )
+    effect.write_text(yaml.safe_dump(effect_payload, sort_keys=False), encoding="utf-8")
     assert_value_error(
         "subordinate effect of git-mr",
         lambda: approval.record_subordinate_effect(repo_root, replace(mr_grant, action="git-push"), "git-state-backfill", "success"),
@@ -586,6 +652,8 @@ def main() -> None:
 
         integrity_repo, integrity_file = init_active_repo(root, "history-integrity")
         test_history_integrity(integrity_repo, integrity_file)
+        masquerade_repo, masquerade_file = init_active_repo(root, "effect-masquerade")
+        test_effect_masquerade_fails_closed(masquerade_repo, masquerade_file)
         path_repo, path_file = init_active_repo(root, "history-paths")
         test_history_path_validation(path_repo, path_file)
         credential_repo, credential_file = init_active_repo(root, "credential-safety")
