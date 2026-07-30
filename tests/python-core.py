@@ -22,6 +22,7 @@ sys.path.insert(0, str(OPS_ROOT))
 from xflow.checks import check_resolution_report, write_pr_state_update_suggestion
 from xflow import approval as approval_gate
 from xflow import providers as provider_module
+from xflow.bindings import resolve_bindings
 from xflow.commit_message import check_commit_message
 from xflow.dependencies import DependencyCheckResult, check_dependencies
 from xflow.env import load_env_files
@@ -34,7 +35,7 @@ from xflow.providers import (
     list_issues,
     show_issue,
 )
-from xflow.paths import default_approval_file, default_issue_file, issue_dir
+from xflow.paths import active_task_pointer_file, default_approval_file, default_issue_file, issue_dir
 from xflow.cli import branch_name_from_slug, commit_and_push_pr_backfill, summarize_commit_message
 from xflow.task_state import TaskState, activate_task, render_task_state
 from xflow.unattended import disable, enable, load, migrate_issue, require_active
@@ -3195,6 +3196,7 @@ Create a plain issue without manual approval when explicitly requested.
                 "XFLOW_PLATFORM": "github",
                 "DEVCTL_SKIP_PROVIDER_LOAD": "0",
             }
+            assert not active_task_pointer_file(repo, resolve_bindings(repo).worktree).exists()
             run_devctl(
                 repo,
                 "approval",

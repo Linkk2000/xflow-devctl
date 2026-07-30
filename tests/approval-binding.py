@@ -13,6 +13,8 @@ OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
 from xflow import approval
+from xflow.bindings import resolve_bindings
+from xflow.paths import active_task_pointer_file
 from xflow.task_state import TaskState, activate_task, render_task_state
 
 
@@ -134,12 +136,41 @@ def test_consumed_record(repo_root: Path, approved_file: Path) -> None:
     )
 
 
+def test_legacy_pr_merge_review(repo_root: Path) -> None:
+    git(repo_root, "config", "extensions.worktreeConfig", "true")
+    git(repo_root, "config", "--worktree", "devctl.issue", "1")
+    git(repo_root, "config", "--worktree", "devctl.base", "main")
+    git(repo_root, "config", "--worktree", "devctl.pr", "42")
+    write(
+        repo_root / ".xflow" / "current-task.md",
+        """# XFlow Current Task
+
+Issue: 1
+State: S9_REMOTE_REVIEW_AND_CI
+
+## Allowed Actions
+- Merge the approved PR.
+
+## Forbidden Actions
+- Push unreviewed changes.
+""",
+    )
+    mr_file = repo_root / ".xflow" / "issues" / "issue-1" / "mr-draft.md"
+    write(mr_file, "<!-- xflow: mr-draft -->\n\nLegacy PR merge evidence.\n")
+    pointer = active_task_pointer_file(repo_root, resolve_bindings(repo_root).worktree)
+    assert not pointer.exists()
+    review = approval.prepare(repo_root, "1", "git-pr-merge", mr_file, reviewer="human reviewer")
+    approve(review)
+    assert approval.require_remote_or_unattended(repo_root, "git-pr-merge", mr_file, "1") == "local-review"
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         worktree_a = root / "worktree-a"
         worktree_b = root / "worktree-b"
         repository_c = root / "repository-c"
+        legacy_repo = root / "legacy-pr-merge"
         git(root, "init", "-q", str(worktree_a))
         git(worktree_a, "config", "user.email", "test@example.com")
         git(worktree_a, "config", "user.name", "Test User")
@@ -213,6 +244,16 @@ def main() -> None:
             ),
         )
         test_consumed_record(worktree_a, a_file)
+
+        git(root, "init", "-q", str(legacy_repo))
+        git(legacy_repo, "config", "user.email", "test@example.com")
+        git(legacy_repo, "config", "user.name", "Test User")
+        git(legacy_repo, "checkout", "-b", "main", "-q")
+        write(legacy_repo / "README.md", "# Legacy\n")
+        git(legacy_repo, "add", "README.md")
+        git(legacy_repo, "commit", "-m", "init", "-q")
+        git(legacy_repo, "checkout", "-b", "feature/1-recorded-merge", "-q")
+        test_legacy_pr_merge_review(legacy_repo)
 
     print("approval binding ok")
 
