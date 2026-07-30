@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -424,6 +425,14 @@ def test_native_descriptor_failures_are_normalized(repo_root: Path) -> None:
                 raise OSError("simulated fstat race")
             return len(VALID.encode("utf-8"))
 
+        def snapshot(self, handle: int) -> tuple[object, ...]:
+            if self.fail_size:
+                raise OSError("simulated fstat race")
+            return (1, 2, len(VALID.encode("utf-8")), 3, 4)
+
+        def final_path(self, handle: int) -> Path:
+            return self._paths[handle]
+
         def is_regular_file(self, handle: int) -> bool:
             return True
 
@@ -476,6 +485,9 @@ def test_windows_reparse_component_never_opens_unc_target(repo_root: Path) -> No
         def file_size(self, handle: int) -> int:
             return 0
 
+        def final_path(self, handle: int) -> Path:
+            return self._paths[handle]
+
         def read(self, handle: int, size: int) -> bytes:
             raise AssertionError("a reparse component must be rejected before reading")
 
@@ -494,6 +506,166 @@ def test_windows_reparse_component_never_opens_unc_target(repo_root: Path) -> No
         issue_dir,
     ]
     assert fake.closed == [4, 3, 2, 1]
+
+
+def test_windows_final_path_mismatch_is_rejected_before_read(repo_root: Path) -> None:
+    issue_dir = repo_root / ".xflow" / "issues" / "issue-owner"
+    path = issue_dir / "classification.yaml"
+
+    class FakeWindowsApi:
+        def __init__(self) -> None:
+            self._paths: dict[int, Path] = {}
+            self.read_called = False
+
+        def open(self, target: Path, *, directory: bool) -> int:
+            handle = len(self._paths) + 1
+            self._paths[handle] = target
+            return handle
+
+        def attributes(self, handle: int) -> int:
+            if self._paths[handle] == path:
+                return 0
+            return classification_module._WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+
+        def final_path(self, handle: int) -> Path:
+            target = self._paths[handle]
+            if target == path:
+                return issue_dir / "other.yaml"
+            return target
+
+        def file_size(self, handle: int) -> int:
+            return len(VALID.encode("utf-8"))
+
+        def is_regular_file(self, handle: int) -> bool:
+            return True
+
+        def read(self, handle: int, size: int) -> bytes:
+            self.read_called = True
+            raise AssertionError("ownership mismatch must be rejected before reading")
+
+        def close(self, handle: int) -> None:
+            pass
+
+    fake = FakeWindowsApi()
+    assert_value_error(
+        "classification file handle path mismatch",
+        lambda: classification_module._read_stable_text_windows(repo_root, path, issue_dir, fake),
+    )
+    assert not fake.read_called
+
+
+def test_windows_in_place_write_during_chunked_read_is_rejected(repo_root: Path) -> None:
+    issue_dir = repo_root / ".xflow" / "issues" / "issue-write-win"
+    path = issue_dir / "classification.yaml"
+    payload = VALID.encode("utf-8")
+
+    class FakeWindowsApi:
+        def __init__(self) -> None:
+            self._paths: dict[int, Path] = {}
+            self._read_count = 0
+            self._changed = False
+
+        def open(self, target: Path, *, directory: bool) -> int:
+            handle = len(self._paths) + 1
+            self._paths[handle] = target
+            return handle
+
+        def attributes(self, handle: int) -> int:
+            if self._paths[handle] == path:
+                return 0
+            return classification_module._WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+
+        def final_path(self, handle: int) -> Path:
+            return self._paths[handle]
+
+        def snapshot(self, handle: int) -> tuple[object, ...]:
+            return (7, 11, len(payload), 101, 202 if self._changed else 201)
+
+        def file_size(self, handle: int) -> int:
+            return len(payload)
+
+        def is_regular_file(self, handle: int) -> bool:
+            return True
+
+        def read(self, handle: int, size: int) -> bytes:
+            self._read_count += 1
+            if self._read_count == 1:
+                self._changed = True
+                return payload[: len(payload) // 2]
+            if self._read_count == 2:
+                return payload[len(payload) // 2 :]
+            return b""
+
+        def close(self, handle: int) -> None:
+            pass
+
+    assert_value_error(
+        "classification file changed while reading",
+        lambda: classification_module._read_stable_text_windows(repo_root, path, issue_dir, FakeWindowsApi()),
+    )
+
+
+def test_posix_in_place_write_during_chunked_read_is_rejected(repo_root: Path) -> None:
+    issue_dir = repo_root / ".xflow" / "issues" / "issue-write-posix"
+    path = issue_dir / "classification.yaml"
+    payload = VALID.encode("utf-8")
+    mutated_payload = b"X" + payload[1:]
+
+    class FakeStat:
+        def __init__(self, *, directory: bool) -> None:
+            self.st_mode = stat.S_IFDIR if directory else stat.S_IFREG
+            self.st_dev = 3
+            self.st_ino = 5
+            self.st_size = len(payload)
+            self.st_mtime_ns = 300
+            self.st_ctime_ns = 400
+
+    class FakePosixApi:
+        def __init__(self) -> None:
+            self._next_descriptor = 1
+            self._file_descriptor = 0
+            self._read_count = 0
+            self._mutated = False
+
+        def open_root(self, target: Path) -> int:
+            return self._new_descriptor()
+
+        def open_child(self, parent: int, name: str, *, directory: bool) -> int:
+            descriptor = self._new_descriptor()
+            if not directory:
+                self._file_descriptor = descriptor
+            return descriptor
+
+        def stat(self, descriptor: int) -> FakeStat:
+            return FakeStat(directory=descriptor != self._file_descriptor)
+
+        def read(self, descriptor: int, size: int) -> bytes:
+            self._read_count += 1
+            current = mutated_payload if self._mutated else payload
+            if self._read_count == 1:
+                split = len(payload) // 2
+                chunk = current[:split]
+                self._mutated = True
+                return chunk
+            if self._read_count == 2:
+                return current[len(payload) // 2 :]
+            return b""
+
+        def rewind(self, descriptor: int) -> None:
+            self._read_count = 0
+
+        def close(self, descriptor: int) -> None:
+            pass
+
+        def _new_descriptor(self) -> int:
+            descriptor = self._next_descriptor
+            self._next_descriptor += 1
+            return descriptor
+
+    assert_value_error(
+        "classification file changed while reading",
+        lambda: classification_module._read_stable_text_posix(repo_root, path, FakePosixApi()),
+    )
 
 
 def test_cli_delete_before_lstat_is_normalized(repo_root: Path) -> None:
@@ -517,6 +689,9 @@ def main() -> None:
         test_decoder_limits(repo_root)
         test_native_descriptor_failures_are_normalized(repo_root)
         test_windows_reparse_component_never_opens_unc_target(repo_root)
+        test_windows_final_path_mismatch_is_rejected_before_read(repo_root)
+        test_windows_in_place_write_during_chunked_read_is_rejected(repo_root)
+        test_posix_in_place_write_during_chunked_read_is_rejected(repo_root)
         test_cli_failures_are_normalized(repo_root)
         test_cli_delete_before_lstat_is_normalized(repo_root)
     print("classification core ok")

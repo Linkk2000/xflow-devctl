@@ -82,19 +82,72 @@ def _relative_classification_parts(repo_root: Path, path: Path) -> tuple[str, ..
     return relative.parts
 
 
-def _read_stable_text_posix(repo_root: Path, path: Path) -> str:
-    if not all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_RDONLY")) or os.open not in os.supports_dir_fd:
-        raise ValueError("trustworthy descriptor-bound classification traversal is unavailable")
+class _PosixApi:
+    def __init__(self) -> None:
+        if (
+            not all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_RDONLY"))
+            or os.open not in os.supports_dir_fd
+        ):
+            raise ValueError("trustworthy descriptor-bound classification traversal is unavailable")
+        self._directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        self._file_flags = os.O_RDONLY | os.O_NOFOLLOW
 
+    def open_root(self, target: Path) -> int:
+        return os.open(target, self._directory_flags)
+
+    def open_child(self, parent: int, name: str, *, directory: bool) -> int:
+        flags = self._directory_flags if directory else self._file_flags
+        return os.open(name, flags, dir_fd=parent)
+
+    def stat(self, descriptor: int) -> os.stat_result:
+        return os.fstat(descriptor)
+
+    def read(self, descriptor: int, size: int) -> bytes:
+        return os.read(descriptor, size)
+
+    def rewind(self, descriptor: int) -> None:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+
+    def close(self, descriptor: int) -> None:
+        os.close(descriptor)
+
+
+def _posix_snapshot(path_stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        int(path_stat.st_dev),
+        int(path_stat.st_ino),
+        int(path_stat.st_mode),
+        int(path_stat.st_size),
+        int(path_stat.st_mtime_ns),
+        int(path_stat.st_ctime_ns),
+    )
+
+
+def _read_bounded_posix(native: Any, descriptor: int, path: Path) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        try:
+            chunk = native.read(descriptor, min(READ_CHUNK_SIZE, MAX_CLASSIFICATION_BYTES + 1 - total))
+        except OSError as exc:
+            raise ValueError(f"cannot read classification file: {path}: {exc}") from exc
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > MAX_CLASSIFICATION_BYTES:
+            raise ValueError(f"classification file exceeds {MAX_CLASSIFICATION_BYTES} bytes: {path}")
+
+
+def _read_stable_text_posix(repo_root: Path, path: Path, api: Any | None = None) -> str:
+    native = api if api is not None else _PosixApi()
     descriptors: list[int] = []
     parts = _relative_classification_parts(repo_root, path)
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    file_flags = os.O_RDONLY | os.O_NOFOLLOW
     try:
         try:
-            root_descriptor = os.open(repo_root, directory_flags)
+            root_descriptor = native.open_root(repo_root)
             descriptors.append(root_descriptor)
-            if not stat.S_ISDIR(os.fstat(root_descriptor).st_mode):
+            if not stat.S_ISDIR(native.stat(root_descriptor).st_mode):
                 raise ValueError(f"classification repository root must be a directory: {repo_root}")
         except FileNotFoundError as exc:
             raise ValueError(f"missing classification file: {path}") from exc
@@ -104,9 +157,9 @@ def _read_stable_text_posix(repo_root: Path, path: Path) -> str:
         parent_descriptor = root_descriptor
         for part in parts[:-1]:
             try:
-                descriptor = os.open(part, directory_flags, dir_fd=parent_descriptor)
+                descriptor = native.open_child(parent_descriptor, part, directory=True)
                 descriptors.append(descriptor)
-                if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                if not stat.S_ISDIR(native.stat(descriptor).st_mode):
                     raise ValueError(f"classification file path component is not a directory: {part}")
             except FileNotFoundError as exc:
                 raise ValueError(f"missing classification file: {path}") from exc
@@ -115,9 +168,9 @@ def _read_stable_text_posix(repo_root: Path, path: Path) -> str:
             parent_descriptor = descriptor
 
         try:
-            descriptor = os.open(parts[-1], file_flags, dir_fd=parent_descriptor)
+            descriptor = native.open_child(parent_descriptor, parts[-1], directory=False)
             descriptors.append(descriptor)
-            file_stat = os.fstat(descriptor)
+            file_stat = native.stat(descriptor)
         except FileNotFoundError as exc:
             raise ValueError(f"missing classification file: {path}") from exc
         except OSError as exc:
@@ -127,29 +180,29 @@ def _read_stable_text_posix(repo_root: Path, path: Path) -> str:
         if file_stat.st_size > MAX_CLASSIFICATION_BYTES:
             raise ValueError(f"classification file exceeds {MAX_CLASSIFICATION_BYTES} bytes: {path}")
 
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            try:
-                chunk = os.read(descriptor, min(READ_CHUNK_SIZE, MAX_CLASSIFICATION_BYTES + 1 - total))
-            except OSError as exc:
-                raise ValueError(f"cannot read classification file: {path}: {exc}") from exc
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
-            if total > MAX_CLASSIFICATION_BYTES:
-                raise ValueError(f"classification file exceeds {MAX_CLASSIFICATION_BYTES} bytes: {path}")
+        initial_snapshot = _posix_snapshot(file_stat)
+        first_content = _read_bounded_posix(native, descriptor, path)
         try:
-            os.fstat(descriptor)
+            middle_snapshot = _posix_snapshot(native.stat(descriptor))
+            native.rewind(descriptor)
         except OSError as exc:
             raise ValueError(f"classification file changed while reading: {path}: {exc}") from exc
-        return _decode_classification_bytes(b"".join(chunks), path)
+        if middle_snapshot != initial_snapshot:
+            raise ValueError(f"classification file changed while reading: {path}")
+
+        second_content = _read_bounded_posix(native, descriptor, path)
+        try:
+            final_snapshot = _posix_snapshot(native.stat(descriptor))
+        except OSError as exc:
+            raise ValueError(f"classification file changed while reading: {path}: {exc}") from exc
+        if final_snapshot != initial_snapshot or second_content != first_content:
+            raise ValueError(f"classification file changed while reading: {path}")
+        return _decode_classification_bytes(first_content, path)
     finally:
         close_error: OSError | None = None
         for descriptor in reversed(descriptors):
             try:
-                os.close(descriptor)
+                native.close(descriptor)
             except OSError as exc:
                 close_error = close_error or exc
         if close_error is not None:
@@ -178,6 +231,8 @@ class _WindowsApi:
         )
         self._create_file.restype = wintypes.HANDLE
         self._get_information = self._kernel32.GetFileInformationByHandle
+        self._get_information_ex = self._kernel32.GetFileInformationByHandleEx
+        self._get_final_path = self._kernel32.GetFinalPathNameByHandleW
         self._read_file = self._kernel32.ReadFile
         self._close_handle = self._kernel32.CloseHandle
         self._get_file_type = self._kernel32.GetFileType
@@ -199,9 +254,28 @@ class _WindowsApi:
                 ("nFileIndexLow", wintypes.DWORD),
             )
 
+        class FileBasicInformation(ctypes.Structure):
+            _fields_ = (
+                ("CreationTime", ctypes.c_longlong),
+                ("LastAccessTime", ctypes.c_longlong),
+                ("LastWriteTime", ctypes.c_longlong),
+                ("ChangeTime", ctypes.c_longlong),
+                ("FileAttributes", wintypes.DWORD),
+            )
+
         self._file_information_type = ByHandleFileInformation
+        self._file_basic_information_type = FileBasicInformation
         self._get_information.argtypes = (wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation))
         self._get_information.restype = wintypes.BOOL
+        self._get_information_ex.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+        self._get_information_ex.restype = wintypes.BOOL
+        self._get_final_path.argtypes = (
+            wintypes.HANDLE,
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        )
+        self._get_final_path.restype = wintypes.DWORD
         self._read_file.argtypes = (
             wintypes.HANDLE,
             wintypes.LPVOID,
@@ -223,7 +297,9 @@ class _WindowsApi:
 
     def open(self, target: Path, *, directory: bool) -> int:
         desired_access = 0x80000000  # GENERIC_READ
-        share_mode = 0x00000001 | 0x00000002  # FILE_SHARE_READ | FILE_SHARE_WRITE, never FILE_SHARE_DELETE.
+        share_mode = 0x00000001  # FILE_SHARE_READ, never FILE_SHARE_DELETE.
+        if directory:
+            share_mode |= 0x00000002  # Directory handles may share writes, never deletion.
         flags = 0x00200000  # FILE_FLAG_OPEN_REPARSE_POINT
         if directory:
             flags |= 0x02000000  # FILE_FLAG_BACKUP_SEMANTICS
@@ -240,6 +316,45 @@ class _WindowsApi:
         information = self._information(handle)
         return (int(information.nFileSizeHigh) << 32) | int(information.nFileSizeLow)  # type: ignore[union-attr]
 
+    def snapshot(self, handle: int) -> tuple[int, int, int, int, int]:
+        information = self._information(handle)
+        basic = self._file_basic_information_type()
+        if not self._get_information_ex(
+            handle,
+            0,  # FileBasicInfo
+            self._ctypes.byref(basic),
+            self._ctypes.sizeof(basic),
+        ):
+            raise OSError(self._ctypes.get_last_error(), "GetFileInformationByHandleEx failed")
+        file_index = (int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow)  # type: ignore[union-attr]
+        size = (int(information.nFileSizeHigh) << 32) | int(information.nFileSizeLow)  # type: ignore[union-attr]
+        return (
+            int(information.dwVolumeSerialNumber),  # type: ignore[union-attr]
+            file_index,
+            size,
+            int(basic.LastWriteTime),
+            int(basic.ChangeTime),
+        )
+
+    def final_path(self, handle: int) -> Path:
+        size = 32_768
+        buffer = self._ctypes.create_unicode_buffer(size)
+        length = self._get_final_path(handle, buffer, size, 0)
+        if not length:
+            raise OSError(self._ctypes.get_last_error(), "GetFinalPathNameByHandleW failed")
+        if length >= size:
+            size = length + 1
+            buffer = self._ctypes.create_unicode_buffer(size)
+            length = self._get_final_path(handle, buffer, size, 0)
+            if not length or length >= size:
+                raise OSError(self._ctypes.get_last_error(), "GetFinalPathNameByHandleW failed")
+        value = buffer.value
+        if value.startswith("\\\\?\\UNC\\"):
+            value = "\\\\" + value[8:]
+        elif value.startswith("\\\\?\\"):
+            value = value[4:]
+        return Path(os.path.abspath(value))
+
     def is_regular_file(self, handle: int) -> bool:
         return self._get_file_type(handle) == 1  # FILE_TYPE_DISK
 
@@ -255,13 +370,16 @@ class _WindowsApi:
             raise OSError(self._ctypes.get_last_error(), "CloseHandle failed")
 
 
+def _windows_path_key(path: Path) -> str:
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
 def _read_stable_text_windows(repo_root: Path, path: Path, issue_directory: Path, api: Any | None = None) -> str:
-    del issue_directory  # Directory-handle traversal establishes this boundary directly.
     native = api if api is not None else _WindowsApi()
     handles: list[int] = []
     parts = _relative_classification_parts(repo_root, path)
 
-    def open_checked(target: Path, *, directory: bool) -> int:
+    def open_checked(target: Path, *, directory: bool, expected_final: Path | None) -> tuple[int, Path]:
         try:
             handle = native.open(target, directory=directory)
             handles.append(handle)
@@ -279,19 +397,48 @@ def _read_stable_text_windows(repo_root: Path, path: Path, issue_directory: Path
             raise ValueError(f"classification file path component is not a directory: {target}")
         if not directory and is_directory:
             raise ValueError(f"classification file must be a regular file: {path}")
-        return handle
+        try:
+            final_path = native.final_path(handle)
+        except OSError as exc:
+            raise ValueError(f"cannot resolve classification file handle: {path}: {exc}") from exc
+        if expected_final is not None and _windows_path_key(final_path) != _windows_path_key(expected_final):
+            raise ValueError(
+                f"classification file handle path mismatch: expected {expected_final}, got {final_path}"
+            )
+        return handle, final_path
 
     try:
-        open_checked(repo_root, directory=True)
+        _, parent_final = open_checked(repo_root, directory=True, expected_final=None)
         current = repo_root
-        for part in parts[:-1]:
+        held_issue_final: Path | None = None
+        descriptor = 0
+        final_file_path: Path | None = None
+        for index, part in enumerate(parts):
             current /= part
-            open_checked(current, directory=True)
-        current /= parts[-1]
-        descriptor = open_checked(current, directory=False)
+            directory = index < len(parts) - 1
+            expected_final = parent_final / part
+            descriptor, child_final = open_checked(
+                current,
+                directory=directory,
+                expected_final=expected_final,
+            )
+            parent_final = child_final
+            if _windows_path_key(current) == _windows_path_key(issue_directory):
+                held_issue_final = child_final
+            if not directory:
+                final_file_path = child_final
+
+        if held_issue_final is None or final_file_path is None:
+            raise ValueError(f"classification file handle is not owned by the issue directory: {path}")
+        expected_issue_file = held_issue_final.joinpath(*path.relative_to(issue_directory).parts)
+        if _windows_path_key(final_file_path) != _windows_path_key(expected_issue_file):
+            raise ValueError(
+                f"classification file handle path mismatch: expected {expected_issue_file}, got {final_file_path}"
+            )
         try:
             if not native.is_regular_file(descriptor):
                 raise ValueError(f"classification file must be a regular file: {path}")
+            initial_snapshot = native.snapshot(descriptor)
             if native.file_size(descriptor) > MAX_CLASSIFICATION_BYTES:
                 raise ValueError(f"classification file exceeds {MAX_CLASSIFICATION_BYTES} bytes: {path}")
         except OSError as exc:
@@ -311,9 +458,11 @@ def _read_stable_text_windows(repo_root: Path, path: Path, issue_directory: Path
             if total > MAX_CLASSIFICATION_BYTES:
                 raise ValueError(f"classification file exceeds {MAX_CLASSIFICATION_BYTES} bytes: {path}")
         try:
-            native.file_size(descriptor)
+            final_snapshot = native.snapshot(descriptor)
         except OSError as exc:
             raise ValueError(f"classification file changed while reading: {path}: {exc}") from exc
+        if final_snapshot != initial_snapshot:
+            raise ValueError(f"classification file changed while reading: {path}")
         return _decode_classification_bytes(b"".join(chunks), path)
     finally:
         close_error: OSError | None = None
