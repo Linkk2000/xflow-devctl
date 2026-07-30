@@ -1269,6 +1269,10 @@ def run_migrate(args: argparse.Namespace) -> int:
             print(f"local absolute path: {path}")
         for path in report.credential_files:
             print(f"credential-like text: {path}")
+        for error in report.scan_errors:
+            print(f"scan error: {error}")
+        for action in report.manual_actions:
+            print(action)
         if args.apply:
             if args.mode == "tracked" and report.exact_ignore_lines:
                 print("[INFO] removed exact .gitignore lines: " + ", ".join(report.exact_ignore_lines))

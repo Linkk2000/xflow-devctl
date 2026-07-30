@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from dataclasses import dataclass
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Literal
 
 
@@ -20,32 +22,77 @@ def _invalid(path: Path, message: str) -> ValueError:
     return ValueError(f"invalid .xflow/xflow.json ({path}): {message}")
 
 
-def _contract_root(path: Path, value: object) -> Path:
+def _is_reparse_point(path_stat: os.stat_result) -> bool:
+    attributes = getattr(path_stat, "st_file_attributes", 0)
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(path_stat.st_mode) or bool(attributes & reparse_attribute)
+
+
+def require_safe_repo_path(repo_root: Path, path: Path, label: str) -> Path:
+    root = repo_root.resolve(strict=False)
+    target = path if path.is_absolute() else root / path
+    target = Path(os.path.abspath(target))
+    try:
+        relative = target.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} is outside repository: {target}") from exc
+
+    current = root
+    for part in relative.parts:
+        current /= part
+        try:
+            path_stat = os.lstat(current)
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            raise ValueError(f"cannot inspect {label} path component {current}: {exc}") from exc
+        if _is_reparse_point(path_stat):
+            raise ValueError(f"{label} must not traverse a symlink, junction, or reparse point: {current}")
+
+    resolved = target.resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} resolves outside repository: {target} -> {resolved}") from exc
+    return target
+
+
+def _contract_root(repo_root: Path, path: Path, value: object) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise _invalid(path, "contracts.root must be a non-empty relative path")
+    if value.lower().startswith("file:"):
+        raise _invalid(path, "contracts.root must not be a file URI")
     candidate = Path(value)
     windows_candidate = PureWindowsPath(value)
-    if candidate.is_absolute() or windows_candidate.is_absolute() or ".." in candidate.parts or ".." in windows_candidate.parts:
+    posix_candidate = PurePosixPath(value)
+    if (
+        candidate.is_absolute()
+        or windows_candidate.anchor
+        or windows_candidate.drive
+        or windows_candidate.root
+        or posix_candidate.anchor
+        or posix_candidate.root
+        or ".." in candidate.parts
+        or ".." in windows_candidate.parts
+        or ".." in posix_candidate.parts
+    ):
         raise _invalid(path, "contracts.root must be a safe relative path")
     if str(candidate) in {"", "."}:
         raise _invalid(path, "contracts.root must name a directory below the repository root")
+    try:
+        require_safe_repo_path(repo_root, repo_root / candidate, "contracts.root")
+    except ValueError as exc:
+        raise _invalid(path, str(exc)) from exc
     return candidate
 
 
-def load_project_config(repo_root: Path) -> ProjectConfig:
-    config_path = repo_root.resolve() / ".xflow" / "xflow.json"
-    if not config_path.is_file():
-        return ProjectConfig(DEFAULT_ISSUE_WORKSPACE_MODE, DEFAULT_CONTRACT_ROOT)
-    try:
-        raw = json.loads(config_path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise _invalid(config_path, "must contain a JSON object") from exc
+def parse_project_config(repo_root: Path, config_path: Path, raw: object) -> ProjectConfig:
     if not isinstance(raw, dict):
         raise _invalid(config_path, "must contain a JSON object")
 
     mode: Literal["tracked", "local"] = DEFAULT_ISSUE_WORKSPACE_MODE
-    issue_workspace = raw.get("issueWorkspace")
-    if issue_workspace is not None:
+    if "issueWorkspace" in raw:
+        issue_workspace = raw["issueWorkspace"]
         if not isinstance(issue_workspace, dict) or set(issue_workspace) != {"mode"}:
             raise _invalid(config_path, "issueWorkspace must contain only mode")
         configured_mode = issue_workspace["mode"]
@@ -54,9 +101,23 @@ def load_project_config(repo_root: Path) -> ProjectConfig:
         mode = configured_mode
 
     contract_root = DEFAULT_CONTRACT_ROOT
-    contracts = raw.get("contracts")
-    if contracts is not None:
+    if "contracts" in raw:
+        contracts = raw["contracts"]
         if not isinstance(contracts, dict) or set(contracts) != {"root"}:
             raise _invalid(config_path, "contracts must contain only root")
-        contract_root = _contract_root(config_path, contracts["root"])
+        contract_root = _contract_root(repo_root.resolve(strict=False), config_path, contracts["root"])
     return ProjectConfig(mode, contract_root)
+
+
+def load_project_config(repo_root: Path) -> ProjectConfig:
+    repo_root = repo_root.resolve(strict=False)
+    config_path = require_safe_repo_path(repo_root, repo_root / ".xflow" / "xflow.json", ".xflow/xflow.json")
+    if not config_path.exists():
+        return ProjectConfig(DEFAULT_ISSUE_WORKSPACE_MODE, DEFAULT_CONTRACT_ROOT)
+    if not config_path.is_file():
+        raise _invalid(config_path, "must be a regular file")
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8-sig", errors="strict"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise _invalid(config_path, "must contain a UTF-8 JSON object") from exc
+    return parse_project_config(repo_root, config_path, raw)
