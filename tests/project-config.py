@@ -339,6 +339,61 @@ def test_scan_failures_and_growth_block_apply(root: Path) -> None:
     assert any("changed while reading" in error for error in report.scan_errors), report.scan_errors
 
 
+def test_directory_timestamp_jitter_does_not_fake_issue_change(root: Path) -> None:
+    repo = root / "directory-jitter"
+    issue_directory = repo / ".xflow" / "issues" / "issue-1"
+    write(issue_directory / "evidence.txt", "safe evidence\n")
+    real_lstat = migration.os.lstat
+    real_scandir = migration.os.scandir
+    jitter = 0
+
+    class JitteredStat:
+        def __init__(self, value: os.stat_result) -> None:
+            nonlocal jitter
+            jitter += 1
+            self._value = value
+            self.st_mtime_ns = value.st_mtime_ns + jitter
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._value, name)
+
+    class JitteredEntry:
+        def __init__(self, entry: os.DirEntry[str]) -> None:
+            self._entry = entry
+            self.name = entry.name
+            self.path = entry.path
+
+        def stat(self, *, follow_symlinks: bool = True) -> os.stat_result:
+            value = self._entry.stat(follow_symlinks=follow_symlinks)
+            if Path(self.path) == issue_directory:
+                return JitteredStat(value)  # type: ignore[return-value]
+            return value
+
+    class JitteredScandir:
+        def __init__(self, path: object) -> None:
+            self._context = real_scandir(path)  # type: ignore[arg-type]
+
+        def __enter__(self) -> object:
+            iterator = self._context.__enter__()
+            return iter(JitteredEntry(entry) for entry in iterator)
+
+        def __exit__(self, *args: object) -> object:
+            return self._context.__exit__(*args)
+
+    def jittered_lstat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        value = real_lstat(path, *args, **kwargs)  # type: ignore[arg-type]
+        if Path(path) == issue_directory:
+            return JitteredStat(value)  # type: ignore[return-value]
+        return value
+
+    with patch.object(migration.os, "lstat", side_effect=jittered_lstat), patch.object(
+        migration.os, "scandir", side_effect=JitteredScandir
+    ):
+        apply_issue_workspace_migration(repo, "local")
+    saved = json.loads((repo / ".xflow" / "xflow.json").read_text(encoding="utf-8"))
+    assert saved["issueWorkspace"] == {"mode": "local"}
+
+
 def test_apply_revalidates_config_and_issue_snapshots(root: Path) -> None:
     config_repo = root / "config-race"
     config_path = config_repo / ".xflow" / "xflow.json"
@@ -397,25 +452,79 @@ def test_final_commit_window_changes_are_preserved(root: Path) -> None:
         assert_value_error("changed during migration", lambda: apply_issue_workspace_migration(target_repo, "local"))
     assert json.loads(config_path.read_text(encoding="utf-8")) == {"projectOwned": "concurrent"}
 
+    ignore_repo = root / "ignore-target-window"
+    ignore_repo.mkdir(parents=True)
+    git(ignore_repo, "init", "-q")
+    ignore_path = ignore_repo / ".gitignore"
+    concurrent_ignore = ".xflow/issues/\n# concurrent project edit\n"
+    write(ignore_path, ".xflow/issues/\n")
+    ignore_mutated = False
+
+    def mutate_ignore_after_target_snapshot(
+        repo_root: Path, expected: migration.FileSnapshot, label: str
+    ) -> migration.FileSnapshot:
+        nonlocal ignore_mutated
+        current = real_snapshot(repo_root, expected, label)
+        if not ignore_mutated and label == "migration target" and expected.path == ignore_path:
+            ignore_mutated = True
+            write(ignore_path, concurrent_ignore)
+        return current
+
+    with patch.object(migration, "_current_target_snapshot", side_effect=mutate_ignore_after_target_snapshot):
+        assert_value_error("changed during migration", lambda: apply_issue_workspace_migration(ignore_repo, "tracked"))
+    assert ignore_mutated
+    assert ignore_path.read_text(encoding="utf-8") == concurrent_ignore
+    assert not (ignore_repo / ".xflow" / "xflow.json").exists()
+
     issue_repo = root / "issue-window"
     issue_path = issue_repo / ".xflow" / "issues" / "issue-1" / "evidence.txt"
     write(issue_path, "safe evidence\n")
     real_update = migration._update_journal_state
-    issue_mutated = False
+    begin_edit = threading.Event()
+    edit_complete = threading.Event()
+    cancel_edit = threading.Event()
+    boundary_reached = False
+    editor_failures: list[BaseException] = []
+
+    def edit_issue_at_commit_boundary() -> None:
+        begin_edit.wait()
+        if cancel_edit.is_set():
+            edit_complete.set()
+            return
+        try:
+            write(issue_path, "openai_api_key=concurrent-secret\n")
+        except BaseException as exc:
+            editor_failures.append(exc)
+        finally:
+            edit_complete.set()
+
+    editor = threading.Thread(target=edit_issue_at_commit_boundary)
+    editor.start()
 
     def mutate_after_journal_update(*args: object, **kwargs: object) -> None:
-        nonlocal issue_mutated
+        nonlocal boundary_reached
         real_update(*args, **kwargs)  # type: ignore[arg-type]
         payload = args[2]
         index = args[3]
         state_value = args[4]
         entries = payload["entries"]  # type: ignore[index]
-        if not issue_mutated and state_value == "committing" and entries[index]["target"] == ".xflow/xflow.json":
-            issue_mutated = True
-            write(issue_path, "openai_api_key=concurrent-secret\n")
+        if not boundary_reached and state_value == "committing" and entries[index]["target"] == ".xflow/xflow.json":
+            boundary_reached = True
+            begin_edit.set()
+            if not edit_complete.wait(timeout=10):
+                raise AssertionError("concurrent Issue edit did not complete at the commit boundary")
 
-    with patch.object(migration, "_update_journal_state", side_effect=mutate_after_journal_update):
-        assert_value_error("changed during migration", lambda: apply_issue_workspace_migration(issue_repo, "local"))
+    try:
+        with patch.object(migration, "_update_journal_state", side_effect=mutate_after_journal_update):
+            assert_value_error("changed during migration", lambda: apply_issue_workspace_migration(issue_repo, "local"))
+    finally:
+        if not boundary_reached:
+            cancel_edit.set()
+            begin_edit.set()
+        editor.join(timeout=10)
+    assert not editor.is_alive()
+    assert boundary_reached, "apply aborted before the synchronized Issue commit boundary"
+    assert editor_failures == [], editor_failures
     assert not (issue_repo / ".xflow" / "xflow.json").exists()
     assert issue_path.read_text(encoding="utf-8") == "openai_api_key=concurrent-secret\n"
 
@@ -659,6 +768,7 @@ def main() -> None:
         test_tracked_apply_verifies_effective_ignore_and_rolls_back(root / "ignore-rollback")
         test_secret_and_local_path_detection(root / "patterns")
         test_scan_failures_and_growth_block_apply(root / "scan-failures")
+        test_directory_timestamp_jitter_does_not_fake_issue_change(root / "directory-jitter")
         test_apply_revalidates_config_and_issue_snapshots(root / "toctou")
         test_final_commit_window_changes_are_preserved(root / "commit-window")
         test_repository_lock_blocks_parallel_apply(root / "repository-lock")

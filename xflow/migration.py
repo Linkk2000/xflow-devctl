@@ -140,6 +140,11 @@ def _same_file_object(left: FileIdentity, right: FileIdentity) -> bool:
     return left[2:] == right[2:]
 
 
+def _tree_directory_identity(path_stat: os.stat_result) -> FileIdentity:
+    identity = _identity(path_stat)
+    return identity[0], identity[1], identity[2], 0, 0, 0
+
+
 def _read_stable_file(
     repo_root: Path,
     path: Path,
@@ -244,7 +249,7 @@ def _scan_issue_workspace(repo_root: Path) -> tuple[
         return IssueScanSnapshot((), ()), (), (), (), (), (str(exc),)
     if _is_reparse_point(root_stat) or not stat.S_ISDIR(root_stat.st_mode):
         return IssueScanSnapshot((), ()), (), (), (), (), (f"issue workspace is a reparse point or not a directory: {issues_root}",)
-    tree.append((".", "dir", _identity(root_stat)))
+    tree.append((".", "dir", _tree_directory_identity(root_stat)))
 
     def walk(directory: Path) -> None:
         try:
@@ -258,7 +263,7 @@ def _scan_issue_workspace(repo_root: Path) -> tuple[
             path = Path(entry.path)
             relative = path.relative_to(issues_root).as_posix()
             try:
-                entry_stat = entry.stat(follow_symlinks=False)
+                entry_stat = os.lstat(path)
             except OSError as exc:
                 errors.append(f"cannot inspect issue workspace entry {path}: {exc}")
                 continue
@@ -266,7 +271,7 @@ def _scan_issue_workspace(repo_root: Path) -> tuple[
                 errors.append(f"issue workspace entry is a symlink, junction, or reparse point: {path}")
                 continue
             if stat.S_ISDIR(entry_stat.st_mode):
-                tree.append((relative, "dir", _identity(entry_stat)))
+                tree.append((relative, "dir", _tree_directory_identity(entry_stat)))
                 walk(path)
                 continue
             if not stat.S_ISREG(entry_stat.st_mode):
