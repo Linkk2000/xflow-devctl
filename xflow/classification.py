@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .paths import normalized_issue
-from .project_config import _is_reparse_point, require_safe_repo_path
 from .task_state import CLASSIFICATIONS
 
 
@@ -20,6 +19,8 @@ MAX_YAML_TOKENS = 8_192
 MAX_COLLECTION_ITEMS = 256
 MAX_SCALAR_CHARACTERS = 65_536
 READ_CHUNK_SIZE = 65_536
+_WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x10
+_WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _ROOT_FIELDS = {
     "version",
     "request",
@@ -43,151 +44,94 @@ class ClassificationCheckResult:
 class RouteRule:
     contract_change_required: bool
     search_statuses: frozenset[str]
-    next_artifact: str
+    next_artifacts: tuple[str, ...]
 
 
 ROUTE_RULES = {
-    "capability-change": RouteRule(True, frozenset(CONTRACT_SEARCH_STATUSES), "contract-change-proposal.md"),
-    "implementation-gap": RouteRule(False, frozenset({"found"}), "gap-analysis.md"),
-    "ui-defect": RouteRule(False, frozenset({"found"}), "issue-draft.md"),
-    "infrastructure": RouteRule(False, frozenset(CONTRACT_SEARCH_STATUSES), "dependency-issue-draft.md"),
-    "governance": RouteRule(False, frozenset(CONTRACT_SEARCH_STATUSES), "issue-draft.md"),
-    "future": RouteRule(False, frozenset(CONTRACT_SEARCH_STATUSES), "futureCapabilitiesOutOfScope"),
+    "capability-change": RouteRule(True, frozenset(CONTRACT_SEARCH_STATUSES), ("contract-change-proposal.md",)),
+    "implementation-gap": RouteRule(False, frozenset({"found"}), ("gap-analysis.md",)),
+    "ui-defect": RouteRule(False, frozenset({"found"}), ("issue-draft.md",)),
+    "infrastructure": RouteRule(
+        False,
+        frozenset(CONTRACT_SEARCH_STATUSES),
+        ("dependency-issue-proposal.md",),
+    ),
+    "governance": RouteRule(False, frozenset(CONTRACT_SEARCH_STATUSES), ("issue-draft.md",)),
+    "future": RouteRule(
+        False,
+        frozenset(CONTRACT_SEARCH_STATUSES),
+        ("futureCapabilitiesOutOfScope", "future-task-proposal.md"),
+    ),
 }
 
 
-def _identity(path_stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
-    return (
-        int(path_stat.st_dev),
-        int(path_stat.st_ino),
-        int(path_stat.st_mode),
-        int(path_stat.st_size),
-        int(path_stat.st_mtime_ns),
-        int(path_stat.st_ctime_ns),
-    )
+def _decode_classification_bytes(content: bytes, path: Path) -> str:
+    try:
+        return content.decode("utf-8-sig", errors="strict")
+    except UnicodeError as exc:
+        raise ValueError(f"classification file must be valid UTF-8: {path}") from exc
 
 
-def _same_file_object(left: os.stat_result, right: os.stat_result) -> bool:
-    left_identity = _identity(left)
-    right_identity = _identity(right)
-    if left_identity[0] and left_identity[1] and right_identity[0] and right_identity[1]:
-        return left_identity[:3] == right_identity[:3]
-    return left_identity == right_identity
-
-
-def _component_snapshot(repo_root: Path, path: Path) -> tuple[tuple[Path, tuple[int, int, int, int, int, int]], ...]:
+def _relative_classification_parts(repo_root: Path, path: Path) -> tuple[str, ...]:
     try:
         relative = path.relative_to(repo_root)
     except ValueError as exc:
         raise ValueError(f"classification file is outside repository: {path}") from exc
-    snapshots: list[tuple[Path, tuple[int, int, int, int, int, int]]] = []
-    current = repo_root
-    for part in relative.parts:
-        current /= part
+    if not relative.parts:
+        raise ValueError(f"classification file must be a regular file: {path}")
+    return relative.parts
+
+
+def _read_stable_text_posix(repo_root: Path, path: Path) -> str:
+    if not all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_RDONLY")) or os.open not in os.supports_dir_fd:
+        raise ValueError("trustworthy descriptor-bound classification traversal is unavailable")
+
+    descriptors: list[int] = []
+    parts = _relative_classification_parts(repo_root, path)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW
+    try:
         try:
-            path_stat = os.lstat(current)
+            root_descriptor = os.open(repo_root, directory_flags)
+            descriptors.append(root_descriptor)
+            if not stat.S_ISDIR(os.fstat(root_descriptor).st_mode):
+                raise ValueError(f"classification repository root must be a directory: {repo_root}")
         except FileNotFoundError as exc:
             raise ValueError(f"missing classification file: {path}") from exc
         except OSError as exc:
-            raise ValueError(f"cannot inspect classification file path component {current}: {exc}") from exc
-        if _is_reparse_point(path_stat):
-            raise ValueError(
-                f"classification file must not traverse a symlink, junction, or reparse point: {current}"
-            )
-        snapshots.append((current, _identity(path_stat)))
-    return tuple(snapshots)
+            raise ValueError(f"cannot open classification file safely: {path}: {exc}") from exc
 
+        parent_descriptor = root_descriptor
+        for part in parts[:-1]:
+            try:
+                descriptor = os.open(part, directory_flags, dir_fd=parent_descriptor)
+                descriptors.append(descriptor)
+                if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                    raise ValueError(f"classification file path component is not a directory: {part}")
+            except FileNotFoundError as exc:
+                raise ValueError(f"missing classification file: {path}") from exc
+            except OSError as exc:
+                raise ValueError(f"cannot open classification file safely: {path}: {exc}") from exc
+            parent_descriptor = descriptor
 
-def _verify_component_snapshot(
-    snapshots: tuple[tuple[Path, tuple[int, int, int, int, int, int]], ...],
-) -> None:
-    for component, expected_identity in snapshots:
         try:
-            path_stat = os.lstat(component)
+            descriptor = os.open(parts[-1], file_flags, dir_fd=parent_descriptor)
+            descriptors.append(descriptor)
+            file_stat = os.fstat(descriptor)
+        except FileNotFoundError as exc:
+            raise ValueError(f"missing classification file: {path}") from exc
         except OSError as exc:
-            raise ValueError(f"classification file changed while reading: {component}: {exc}") from exc
-        if _is_reparse_point(path_stat) or _identity(path_stat) != expected_identity:
-            raise ValueError(f"classification file changed while reading: {component}")
-
-
-def _windows_final_handle_path(descriptor: int) -> Path:
-    import ctypes
-    import msvcrt
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    get_final_path = kernel32.GetFinalPathNameByHandleW
-    get_final_path.argtypes = (
-        wintypes.HANDLE,
-        wintypes.LPWSTR,
-        wintypes.DWORD,
-        wintypes.DWORD,
-    )
-    get_final_path.restype = wintypes.DWORD
-    handle = wintypes.HANDLE(msvcrt.get_osfhandle(descriptor))
-    size = 32_768
-    buffer = ctypes.create_unicode_buffer(size)
-    length = get_final_path(handle, buffer, size, 0)
-    if not length:
-        error = ctypes.get_last_error()
-        raise ValueError(f"cannot resolve classification file handle: Windows error {error}")
-    if length >= size:
-        buffer = ctypes.create_unicode_buffer(length + 1)
-        length = get_final_path(handle, buffer, length + 1, 0)
-        if not length:
-            error = ctypes.get_last_error()
-            raise ValueError(f"cannot resolve classification file handle: Windows error {error}")
-    value = buffer.value
-    if value.startswith("\\\\?\\UNC\\"):
-        value = "\\\\" + value[8:]
-    elif value.startswith("\\\\?\\"):
-        value = value[4:]
-    return Path(os.path.abspath(value))
-
-
-def _final_handle_path(descriptor: int, path: Path) -> Path:
-    if os.name == "nt":
-        return _windows_final_handle_path(descriptor)
-    descriptor_path = Path(f"/proc/self/fd/{descriptor}")
-    try:
-        return Path(os.path.abspath(os.readlink(descriptor_path)))
-    except OSError:
-        return Path(os.path.abspath(path.resolve(strict=False)))
-
-
-def _read_stable_text(repo_root: Path, path: Path, issue_directory: Path) -> str:
-    snapshots = _component_snapshot(repo_root, path)
-    before_path = os.lstat(path)
-    if not stat.S_ISREG(before_path.st_mode):
-        raise ValueError(f"classification file must be a regular file: {path}")
-    if before_path.st_size > MAX_CLASSIFICATION_BYTES:
-        raise ValueError(f"classification file exceeds {MAX_CLASSIFICATION_BYTES} bytes: {path}")
-
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise ValueError(f"cannot read classification file: {path}: {exc}") from exc
-    try:
-        before_handle = os.fstat(descriptor)
-        if not _same_file_object(before_path, before_handle):
-            raise ValueError(f"classification file changed while opening: {path}")
-        final_path = _final_handle_path(descriptor, path)
-        try:
-            final_path.relative_to(issue_directory)
-        except ValueError as exc:
-            raise ValueError(
-                f"classification file handle resolves outside the issue directory: {final_path}"
-            ) from exc
+            raise ValueError(f"cannot open classification file safely: {path}: {exc}") from exc
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError(f"classification file must be a regular file: {path}")
+        if file_stat.st_size > MAX_CLASSIFICATION_BYTES:
+            raise ValueError(f"classification file exceeds {MAX_CLASSIFICATION_BYTES} bytes: {path}")
 
         chunks: list[bytes] = []
         total = 0
         while True:
             try:
-                chunk = os.read(
-                    descriptor,
-                    min(READ_CHUNK_SIZE, MAX_CLASSIFICATION_BYTES + 1 - total),
-                )
+                chunk = os.read(descriptor, min(READ_CHUNK_SIZE, MAX_CLASSIFICATION_BYTES + 1 - total))
             except OSError as exc:
                 raise ValueError(f"cannot read classification file: {path}: {exc}") from exc
             if not chunk:
@@ -196,23 +140,196 @@ def _read_stable_text(repo_root: Path, path: Path, issue_directory: Path) -> str
             total += len(chunk)
             if total > MAX_CLASSIFICATION_BYTES:
                 raise ValueError(f"classification file exceeds {MAX_CLASSIFICATION_BYTES} bytes: {path}")
-        after_handle = os.fstat(descriptor)
+        try:
+            os.fstat(descriptor)
+        except OSError as exc:
+            raise ValueError(f"classification file changed while reading: {path}: {exc}") from exc
+        return _decode_classification_bytes(b"".join(chunks), path)
     finally:
-        os.close(descriptor)
+        close_error: OSError | None = None
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError as exc:
+                close_error = close_error or exc
+        if close_error is not None:
+            raise ValueError(f"cannot close classification file safely: {path}: {close_error}") from close_error
+
+
+class _WindowsApi:
+    """Small native layer kept injectable so no-reparse traversal is testable."""
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._create_file = self._kernel32.CreateFileW
+        self._create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        self._create_file.restype = wintypes.HANDLE
+        self._get_information = self._kernel32.GetFileInformationByHandle
+        self._read_file = self._kernel32.ReadFile
+        self._close_handle = self._kernel32.CloseHandle
+        self._get_file_type = self._kernel32.GetFileType
+
+        class FileTime(ctypes.Structure):
+            _fields_ = (("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD))
+
+        class ByHandleFileInformation(ctypes.Structure):
+            _fields_ = (
+                ("dwFileAttributes", wintypes.DWORD),
+                ("ftCreationTime", FileTime),
+                ("ftLastAccessTime", FileTime),
+                ("ftLastWriteTime", FileTime),
+                ("dwVolumeSerialNumber", wintypes.DWORD),
+                ("nFileSizeHigh", wintypes.DWORD),
+                ("nFileSizeLow", wintypes.DWORD),
+                ("nNumberOfLinks", wintypes.DWORD),
+                ("nFileIndexHigh", wintypes.DWORD),
+                ("nFileIndexLow", wintypes.DWORD),
+            )
+
+        self._file_information_type = ByHandleFileInformation
+        self._get_information.argtypes = (wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation))
+        self._get_information.restype = wintypes.BOOL
+        self._read_file.argtypes = (
+            wintypes.HANDLE,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.LPVOID,
+        )
+        self._read_file.restype = wintypes.BOOL
+        self._close_handle.argtypes = (wintypes.HANDLE,)
+        self._close_handle.restype = wintypes.BOOL
+        self._get_file_type.argtypes = (wintypes.HANDLE,)
+        self._get_file_type.restype = wintypes.DWORD
+
+    def _information(self, handle: int) -> object:
+        information = self._file_information_type()
+        if not self._get_information(handle, self._ctypes.byref(information)):
+            raise OSError(self._ctypes.get_last_error(), "GetFileInformationByHandle failed")
+        return information
+
+    def open(self, target: Path, *, directory: bool) -> int:
+        desired_access = 0x80000000  # GENERIC_READ
+        share_mode = 0x00000001 | 0x00000002  # FILE_SHARE_READ | FILE_SHARE_WRITE, never FILE_SHARE_DELETE.
+        flags = 0x00200000  # FILE_FLAG_OPEN_REPARSE_POINT
+        if directory:
+            flags |= 0x02000000  # FILE_FLAG_BACKUP_SEMANTICS
+        handle = self._create_file(str(target), desired_access, share_mode, None, 3, flags, None)
+        invalid_handle = self._ctypes.c_void_p(-1).value
+        if handle is None or handle == invalid_handle:
+            raise OSError(self._ctypes.get_last_error(), f"CreateFileW failed for {target}")
+        return int(handle)
+
+    def attributes(self, handle: int) -> int:
+        return int(self._information(handle).dwFileAttributes)  # type: ignore[union-attr]
+
+    def file_size(self, handle: int) -> int:
+        information = self._information(handle)
+        return (int(information.nFileSizeHigh) << 32) | int(information.nFileSizeLow)  # type: ignore[union-attr]
+
+    def is_regular_file(self, handle: int) -> bool:
+        return self._get_file_type(handle) == 1  # FILE_TYPE_DISK
+
+    def read(self, handle: int, size: int) -> bytes:
+        buffer = self._ctypes.create_string_buffer(size)
+        read = self._wintypes.DWORD()
+        if not self._read_file(handle, buffer, size, self._ctypes.byref(read), None):
+            raise OSError(self._ctypes.get_last_error(), "ReadFile failed")
+        return buffer.raw[: read.value]
+
+    def close(self, handle: int) -> None:
+        if not self._close_handle(handle):
+            raise OSError(self._ctypes.get_last_error(), "CloseHandle failed")
+
+
+def _read_stable_text_windows(repo_root: Path, path: Path, issue_directory: Path, api: Any | None = None) -> str:
+    del issue_directory  # Directory-handle traversal establishes this boundary directly.
+    native = api if api is not None else _WindowsApi()
+    handles: list[int] = []
+    parts = _relative_classification_parts(repo_root, path)
+
+    def open_checked(target: Path, *, directory: bool) -> int:
+        try:
+            handle = native.open(target, directory=directory)
+            handles.append(handle)
+            attributes = native.attributes(handle)
+        except FileNotFoundError as exc:
+            raise ValueError(f"missing classification file: {path}") from exc
+        except OSError as exc:
+            raise ValueError(f"cannot open classification file safely: {path}: {exc}") from exc
+        if attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT:
+            raise ValueError(
+                f"classification file must not traverse a symlink, junction, or reparse point: {target}"
+            )
+        is_directory = bool(attributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY)
+        if directory and not is_directory:
+            raise ValueError(f"classification file path component is not a directory: {target}")
+        if not directory and is_directory:
+            raise ValueError(f"classification file must be a regular file: {path}")
+        return handle
 
     try:
-        after_path = os.lstat(path)
-    except OSError as exc:
-        raise ValueError(f"classification file changed while reading: {path}: {exc}") from exc
-    if _identity(before_handle) != _identity(after_handle) or not _same_file_object(after_handle, after_path):
-        raise ValueError(f"classification file changed while reading: {path}")
-    _verify_component_snapshot(snapshots)
-    require_safe_repo_path(repo_root, path, "classification file")
-    content = b"".join(chunks)
-    try:
-        return content.decode("utf-8-sig", errors="strict")
-    except UnicodeError as exc:
-        raise ValueError(f"classification file must be valid UTF-8: {path}") from exc
+        open_checked(repo_root, directory=True)
+        current = repo_root
+        for part in parts[:-1]:
+            current /= part
+            open_checked(current, directory=True)
+        current /= parts[-1]
+        descriptor = open_checked(current, directory=False)
+        try:
+            if not native.is_regular_file(descriptor):
+                raise ValueError(f"classification file must be a regular file: {path}")
+            if native.file_size(descriptor) > MAX_CLASSIFICATION_BYTES:
+                raise ValueError(f"classification file exceeds {MAX_CLASSIFICATION_BYTES} bytes: {path}")
+        except OSError as exc:
+            raise ValueError(f"classification file changed while opening: {path}: {exc}") from exc
+
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            try:
+                chunk = native.read(descriptor, min(READ_CHUNK_SIZE, MAX_CLASSIFICATION_BYTES + 1 - total))
+            except OSError as exc:
+                raise ValueError(f"cannot read classification file: {path}: {exc}") from exc
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_CLASSIFICATION_BYTES:
+                raise ValueError(f"classification file exceeds {MAX_CLASSIFICATION_BYTES} bytes: {path}")
+        try:
+            native.file_size(descriptor)
+        except OSError as exc:
+            raise ValueError(f"classification file changed while reading: {path}: {exc}") from exc
+        return _decode_classification_bytes(b"".join(chunks), path)
+    finally:
+        close_error: OSError | None = None
+        for handle in reversed(handles):
+            try:
+                native.close(handle)
+            except OSError as exc:
+                close_error = close_error or exc
+        if close_error is not None:
+            raise ValueError(f"cannot close classification file safely: {path}: {close_error}") from close_error
+
+
+def _read_stable_text(repo_root: Path, path: Path, issue_directory: Path) -> str:
+    if os.name == "nt":
+        return _read_stable_text_windows(repo_root, path, issue_directory)
+    return _read_stable_text_posix(repo_root, path)
 
 
 def _load_yaml(text: str) -> object:
@@ -330,10 +447,13 @@ def _next_artifact(value: object) -> str:
 def _classification_file(repo_root: Path, issue: str, file_path: Path | None) -> Path:
     root = repo_root.resolve()
     issue_directory = root / ".xflow" / "issues" / f"issue-{normalized_issue(issue)}"
-    require_safe_repo_path(root, issue_directory, "classification issue directory")
     requested = file_path if file_path is not None else issue_directory / "classification.yaml"
     path = requested if requested.is_absolute() else root / requested
-    path = require_safe_repo_path(root, Path(os.path.abspath(path)), "classification file")
+    path = Path(os.path.abspath(path))
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"classification file is outside repository: {path}") from exc
     try:
         path.relative_to(issue_directory)
     except ValueError as exc:
@@ -385,7 +505,8 @@ def check_classification(
     if search_status not in route.search_statuses:
         expected = " or ".join(sorted(route.search_statuses))
         raise ValueError(f"{classification} requires contractSearch.status: {expected}")
-    if next_artifact != route.next_artifact:
-        raise ValueError(f"{classification} requires nextArtifact: {route.next_artifact}")
+    if next_artifact not in route.next_artifacts:
+        expected = " or ".join(route.next_artifacts)
+        raise ValueError(f"{classification} requires nextArtifact: {expected}")
 
     return ClassificationCheckResult(path=path, classification=classification, raw=document)

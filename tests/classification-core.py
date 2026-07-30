@@ -124,7 +124,7 @@ def test_routes_and_document_shape(repo_root: Path) -> None:
                 "nextArtifact: contract-change-proposal.md",
                 "nextArtifact: implementation-plan.md",
             ),
-            "future requires nextArtifact: futureCapabilitiesOutOfScope",
+            "future requires nextArtifact: futureCapabilitiesOutOfScope or future-task-proposal.md",
         ),
     )
     for name, document, expected in cases:
@@ -158,11 +158,11 @@ def test_approved_route_table(repo_root: Path) -> None:
             search_status="found",
             refs=("requirement:UI-17",),
         ),
-        document("infrastructure", False, "dependency-issue-draft.md"),
+        document("infrastructure", False, "dependency-issue-proposal.md"),
         document(
             "infrastructure",
             False,
-            "dependency-issue-draft.md",
+            "dependency-issue-proposal.md",
             search_status="found",
             refs=("example.contract.shared-runtime@1.0.0",),
         ),
@@ -175,10 +175,11 @@ def test_approved_route_table(repo_root: Path) -> None:
             refs=("requirement:GOV-3",),
         ),
         document("future", False, "futureCapabilitiesOutOfScope"),
+        document("future", False, "future-task-proposal.md"),
         document(
             "future",
             False,
-            "futureCapabilitiesOutOfScope",
+            "future-task-proposal.md",
             search_status="found",
             refs=("example.contract.current@1.0.0",),
         ),
@@ -211,12 +212,17 @@ def test_approved_route_table(repo_root: Path) -> None:
             document("ui-defect", False, "implementation-plan.md", search_status="found", refs=("requirement:UI-17",)),
             "ui-defect requires nextArtifact: issue-draft.md",
         ),
-        (document("infrastructure", True, "dependency-issue-draft.md"), "infrastructure requires contractChangeRequired: false"),
-        (document("infrastructure", False, "issue-draft.md"), "infrastructure requires nextArtifact: dependency-issue-draft.md"),
+        (document("infrastructure", True, "dependency-issue-proposal.md"), "infrastructure requires contractChangeRequired: false"),
+        (document("infrastructure", False, "dependency-issue-draft.md"), "infrastructure requires nextArtifact: dependency-issue-proposal.md"),
+        (document("infrastructure", False, "issue-draft.md"), "infrastructure requires nextArtifact: dependency-issue-proposal.md"),
         (document("governance", True, "issue-draft.md"), "governance requires contractChangeRequired: false"),
         (document("governance", False, "implementation-plan.md"), "governance requires nextArtifact: issue-draft.md"),
         (document("future", True, "futureCapabilitiesOutOfScope"), "future requires contractChangeRequired: false"),
-        (document("future", False, "build-plan.md"), "future requires nextArtifact: futureCapabilitiesOutOfScope"),
+        (document("future", True, "future-task-proposal.md"), "future requires contractChangeRequired: false"),
+        (
+            document("future", False, "build-plan.md"),
+            "future requires nextArtifact: futureCapabilitiesOutOfScope or future-task-proposal.md",
+        ),
     )
     for route, expected in invalid_routes:
         write(path, route)
@@ -388,92 +394,116 @@ def test_decoder_limits(repo_root: Path) -> None:
         assert_value_error(expected, lambda: check_classification(repo_root, "limits"))
 
 
-def test_replacement_races_are_rejected(repo_root: Path) -> None:
+def test_native_descriptor_failures_are_normalized(repo_root: Path) -> None:
     issue_dir = repo_root / ".xflow" / "issues" / "issue-race"
     path = issue_dir / "classification.yaml"
-    replacement = issue_dir / "replacement.yaml"
-    write(path, VALID)
-    write(replacement, VALID)
+    class FakeWindowsApi:
+        def __init__(self, *, fail_open: bool = False, fail_size: bool = False, fail_close: bool = False) -> None:
+            self.fail_open = fail_open
+            self.fail_size = fail_size
+            self.fail_close = fail_close
+            self._paths: dict[int, Path] = {}
+            self._read = False
 
-    real_open = classification_module.os.open
-    opened = False
+        def open(self, target: Path, *, directory: bool) -> int:
+            if self.fail_open:
+                raise OSError("simulated open race")
+            handle = len(self._paths) + 1
+            self._paths[handle] = target
+            return handle
 
-    def replace_before_open(target: object, *args: object, **kwargs: object) -> int:
-        nonlocal opened
-        if Path(target) == path and not opened:
-            opened = True
-            os.replace(replacement, path)
-        return real_open(target, *args, **kwargs)  # type: ignore[arg-type]
-
-    classification_module.os.open = replace_before_open  # type: ignore[assignment]
-    try:
-        assert_value_error("classification file changed while opening", lambda: check_classification(repo_root, "race"))
-    finally:
-        classification_module.os.open = real_open
-
-    write(path, VALID)
-    write(replacement, VALID)
-    real_close = classification_module.os.close
-    read_finished = False
-
-    def replace_after_read(descriptor: int) -> None:
-        nonlocal read_finished
-        real_close(descriptor)
-        if not read_finished:
-            read_finished = True
-            os.replace(replacement, path)
-
-    classification_module.os.close = replace_after_read
-    try:
-        assert_value_error("classification file changed while reading", lambda: check_classification(repo_root, "race"))
-    finally:
-        classification_module.os.close = real_close
-
-
-def test_native_windows_junction_swap_is_rejected(repo_root: Path) -> None:
-    if os.name != "nt":
-        return
-    issue_dir = repo_root / ".xflow" / "issues" / "issue-junction"
-    path = issue_dir / "classification.yaml"
-    saved_dir = issue_dir.with_name("issue-junction-saved")
-    outside_dir = repo_root / "outside-junction"
-    write(path, VALID)
-    outside_dir.mkdir(parents=True)
-    os.link(path, outside_dir / "classification.yaml")
-
-    real_open = classification_module.os.open
-    swapped = False
-
-    def swap_to_junction(target: object, *args: object, **kwargs: object) -> int:
-        nonlocal swapped
-        if Path(target) == path and not swapped:
-            swapped = True
-            os.rename(issue_dir, saved_dir)
-            junction = subprocess.run(
-                ["cmd", "/c", "mklink", "/J", str(issue_dir), str(outside_dir)],
-                text=True,
-                encoding="utf-8",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+        def attributes(self, handle: int) -> int:
+            return (
+                classification_module._WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+                if self._paths[handle] != path
+                else 0
             )
-            if junction.returncode != 0:
-                os.rename(saved_dir, issue_dir)
-                swapped = False
-                raise AssertionError(junction.stderr or junction.stdout)
-        return real_open(target, *args, **kwargs)  # type: ignore[arg-type]
 
-    classification_module.os.open = swap_to_junction  # type: ignore[assignment]
-    try:
-        assert_value_error(
-            "classification file handle resolves outside the issue directory",
-            lambda: check_classification(repo_root, "junction"),
-        )
-    finally:
-        classification_module.os.open = real_open
-        if swapped and os.path.lexists(issue_dir):
-            os.rmdir(issue_dir)
-        if saved_dir.exists():
-            os.rename(saved_dir, issue_dir)
+        def file_size(self, handle: int) -> int:
+            if self.fail_size:
+                raise OSError("simulated fstat race")
+            return len(VALID.encode("utf-8"))
+
+        def is_regular_file(self, handle: int) -> bool:
+            return True
+
+        def read(self, handle: int, size: int) -> bytes:
+            if self._read:
+                return b""
+            self._read = True
+            return VALID.encode("utf-8")
+
+        def close(self, handle: int) -> None:
+            if self.fail_close:
+                raise OSError("simulated close race")
+
+    assert_value_error(
+        "cannot open classification file safely",
+        lambda: classification_module._read_stable_text_windows(repo_root, path, issue_dir, FakeWindowsApi(fail_open=True)),
+    )
+    assert_value_error(
+        "classification file changed while opening",
+        lambda: classification_module._read_stable_text_windows(repo_root, path, issue_dir, FakeWindowsApi(fail_size=True)),
+    )
+    assert_value_error(
+        "cannot close classification file safely",
+        lambda: classification_module._read_stable_text_windows(repo_root, path, issue_dir, FakeWindowsApi(fail_close=True)),
+    )
+
+
+def test_windows_reparse_component_never_opens_unc_target(repo_root: Path) -> None:
+    issue_dir = repo_root / ".xflow" / "issues" / "issue-unc"
+    path = issue_dir / "classification.yaml"
+
+    class FakeWindowsApi:
+        def __init__(self) -> None:
+            self.opened: list[Path] = []
+            self.closed: list[int] = []
+            self._paths: dict[int, Path] = {}
+
+        def open(self, target: Path, *, directory: bool) -> int:
+            assert not str(target).startswith("\\\\"), target
+            self.opened.append(target)
+            handle = len(self.opened)
+            self._paths[handle] = target
+            return handle
+
+        def attributes(self, handle: int) -> int:
+            if self._paths[handle] == issue_dir:
+                return classification_module._WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+            return classification_module._WINDOWS_FILE_ATTRIBUTE_DIRECTORY
+
+        def file_size(self, handle: int) -> int:
+            return 0
+
+        def read(self, handle: int, size: int) -> bytes:
+            raise AssertionError("a reparse component must be rejected before reading")
+
+        def close(self, handle: int) -> None:
+            self.closed.append(handle)
+
+    fake = FakeWindowsApi()
+    assert_value_error(
+        "classification file must not traverse a symlink, junction, or reparse point",
+        lambda: classification_module._read_stable_text_windows(repo_root, path, issue_dir, fake),
+    )
+    assert fake.opened == [
+        repo_root,
+        repo_root / ".xflow",
+        repo_root / ".xflow" / "issues",
+        issue_dir,
+    ]
+    assert fake.closed == [4, 3, 2, 1]
+
+
+def test_cli_delete_before_lstat_is_normalized(repo_root: Path) -> None:
+    path = repo_root / ".xflow" / "issues" / "issue-deleted" / "classification.yaml"
+    write(path, VALID)
+    path.unlink()
+    result = run_devctl(repo_root, "check", "classification", "--issue", "deleted")
+    assert result.returncode == 1
+    assert result.stderr.startswith("[ERROR] missing classification file:")
+    assert "Traceback" not in result.stderr
 
 
 def main() -> None:
@@ -485,9 +515,10 @@ def main() -> None:
         test_safe_yaml_and_containment(repo_root)
         test_safe_loader_duplicate_semantics(repo_root)
         test_decoder_limits(repo_root)
-        test_replacement_races_are_rejected(repo_root)
-        test_native_windows_junction_swap_is_rejected(repo_root)
+        test_native_descriptor_failures_are_normalized(repo_root)
+        test_windows_reparse_component_never_opens_unc_target(repo_root)
         test_cli_failures_are_normalized(repo_root)
+        test_cli_delete_before_lstat_is_normalized(repo_root)
     print("classification core ok")
 
 
