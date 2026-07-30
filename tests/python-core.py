@@ -36,6 +36,7 @@ from xflow.providers import (
 )
 from xflow.paths import default_approval_file, default_issue_file, issue_dir
 from xflow.cli import branch_name_from_slug, commit_and_push_pr_backfill, summarize_commit_message
+from xflow.task_state import TaskState, activate_task, render_task_state
 from xflow.unattended import disable, enable, load, migrate_issue, require_active
 
 
@@ -454,6 +455,11 @@ def test_successful_issue_close_invalidates_unattended_state(parent: Path) -> No
         )
         assert f"Issue #{issue_id} closed" in closed.stdout
         assert [item["method"] for item in server.requests] == ["PATCH"]
+    history = repo / ".xflow" / "issues" / f"issue-{issue_id}" / "approvals" / "history"
+    history_text = "\n".join(path.read_text(encoding="utf-8") for path in history.glob("*.yaml"))
+    assert "source: unattended" in history_text
+    assert "action: issue-close" in history_text
+    assert "reviewerSummary: task-scoped-unattended" in history_text
     assert load(repo) is None
 
 
@@ -1989,6 +1995,23 @@ def test_git_push_and_mr_are_separate_with_state_backfill(parent: Path) -> None:
 
     run_devctl(work, "git", "start", "pr-state", "--issue", "8", "--base", "main")
     branch = "feat/8-pr-state"
+    approval_state = TaskState(
+        issue="8",
+        execution_state="S6_PREPARE_COMMIT_AND_MR_DRAFT",
+        semantic_phase="classified",
+        classification="capability-change",
+        contract="example.contract.approval-history@0.1.0",
+        contract_file="docs/requirements/example/contract.yaml",
+        contract_change_required=True,
+        branch=branch,
+        base="main",
+        allowed_actions=("prepare-verification",),
+        forbidden_actions=("edit-implementation",),
+        human_gate="local human approval required",
+        human_approval_ref="none",
+    )
+    write(work / ".xflow" / "issues" / "issue-8" / "task-state.md", render_task_state(approval_state))
+    activate_task(work, "8")
     write(
         work / ".xflow" / "current-task.md",
         """# XFlow Current Task
@@ -2056,12 +2079,15 @@ Closes #8
     )
     assert "devctl git push" in mr_before_push.stderr
     assert branch not in git_text(origin, "branch", "--format=%(refname:short)")
+    history = work / ".xflow" / "issues" / "issue-8" / "approvals" / "history"
+    assert not tuple(history.glob("*.yaml"))
 
     run_devctl(work, "approval", "prepare", "--issue", "8", "--action", "git-push", "--file", str(walkthrough), "--force")
     approval.write_text(approval.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"), encoding="utf-8")
     push_result = run_devctl(work, "git", "push", "--issue", "8", "--file", str(walkthrough))
     assert f"pushed {branch}" in push_result.stdout
     assert branch in git_text(origin, "branch", "--format=%(refname:short)")
+    assert any("action: git-push" in path.read_text(encoding="utf-8") for path in history.glob("*.yaml"))
 
     run_devctl(work, "approval", "prepare", "--issue", "8", "--action", "git-mr", "--file", str(mr_file), "--force")
     approval.write_text(approval.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"), encoding="utf-8")
@@ -2100,6 +2126,10 @@ Closes #8
     assert "PR URL: https://github.test/pulls/42" in remote_task
     remote_suggestion = git_text(origin, "show", f"refs/heads/{branch}:.xflow/issues/issue-8/state-update-suggestion.md")
     assert "PR: 42" in remote_suggestion
+    history_text = "\n".join(path.read_text(encoding="utf-8") for path in history.glob("*.yaml"))
+    assert "action: git-mr" in history_text
+    assert "action: git-state-backfill" in history_text
+    assert "Approved: yes" not in history_text
 
 
 def test_ai_call_guidance_is_visible(repo: Path) -> None:

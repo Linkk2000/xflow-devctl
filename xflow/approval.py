@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import re
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
+from .bindings import resolve_bindings
 from .io import read_text
 from .paths import default_approval_file
+from .task_state import check_task_binding
 from .unattended import require_active
 
 
@@ -26,6 +32,9 @@ REQUIRED_TEXT = (
     "Issue:",
     "Reviewer:",
     "Approved At:",
+    "Repository ID:",
+    "Worktree ID:",
+    "Branch:",
     "Approved Action:",
     "Approved File:",
     "Approved SHA256:",
@@ -146,6 +155,7 @@ def prepare(
     attachment_manifest: Path | None = None,
 ) -> Path:
     repo_root = repo_root.resolve()
+    bindings = resolve_bindings(repo_root)
     approved_path = resolve_path(repo_root, approved_file)
     if not approved_path.is_file():
         raise ValueError(f"missing approved artifact: {approved_path}")
@@ -177,6 +187,9 @@ def prepare(
         f"Issue: {issue}\n"
         f"Reviewer: {reviewer}\n"
         f"Approved At: {now}\n"
+        f"Repository ID: {bindings.repository}\n"
+        f"Worktree ID: {bindings.worktree}\n"
+        f"Branch: {bindings.branch}\n"
         f"Approved Action: {action}\n"
         f"Approved File: {relative_file}\n"
         f"Approved SHA256: {digest}\n"
@@ -200,6 +213,7 @@ def prepare(
 
 def check(repo_root: Path, issue: str, approved_file: Path, attachment_manifest: Path | None = None) -> None:
     repo_root = repo_root.resolve()
+    bindings = resolve_bindings(repo_root)
     review_file = default_approval_file(repo_root, issue)
     if not review_file.is_file():
         raise ValueError(f"local review approval required: {review_file}")
@@ -207,10 +221,25 @@ def check(repo_root: Path, issue: str, approved_file: Path, attachment_manifest:
     for needle in REQUIRED_TEXT:
         if needle not in text:
             raise ValueError(f"missing required text '{needle}'")
-    for name in ("Reviewer", "Approved At", "Approved Action", "Approved File", "Approved SHA256", "Approved"):
+    for name in (
+        "Issue", "Reviewer", "Approved At", "Repository ID", "Worktree ID", "Branch", "Approved Action",
+        "Approved File", "Approved SHA256", "Approved",
+    ):
         reject_placeholder(text, name)
     if field(text, "Approved").lower() != "yes":
         raise ValueError("local approval required: Approved: yes")
+
+    expected_bindings = {
+        "Repository ID": bindings.repository,
+        "Worktree ID": bindings.worktree,
+        "Branch": bindings.branch,
+        "Issue": issue,
+    }
+    for name, expected_value in expected_bindings.items():
+        actual_value = field(text, name)
+        if actual_value != expected_value:
+            label = "Issue" if name == "Issue" else name.removesuffix(" ID").lower()
+            raise ValueError(f"approval {label} mismatch: expected {expected_value}, got {actual_value}")
 
     declared = resolve_path(repo_root, Path(field(text, "Approved File")))
     actual = resolve_path(repo_root, approved_file)
@@ -236,6 +265,33 @@ def check(repo_root: Path, issue: str, approved_file: Path, attachment_manifest:
             )
 
 
+def reject_consumed_approval(repo_root: Path, issue: str, action: str, approved_file: Path) -> None:
+    bindings = resolve_bindings(repo_root)
+    approved_path = resolve_path(repo_root, approved_file)
+    expected = {
+        "reusable": "false",
+        "repository": bindings.repository,
+        "worktree": bindings.worktree,
+        "branch": bindings.branch,
+        "issue": issue,
+        "action": action,
+        "approvedFile": display_path(repo_root, approved_path),
+        "approvedSha256": sha256_file(approved_path).lower(),
+        "result": "success",
+    }
+    history = repo_root / ".xflow" / "issues" / f"issue-{issue}" / "approvals" / "history"
+    if not history.is_dir():
+        return
+    for record in history.glob("*.yaml"):
+        text = read_text(record)
+        try:
+            if all(field(text, name).strip('"') == value for name, value in expected.items()):
+                raise ValueError(f"approval already consumed: {record}")
+        except ValueError as exc:
+            if str(exc).startswith("approval already consumed:"):
+                raise
+
+
 def require_remote(
     repo_root: Path,
     action: str,
@@ -248,9 +304,14 @@ def require_remote(
         raise ValueError(f"local review approval required: {review_file}")
     text = read_text(review_file)
     approved_action = field(text, "Approved Action")
-    if approved_action != action and approved_action.lower() not in UMBRELLA_ACTIONS:
+    if action == "contract-acceptance" and approved_action != action:
+        raise ValueError(f"action mismatch: expected exact {action}, got {approved_action}")
+    if action != "contract-acceptance" and approved_action != action and approved_action.lower() not in UMBRELLA_ACTIONS:
         raise ValueError(f"action mismatch: expected {action}, got {approved_action}")
     check(repo_root, issue, approved_file, attachment_manifest)
+    if issue != "draft":
+        check_task_binding(repo_root, issue)
+    reject_consumed_approval(repo_root, issue, action, approved_file)
 
 
 def require_exact_remote(
@@ -276,6 +337,12 @@ def require_remote_or_unattended(
     attachment_manifest: Path | None = None,
     request_unattended: bool = False,
 ) -> str:
+    if action == "contract-acceptance":
+        if request_unattended:
+            raise ValueError("contract-acceptance is not eligible for unattended mode")
+        check_task_binding(repo_root, issue)
+        require_exact_remote(repo_root, action, approved_file, issue)
+        return "local-review"
     if action not in UNATTENDED_ACTIONS:
         raise ValueError(f"remote action {action} is not eligible for unattended mode")
 
@@ -293,3 +360,86 @@ def require_remote_or_unattended(
 
     print(f"[UNATTENDED] Human approval gate bypassed for current task {state.issue}.")
     return "unattended"
+
+
+def _history_scalar(value: str) -> str:
+    if value and all(character.isalnum() or character in "._/-:@+" for character in value):
+        return value
+    return json.dumps(value, ensure_ascii=True)
+
+
+def reject_credential_text(value: str) -> None:
+    if re.search(r"(?i)(?:^|[^A-Za-z0-9])(?:token|secret|password|credential)\s*[:=]", value):
+        raise ValueError("credential-like text is not allowed in approval history")
+
+
+def _write_history_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            raise ValueError(f"consumed approval history collision: {path}") from None
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def record_consumed_approval(
+    repo_root: Path,
+    issue: str,
+    action: str,
+    approved_file: Path,
+    source: Literal["local-review", "unattended"],
+    reviewer_summary: str,
+    result: Literal["success"],
+) -> Path:
+    if source not in {"local-review", "unattended"}:
+        raise ValueError(f"unknown approval source: {source}")
+    if result != "success":
+        raise ValueError("consumed approval records require confirmed success")
+    repo_root = repo_root.resolve()
+    bindings = resolve_bindings(repo_root)
+    if source == "local-review" and issue != "draft":
+        check_task_binding(repo_root, issue)
+    approved_path = resolve_path(repo_root, approved_file)
+    approved_hash = sha256_file(approved_path).lower()
+    if source == "local-review":
+        review_file = default_approval_file(repo_root, issue)
+        review_text = read_text(review_file)
+        reviewer_summary = field(review_text, "Reviewer")
+        reject_placeholder(review_text, "Reviewer")
+        reject_credential_text(reviewer_summary)
+    else:
+        reviewer_summary = "task-scoped-unattended"
+    recorded_at = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    timestamp = recorded_at.replace("-", "").replace(":", "").replace(".", "")
+    history_file = (
+        repo_root / ".xflow" / "issues" / f"issue-{issue}" / "approvals" / "history" / f"{timestamp}-{action}.yaml"
+    )
+    content = "\n".join(
+        (
+            "version: 0.1.0",
+            "reusable: false",
+            f"source: {source}",
+            f"repository: {bindings.repository}",
+            f"worktree: {bindings.worktree}",
+            f"branch: {_history_scalar(bindings.branch)}",
+            f"issue: {json.dumps(issue, ensure_ascii=True)}",
+            f"action: {_history_scalar(action)}",
+            f"approvedFile: {_history_scalar(display_path(repo_root, approved_path))}",
+            f"approvedSha256: {approved_hash}",
+            f"reviewerSummary: {_history_scalar(reviewer_summary)}",
+            "result: success",
+            f"recordedAt: {recorded_at}",
+            "",
+        )
+    )
+    _write_history_atomic(history_file, content)
+    return history_file

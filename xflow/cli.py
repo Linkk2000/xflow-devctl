@@ -499,7 +499,7 @@ def run_issue(args: argparse.Namespace) -> int:
         check_action_current_task(ctx.repo_root, issue_id)
         require_requested_unattended(ctx.repo_root, issue_id, args.no_local_review)
         body, file_path, manifest_path = prepare_attachment_body(ctx.repo_root, issue_id, file_path, args)
-        approval.require_remote_or_unattended(
+        gate_source = approval.require_remote_or_unattended(
             ctx.repo_root,
             "issue-comment",
             file_path,
@@ -511,6 +511,9 @@ def run_issue(args: argparse.Namespace) -> int:
             print("[INFO] issue-comment gate passed; provider skipped")
             return 0
         result = providers.comment_issue(ctx.repo_root, issue_id, body, os.environ)
+        approval.record_consumed_approval(
+            ctx.repo_root, issue_id, "issue-comment", file_path, gate_source, "human reviewer", "success"
+        )
         print(f"[INFO] Comment posted on Issue #{issue_id}")
         if result.get("html_url"):
             print(f"[INFO] {result['html_url']}")
@@ -519,11 +522,14 @@ def run_issue(args: argparse.Namespace) -> int:
         issue_id = resolve_action_issue(ctx, args.number)
         file_path = Path(os.environ.get("DEVCTL_APPROVED_FILE", default_issue_file(ctx.repo_root, issue_id, "walkthrough.md")))
         check_action_current_task(ctx.repo_root, issue_id)
-        approval.require_remote_or_unattended(ctx.repo_root, "issue-close", file_path, issue_id)
+        gate_source = approval.require_remote_or_unattended(ctx.repo_root, "issue-close", file_path, issue_id)
         if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
             print("[INFO] issue-close gate passed; provider skipped")
             return 0
         result = providers.close_issue(ctx.repo_root, issue_id, os.environ)
+        approval.record_consumed_approval(
+            ctx.repo_root, issue_id, "issue-close", file_path, gate_source, "human reviewer", "success"
+        )
         unattended.disable(ctx.repo_root)
         print(f"[INFO] Issue #{result.get('number', issue_id)} closed")
         return 0
@@ -546,6 +552,9 @@ def run_issue(args: argparse.Namespace) -> int:
         print("[INFO] issue-create gate passed; provider skipped")
         return 0
     result = providers.create_issue(ctx.repo_root, args.title, body, args.labels, os.environ)
+    approval.record_consumed_approval(
+        ctx.repo_root, issue_id, "issue-create", file_path, gate_source, "human reviewer", "success"
+    )
     if gate_source == "unattended":
         unattended.migrate_issue(ctx.repo_root, issue_id, result.number)
     print(f"[INFO] Issue #{result.number} created")
@@ -869,8 +878,11 @@ def run_git_push(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     base = branch_meta(ctx.repo_root, "base") or default_base(ctx.repo_root)
     if branch == base:
         raise ValueError(f"current branch is {base}; start a task branch before pushing")
-    approval.require_remote_or_unattended(ctx.repo_root, "git-push", approved_file, issue)
+    gate_source = approval.require_remote_or_unattended(ctx.repo_root, "git-push", approved_file, issue)
     push_branch(ctx.repo_root, branch)
+    approval.record_consumed_approval(
+        ctx.repo_root, issue, "git-push", approved_file, gate_source, "human reviewer", "success"
+    )
     print(f"[INFO] pushed {branch}")
     return 0
 
@@ -1028,7 +1040,7 @@ def run_git(args: argparse.Namespace) -> int:
             raise ValueError(f"pull request head branch mismatch: expected {branch}, got {remote_pr.head}")
         if remote_pr.base != base:
             raise ValueError(f"pull request base branch mismatch: expected {base}, got {remote_pr.base}")
-        approval.require_remote_or_unattended(ctx.repo_root, "git-pr-merge", approved_file, issue)
+        gate_source = approval.require_remote_or_unattended(ctx.repo_root, "git-pr-merge", approved_file, issue)
         result = providers.merge_pull_request(
             ctx.repo_root,
             requested_pr,
@@ -1036,6 +1048,9 @@ def run_git(args: argparse.Namespace) -> int:
             args.commit_title,
             args.commit_message,
             os.environ,
+        )
+        approval.record_consumed_approval(
+            ctx.repo_root, issue, "git-pr-merge", approved_file, gate_source, "human reviewer", "success"
         )
         print(f"[INFO] PR #{args.number} merged")
         if result.get("sha"):
@@ -1074,6 +1089,9 @@ def run_git(args: argparse.Namespace) -> int:
         print("[INFO] git-mr gate passed; provider skipped")
         return 0
     result = providers.create_pull_request(ctx.repo_root, title, body_file.read_text(encoding="utf-8"), branch, base, os.environ)
+    approval.record_consumed_approval(
+        ctx.repo_root, issue, "git-mr", body_file, gate_source, "human reviewer", "success"
+    )
     set_branch_meta(ctx.repo_root, "pr", result.number)
     if result.html_url:
         set_branch_meta(ctx.repo_root, "pr-url", result.html_url)
@@ -1088,6 +1106,10 @@ def run_git(args: argparse.Namespace) -> int:
     suggestion = write_pr_state_update_suggestion(ctx.repo_root, issue, result.number, result.html_url)
     backfill_paths = [suggestion, *update_current_task_for_pr(ctx.repo_root, issue, result.number, result.html_url)]
     backfill_pushed = commit_and_push_pr_backfill(ctx.repo_root, branch, backfill_paths, result.number, issue)
+    if backfill_pushed:
+        approval.record_consumed_approval(
+            ctx.repo_root, issue, "git-state-backfill", body_file, gate_source, "human reviewer", "success"
+        )
     print(f"[INFO] PR #{result.number} created")
     if result.html_url:
         print(f"[INFO] {result.html_url}")
