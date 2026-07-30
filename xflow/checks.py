@@ -159,7 +159,7 @@ def git_config(repo_root: Path, key: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def check_current_task(repo_root: Path, issue: str | None = None) -> None:
+def check_current_task(repo_root: Path, issue: str | None = None, *, check_stale_pr: bool = True) -> None:
     from .task_state import check_task_binding
     from .bindings import fingerprint, git_path
     from .paths import active_task_pointer_file
@@ -189,7 +189,7 @@ def check_current_task(repo_root: Path, issue: str | None = None) -> None:
             raise ValueError(f"missing required section in .xflow/current-task.md: {section}")
 
     pr_number = git_config(repo_root, "devctl.pr")
-    if pr_number and state in PRE_PR_STATES:
+    if check_stale_pr and pr_number and state in PRE_PR_STATES:
         raise ValueError(
             "stale current task state: local git config already records "
             f"devctl.pr={pr_number}, but State is still {state}; update to S9_REMOTE_REVIEW_AND_CI or later"

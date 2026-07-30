@@ -164,6 +164,53 @@ State: S9_REMOTE_REVIEW_AND_CI
     assert approval.require_remote_or_unattended(repo_root, "git-pr-merge", mr_file, "1") == "local-review"
 
 
+def test_legacy_draft_ignores_unrelated_pr_metadata(repo_root: Path) -> None:
+    git(repo_root, "config", "extensions.worktreeConfig", "true")
+    git(repo_root, "config", "--worktree", "devctl.pr", "9")
+    write(
+        repo_root / ".xflow" / "current-task.md",
+        """# XFlow Current Task
+
+Issue: draft
+State: G5_APPROVE_MR_CREATE
+
+## Allowed Actions
+- Create the approved issue.
+
+## Forbidden Actions
+- Push unreviewed changes.
+""",
+    )
+    draft_file = repo_root / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
+    write(draft_file, "<!-- xflow: issue-draft -->\n\nLegacy draft evidence.\n")
+    review = approval.prepare(repo_root, "draft", "issue-create", draft_file, reviewer="human reviewer")
+    approve(review)
+    approval.require_remote(repo_root, "issue-create", draft_file, "draft")
+
+    write(
+        repo_root / ".xflow" / "current-task.md",
+        """# XFlow Current Task
+
+Issue: 1
+State: G5_APPROVE_MR_CREATE
+
+## Allowed Actions
+- Push the approved branch.
+
+## Forbidden Actions
+- Create unreviewed remote writes.
+""",
+    )
+    git_file = repo_root / ".xflow" / "issues" / "issue-1" / "walkthrough.md"
+    write(git_file, "# Walkthrough\n\nGit approval evidence.\n")
+    review = approval.prepare(repo_root, "1", "git-push", git_file, reviewer="human reviewer")
+    approve(review)
+    assert_value_error(
+        "stale current task state",
+        lambda: approval.require_remote(repo_root, "git-push", git_file, "1"),
+    )
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
@@ -171,6 +218,7 @@ def main() -> None:
         worktree_b = root / "worktree-b"
         repository_c = root / "repository-c"
         legacy_repo = root / "legacy-pr-merge"
+        legacy_draft_repo = root / "legacy-draft"
         git(root, "init", "-q", str(worktree_a))
         git(worktree_a, "config", "user.email", "test@example.com")
         git(worktree_a, "config", "user.name", "Test User")
@@ -254,6 +302,15 @@ def main() -> None:
         git(legacy_repo, "commit", "-m", "init", "-q")
         git(legacy_repo, "checkout", "-b", "feature/1-recorded-merge", "-q")
         test_legacy_pr_merge_review(legacy_repo)
+
+        git(root, "init", "-q", str(legacy_draft_repo))
+        git(legacy_draft_repo, "config", "user.email", "test@example.com")
+        git(legacy_draft_repo, "config", "user.name", "Test User")
+        git(legacy_draft_repo, "checkout", "-b", "main", "-q")
+        write(legacy_draft_repo / "README.md", "# Legacy draft\n")
+        git(legacy_draft_repo, "add", "README.md")
+        git(legacy_draft_repo, "commit", "-m", "init", "-q")
+        test_legacy_draft_ignores_unrelated_pr_metadata(legacy_draft_repo)
 
     print("approval binding ok")
 

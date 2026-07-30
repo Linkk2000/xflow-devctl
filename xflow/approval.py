@@ -291,11 +291,11 @@ def reject_consumed_approval(repo_root: Path, issue: str, action: str, approved_
                 raise
 
 
-def check_reviewed_task_binding(repo_root: Path, issue: str) -> None:
+def check_reviewed_task_binding(repo_root: Path, issue: str, action: str) -> None:
     # This preserves legacy current-task.md workflows while using strict task bindings whenever present.
     from .checks import check_current_task
 
-    check_current_task(repo_root, issue)
+    check_current_task(repo_root, issue, check_stale_pr=not (issue == "draft" and action == "issue-create"))
 
 
 def require_remote(
@@ -315,7 +315,7 @@ def require_remote(
     if action != "contract-acceptance" and approved_action != action and approved_action.lower() not in UMBRELLA_ACTIONS:
         raise ValueError(f"action mismatch: expected {action}, got {approved_action}")
     check(repo_root, issue, approved_file, attachment_manifest)
-    check_reviewed_task_binding(repo_root, issue)
+    check_reviewed_task_binding(repo_root, issue, action)
     reject_consumed_approval(repo_root, issue, action, approved_file)
 
 
@@ -345,7 +345,7 @@ def require_remote_or_unattended(
     if action == "contract-acceptance":
         if request_unattended:
             raise ValueError("contract-acceptance is not eligible for unattended mode")
-        check_reviewed_task_binding(repo_root, issue)
+        check_reviewed_task_binding(repo_root, issue, action)
         require_exact_remote(repo_root, action, approved_file, issue)
         return "local-review"
     if action not in UNATTENDED_ACTIONS:
@@ -412,7 +412,7 @@ def record_consumed_approval(
     repo_root = repo_root.resolve()
     bindings = resolve_bindings(repo_root)
     if source == "local-review":
-        check_reviewed_task_binding(repo_root, issue)
+        check_reviewed_task_binding(repo_root, issue, action)
     approved_path = resolve_path(repo_root, approved_file)
     approved_hash = sha256_file(approved_path).lower()
     if source == "local-review":
