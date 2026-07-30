@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
-import subprocess
 import tempfile
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .bindings import resolve_bindings
 from .paths import normalized_issue
 
 
@@ -32,38 +31,6 @@ class UnattendedState:
 
 def state_path(repo_root: Path) -> Path:
     return repo_root.resolve() / ".xflow" / "local" / "unattended.json"
-
-
-def _git_path(repo_root: Path, argument: str) -> Path:
-    result = subprocess.run(
-        ["git", "-C", str(repo_root), "rev-parse", "--path-format=absolute", argument],
-        check=False,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    value = result.stdout.strip()
-    if result.returncode != 0 or not value:
-        detail = result.stderr.strip() or result.stdout.strip()
-        raise ValueError(f"cannot resolve Git {argument}: {detail or 'unknown Git error'}")
-    return Path(value).resolve()
-
-
-def _canonical_path(path: Path) -> str:
-    return os.path.normcase(str(path.resolve()))
-
-
-def _fingerprint(label: str, path: Path) -> str:
-    value = f"{label}\0{_canonical_path(path)}".encode("utf-8")
-    return hashlib.sha256(value).hexdigest()
-
-
-def _bindings(repo_root: Path) -> tuple[str, str]:
-    common_dir = _git_path(repo_root, "--git-common-dir")
-    worktree = _git_path(repo_root, "--show-toplevel")
-    return _fingerprint("repository", common_dir), _fingerprint("worktree", worktree)
 
 
 def _current_task_binding(repo_root: Path) -> tuple[str, str] | None:
@@ -141,12 +108,12 @@ def _write(repo_root: Path, state: UnattendedState) -> None:
 def enable(repo_root: Path, issue: str, confirmation: str) -> UnattendedState:
     if confirmation != CONFIRMATION:
         raise ValueError("confirmation does not exactly match the required unattended value")
-    repository, worktree = _bindings(repo_root)
+    bindings = resolve_bindings(repo_root)
     state = UnattendedState(
         version=STATE_VERSION,
         mode=STATE_MODE,
-        repository=repository,
-        worktree=worktree,
+        repository=bindings.repository,
+        worktree=bindings.worktree,
         issue=normalized_issue(issue),
         enabledAt=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     )
@@ -165,10 +132,10 @@ def load(repo_root: Path) -> UnattendedState | None:
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid unattended state: cannot read {path}: {exc}") from exc
     state = _parse(payload)
-    repository, worktree = _bindings(repo_root)
-    if state.repository != repository:
+    bindings = resolve_bindings(repo_root)
+    if state.repository != bindings.repository:
         raise ValueError("unattended state repository mismatch")
-    if state.worktree != worktree:
+    if state.worktree != bindings.worktree:
         raise ValueError("unattended state worktree mismatch")
     task_binding = _current_task_binding(repo_root)
     if task_binding is not None:
