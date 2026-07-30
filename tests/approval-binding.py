@@ -171,6 +171,28 @@ def test_legacy_draft_ignores_unrelated_pr_metadata(repo_root: Path) -> None:
         repo_root / ".xflow" / "current-task.md",
         """# XFlow Current Task
 
+Issue: 1
+State: G5_APPROVE_MR_CREATE
+
+## Allowed Actions
+- Push the approved branch.
+
+## Forbidden Actions
+- Push unreviewed changes.
+""",
+    )
+    draft_file = repo_root / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
+    write(draft_file, "<!-- xflow: issue-draft -->\n\nLegacy draft evidence.\n")
+    review = approval.prepare(repo_root, "draft", "issue-create", draft_file, reviewer="human reviewer")
+    approve(review)
+    assert_value_error(
+        "current task Issue mismatch",
+        lambda: approval.require_remote(repo_root, "issue-create", draft_file, "draft"),
+    )
+    write(
+        repo_root / ".xflow" / "current-task.md",
+        """# XFlow Current Task
+
 Issue: draft
 State: G5_APPROVE_MR_CREATE
 
@@ -181,10 +203,6 @@ State: G5_APPROVE_MR_CREATE
 - Push unreviewed changes.
 """,
     )
-    draft_file = repo_root / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
-    write(draft_file, "<!-- xflow: issue-draft -->\n\nLegacy draft evidence.\n")
-    review = approval.prepare(repo_root, "draft", "issue-create", draft_file, reviewer="human reviewer")
-    approve(review)
     approval.require_remote(repo_root, "issue-create", draft_file, "draft")
 
     write(

@@ -3106,8 +3106,23 @@ Image evidence is attached locally.
         )
         approval_text = approval.read_text(encoding="utf-8")
         approval.write_text(approval_text.replace("Approved: no", "Approved: yes"), encoding="utf-8")
-        run_devctl(repo, "check", "local-review", "--issue", "draft", "--file", str(oss_final_body), "--action", "issue-create", "--attachments", str(oss_published_manifest))
+        stale_draft_review = run_devctl(
+            repo,
+            "check",
+            "local-review",
+            "--issue",
+            "draft",
+            "--file",
+            str(oss_final_body),
+            "--action",
+            "issue-create",
+            "--attachments",
+            str(oss_published_manifest),
+            expect=1,
+        )
+        assert "current task Issue mismatch: expected draft, found 1" in stale_draft_review.stderr
         write(current_task, current_task_text("draft"))
+        run_devctl(repo, "check", "local-review", "--issue", "draft", "--file", str(oss_final_body), "--action", "issue-create", "--attachments", str(oss_published_manifest))
         run_devctl(repo, "issue", "create", "OSS image gate", "--body-file", str(oss_final_body), "--attachments", str(oss_published_manifest))
 
         run_devctl(repo, "issue", "create", "Review required", "--body-file", str(auto_issue_body := issue_file.with_name("plain-issue.md")), expect=1)
