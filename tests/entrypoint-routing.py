@@ -205,6 +205,8 @@ def assert_check_commands_are_discoverable() -> None:
         assert result.returncode == 0, result.stderr
         assert "dependencies" in result.stdout, (command, result.stdout)
         assert "commit-msg" in result.stdout, (command, result.stdout)
+        if command[-2:] == ["check", "--help"]:
+            assert "classification" in result.stdout, (command, result.stdout)
 
     for path in (OPS_ROOT / "README.md", OPS_ROOT / "help.txt"):
         text = path.read_text(encoding="utf-8")

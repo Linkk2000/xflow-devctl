@@ -22,6 +22,7 @@ from .checks import (
 )
 from .commit_message import check_commit_message
 from .bindings import resolve_bindings
+from .classification import check_classification
 from .env import RuntimeContext, load_env_files, python_version, token_status_lines
 from .dependencies import check_dependencies
 from .migration import apply_issue_workspace_migration, inspect, inspect_issue_workspace_migration, write_wrappers
@@ -132,6 +133,9 @@ def build_parser() -> argparse.ArgumentParser:
     dependencies = check_sub.add_parser("dependencies")
     dependencies.add_argument("--issue", required=True)
     dependencies.add_argument("--file", type=Path)
+    classification = check_sub.add_parser("classification")
+    classification.add_argument("--issue", required=True)
+    classification.add_argument("--file", type=Path)
     commit_message = check_sub.add_parser("commit-msg")
     commit_message.add_argument("--file", required=True, type=Path)
     commit_message.add_argument("--issue")
@@ -350,6 +354,9 @@ def run_check(args: argparse.Namespace) -> int:
         path = result.path
         for warning in result.warnings:
             print(f"[WARN] {warning}")
+    elif args.check_command == "classification":
+        result = check_classification(ctx.repo_root, args.issue, args.file)
+        path = result.path
     elif args.check_command == "commit-msg":
         path = resolve_check_file(ctx.repo_root, args.issue, args.file, "commit-message.txt")
         if not path.is_file():
