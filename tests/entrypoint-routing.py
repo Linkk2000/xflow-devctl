@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import os
 import subprocess
 import sys
@@ -9,6 +8,9 @@ from pathlib import Path
 
 
 OPS_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(OPS_ROOT))
+
+from xflow import approval as approval_gate
 
 
 def git(repo_root: Path, *args: str) -> None:
@@ -21,22 +23,18 @@ def write(path: Path, text: str) -> None:
 
 
 def approval(repo_root: Path, issue: str, action: str, approved_file: Path) -> None:
-    digest = hashlib.sha256(approved_file.read_bytes()).hexdigest()
-    relative = approved_file.relative_to(repo_root).as_posix()
-    write(
-        repo_root / ".xflow" / "issues" / f"issue-{issue}" / "approvals" / "local-review.md",
-        f"""# Local Review Approval
-
-Issue: {issue}
-Reviewer: user
-Approved At: 2026-06-16T00:00:00+08:00
-Approved Action: {action}
-Approved File: {relative}
-Approved SHA256: {digest}
-
-## Decision
-Approved: yes
-""",
+    review = approval_gate.prepare(
+        repo_root,
+        issue,
+        action,
+        approved_file,
+        reviewer="user",
+        force=True,
+    )
+    review.write_text(
+        review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"),
+        encoding="utf-8",
+        newline="\n",
     )
 
 

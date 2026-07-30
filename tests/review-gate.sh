@@ -7,6 +7,14 @@ OPS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
+git -C "$tmpdir" init -q
+git -C "$tmpdir" config user.email test@example.com
+git -C "$tmpdir" config user.name "Test User"
+git -C "$tmpdir" checkout -b main -q
+touch "$tmpdir/README.md"
+git -C "$tmpdir" add README.md
+git -C "$tmpdir" commit -m init -q
+
 run_devctl() {
   DEVCTL_REPO_ROOT="$tmpdir" DEVCTL_SKIP_PROVIDER_LOAD=1 bash "$OPS_ROOT/devctl" "$@"
 }
@@ -28,26 +36,45 @@ expect_pass() {
 
 write_review() {
   local issue="$1" action="$2" file="$3"
-  local review_dir="$tmpdir/.xflow/issues/issue-${issue}/approvals"
-  local hash
-  mkdir -p "$review_dir"
-  hash="$(sha256sum "$file" | awk '{print $1}')"
-  cat >"$review_dir/local-review.md" <<EOF_REVIEW
-# Local Review Approval
+  DEVCTL_REPO_ROOT="$tmpdir" PYTHONPATH="$OPS_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
+    python - "$issue" "$action" "$file" <<'PY_REVIEW'
+import os
+import sys
+from pathlib import Path
 
-Issue: $issue
-Reviewer: user
-Approved At: 2026-06-13T00:00:00+08:00
-Approved Action: $action
-Approved File: $file
-Approved SHA256: $hash
+from xflow import approval
 
-## Decision
-Approved: yes
-EOF_REVIEW
+repo_root = Path(os.environ["DEVCTL_REPO_ROOT"])
+review = approval.prepare(
+    repo_root,
+    sys.argv[1],
+    sys.argv[2],
+    Path(sys.argv[3]),
+    reviewer="user",
+    force=True,
+)
+review.write_text(
+    review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"),
+    encoding="utf-8",
+    newline="\n",
+)
+PY_REVIEW
 }
 
 mkdir -p "$tmpdir/.xflow/issues/issue-draft" "$tmpdir/.xflow/issues/issue-1"
+
+cat >"$tmpdir/.xflow/current-task.md" <<'EOF_TASK'
+# XFlow Current Task
+
+Issue: draft
+State: G1_APPROVE_ISSUE_CREATE
+
+## Allowed Actions
+- Create the approved issue.
+
+## Forbidden Actions
+- Create unreviewed remote writes.
+EOF_TASK
 
 cat >"$tmpdir/.xflow/issues/issue-draft/issue-draft.md" <<'EOF_ISSUE'
 <!-- xflow: issue-draft -->
@@ -124,13 +151,6 @@ expect_fail issue comment 1 --body-file "$tmpdir/.xflow/issues/issue-draft/issue
 
 expect_fail issue close 1
 
-git -C "$tmpdir" init -q
-git -C "$tmpdir" config user.email test@example.com
-git -C "$tmpdir" config user.name "Test User"
-git -C "$tmpdir" checkout -b main -q
-touch "$tmpdir/README.md"
-git -C "$tmpdir" add README.md
-git -C "$tmpdir" commit -m init -q
 git -C "$tmpdir" checkout -b feature/1-review-gate -q
 expect_fail git mr --title "Review gate" --body-file "$tmpdir/.xflow/issues/issue-1/mr-draft.md" --base main --issue 1
 
