@@ -160,6 +160,17 @@ def git_config(repo_root: Path, key: str) -> str:
 
 
 def check_current_task(repo_root: Path, issue: str | None = None) -> None:
+    from .task_state import check_task_binding
+    from .bindings import resolve_bindings
+    from .paths import active_task_pointer_file
+
+    try:
+        bindings = resolve_bindings(repo_root)
+    except ValueError:
+        bindings = None
+    if bindings is not None and active_task_pointer_file(repo_root, bindings.worktree).exists():
+        check_task_binding(repo_root, issue)
+        return
     path = repo_root / ".xflow" / "current-task.md"
     if not path.is_file():
         raise ValueError(f"missing current task state file: {path}")

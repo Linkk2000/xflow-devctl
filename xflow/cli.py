@@ -20,10 +20,12 @@ from .checks import (
     write_pr_state_update_suggestion,
 )
 from .commit_message import check_commit_message
+from .bindings import resolve_bindings
 from .env import RuntimeContext, load_env_files, python_version, token_status_lines
 from .dependencies import check_dependencies
 from .migration import inspect, write_wrappers
 from .paths import default_issue_file, normalized_issue
+from .task_state import activate_task, list_task_states, load_active_task, migrate_legacy_current_task
 
 
 ISSUE_CREATE_EPILOG = """AI call recipes:
@@ -132,6 +134,14 @@ def build_parser() -> argparse.ArgumentParser:
     commit_message = check_sub.add_parser("commit-msg")
     commit_message.add_argument("--file", required=True, type=Path)
     commit_message.add_argument("--issue")
+
+    task = sub.add_parser("task")
+    task_sub = task.add_subparsers(dest="task_command")
+    task_activate = task_sub.add_parser("activate")
+    task_activate.add_argument("--issue", required=True)
+    task_sub.add_parser("status")
+    task_sub.add_parser("list")
+    task_sub.add_parser("migrate-current")
 
     unattended_parser = sub.add_parser("unattended")
     unattended_sub = unattended_parser.add_subparsers(dest="unattended_command")
@@ -349,6 +359,35 @@ def run_check(args: argparse.Namespace) -> int:
         raise ValueError(f"unknown check subcommand: {args.check_command}")
     print(f"[INFO] {args.check_command} check passed: {path}")
     return 0
+
+
+def run_task(args: argparse.Namespace) -> int:
+    ctx = context()
+    if args.task_command == "activate":
+        state = activate_task(ctx.repo_root, args.issue)
+        print(f"[INFO] active task: #{state.issue}")
+        return 0
+    if args.task_command == "status":
+        bindings = resolve_bindings(ctx.repo_root)
+        state = load_active_task(ctx.repo_root)
+        print(f"repository: {bindings.repository[:12]}")
+        print(f"worktree: {bindings.worktree[:12]}")
+        print(f"branch: {bindings.branch}")
+        print(f"Issue: {state.issue}")
+        print(f"Execution State: {state.execution_state}")
+        print(f"Semantic Phase: {state.semantic_phase}")
+        print(f"Classification: {state.classification}")
+        print(f"Contract: {state.contract}")
+        return 0
+    if args.task_command == "list":
+        for state in list_task_states(ctx.repo_root):
+            print(f"#{state.issue}\t{state.execution_state}\t{state.semantic_phase}\t{state.classification}\t{state.contract}")
+        return 0
+    if args.task_command == "migrate-current":
+        state = migrate_legacy_current_task(ctx.repo_root)
+        print(f"[INFO] migrated current task: #{state.issue}")
+        return 0
+    raise ValueError(f"unknown task subcommand: {args.task_command}")
 
 
 def body_from_file(path: Path | None, inline: str | None, required_message: str) -> tuple[str, Path]:
@@ -1196,6 +1235,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_preflight()
         if args.command == "check":
             return run_check(args)
+        if args.command == "task":
+            return run_task(args)
         if args.command == "issue":
             return run_issue(args)
         if args.command == "git":

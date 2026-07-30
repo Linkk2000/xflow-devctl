@@ -30,3 +30,11 @@ def default_issue_file(repo_root: Path, issue: str, filename: str) -> Path:
 
 def default_approval_file(repo_root: Path, issue: str) -> Path:
     return issue_dir(repo_root, issue) / "approvals" / "local-review.md"
+
+
+def task_state_file(repo_root: Path, issue: str) -> Path:
+    return issue_dir(repo_root, issue) / "task-state.md"
+
+
+def active_task_pointer_file(repo_root: Path, worktree_fingerprint: str) -> Path:
+    return repo_root.resolve() / ".xflow" / "local" / "worktrees" / worktree_fingerprint / "active-task.json"
