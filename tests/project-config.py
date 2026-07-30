@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -275,8 +276,16 @@ def test_secret_and_local_path_detection(root: Path) -> None:
     issue = repo / ".xflow" / "issues" / "issue-1"
     secret_cases = {
         "json.json": '"token": "hidden"\n',
+        "openai.json": '"openai_api_key": "hidden"\n',
+        "aws.json": '"aws_access_key_id": "hidden"\n',
         "yaml.yaml": "client_secret: hidden\n",
+        "prefixed.yaml": "azure_openai_api_key: hidden\n",
         "env.env": "API_KEY='hidden'\n",
+        "prefixed.env": "AWS_ACCESS_KEY_ID='hidden'\n",
+    }
+    prose_cases = {
+        "prose.txt": "Rotate the openai api key before release.\n",
+        "prose-aws.txt": "The AWS access key id is documented by the provider.\n",
     }
     path_cases = {
         "posix.txt": "/opt/data/evidence.txt\n",
@@ -285,7 +294,7 @@ def test_secret_and_local_path_detection(root: Path) -> None:
         "unc.txt": "\\\\server\\share\\evidence.txt\n",
         "device.txt": "\\\\.\\PhysicalDrive0\n",
     }
-    for name, content in {**secret_cases, **path_cases}.items():
+    for name, content in {**secret_cases, **prose_cases, **path_cases}.items():
         write(issue / name, content)
     report = inspect_issue_workspace_migration(repo, "tracked")
     assert {path.name for path in report.credential_files} == set(secret_cases)
@@ -367,6 +376,100 @@ def test_apply_revalidates_config_and_issue_snapshots(root: Path) -> None:
     assert not (issue_repo / ".xflow" / "xflow.json").exists()
 
 
+def test_final_commit_window_changes_are_preserved(root: Path) -> None:
+    target_repo = root / "target-window"
+    config_path = target_repo / ".xflow" / "xflow.json"
+    write_json(config_path, {"projectOwned": "original"})
+    real_snapshot = migration._current_target_snapshot
+    target_mutated = False
+
+    def mutate_after_target_snapshot(
+        repo_root: Path, expected: migration.FileSnapshot, label: str
+    ) -> migration.FileSnapshot:
+        nonlocal target_mutated
+        current = real_snapshot(repo_root, expected, label)
+        if not target_mutated and label == "migration target" and expected.path == config_path:
+            target_mutated = True
+            write_json(config_path, {"projectOwned": "concurrent"})
+        return current
+
+    with patch.object(migration, "_current_target_snapshot", side_effect=mutate_after_target_snapshot):
+        assert_value_error("changed during migration", lambda: apply_issue_workspace_migration(target_repo, "local"))
+    assert json.loads(config_path.read_text(encoding="utf-8")) == {"projectOwned": "concurrent"}
+
+    issue_repo = root / "issue-window"
+    issue_path = issue_repo / ".xflow" / "issues" / "issue-1" / "evidence.txt"
+    write(issue_path, "safe evidence\n")
+    real_update = migration._update_journal_state
+    issue_mutated = False
+
+    def mutate_after_journal_update(*args: object, **kwargs: object) -> None:
+        nonlocal issue_mutated
+        real_update(*args, **kwargs)  # type: ignore[arg-type]
+        payload = args[2]
+        index = args[3]
+        state_value = args[4]
+        entries = payload["entries"]  # type: ignore[index]
+        if not issue_mutated and state_value == "committing" and entries[index]["target"] == ".xflow/xflow.json":
+            issue_mutated = True
+            write(issue_path, "openai_api_key=concurrent-secret\n")
+
+    with patch.object(migration, "_update_journal_state", side_effect=mutate_after_journal_update):
+        assert_value_error("changed during migration", lambda: apply_issue_workspace_migration(issue_repo, "local"))
+    assert not (issue_repo / ".xflow" / "xflow.json").exists()
+    assert issue_path.read_text(encoding="utf-8") == "openai_api_key=concurrent-secret\n"
+
+    success_repo = root / "success-window"
+    success_config = success_repo / ".xflow" / "xflow.json"
+    write_json(success_config, {"projectOwned": "original"})
+    real_safe_replace = migration._safe_replace
+    success_mutated = False
+
+    def mutate_after_replacement(
+        repo_root: Path, source: Path, target: Path, label: str, *args: object, **kwargs: object
+    ) -> object:
+        nonlocal success_mutated
+        result = real_safe_replace(repo_root, source, target, label, *args, **kwargs)
+        if not success_mutated and label == "migration commit" and target == success_config:
+            success_mutated = True
+            write_json(success_config, {"projectOwned": "edited-before-success"})
+        return result
+
+    with patch.object(migration, "_safe_replace", side_effect=mutate_after_replacement):
+        assert_value_error("manual recovery", lambda: apply_issue_workspace_migration(success_repo, "local"))
+    assert json.loads(success_config.read_text(encoding="utf-8")) == {"projectOwned": "edited-before-success"}
+
+
+def test_repository_lock_blocks_parallel_apply(root: Path) -> None:
+    repo = root / "repository-lock"
+    write_json(repo / ".xflow" / "xflow.json", {"projectOwned": True})
+    entered = threading.Event()
+    release = threading.Event()
+    failures: list[BaseException] = []
+
+    def hold_lock() -> None:
+        try:
+            with migration._repository_migration_lock(repo.resolve(strict=False)):
+                entered.set()
+                release.wait(timeout=10)
+        except BaseException as exc:
+            failures.append(exc)
+            entered.set()
+
+    worker = threading.Thread(target=hold_lock)
+    worker.start()
+    try:
+        assert entered.wait(timeout=10), "repository lock holder did not start"
+        assert failures == [], failures
+        assert_value_error("repository lock", lambda: apply_issue_workspace_migration(repo, "local"))
+    finally:
+        release.set()
+        worker.join(timeout=10)
+    assert not worker.is_alive()
+    assert failures == [], failures
+    assert json.loads((repo / ".xflow" / "xflow.json").read_text(encoding="utf-8")) == {"projectOwned": True}
+
+
 def test_second_commit_failure_rolls_back_both_targets(root: Path) -> None:
     repo = root / "rollback"
     repo.mkdir(parents=True)
@@ -377,19 +480,19 @@ def test_second_commit_failure_rolls_back_both_targets(root: Path) -> None:
     original_ignore = ".xflow/issues/\n"
     write(config_path, original_config)
     write(ignore_path, original_ignore)
-    real_replace = migration.os.replace
+    real_safe_replace = migration._safe_replace
     failed = False
 
-    def fail_second_replace(source: object, target: object) -> None:
+    def fail_second_replace(
+        repo_root: Path, source: Path, target: Path, label: str, *args: object, **kwargs: object
+    ) -> object:
         nonlocal failed
-        source_path = Path(source)
-        target_path = Path(target)
-        if not failed and target_path == config_path and source_path.name.startswith(".xflow-config.migration."):
+        if not failed and target == config_path and label == "migration commit":
             failed = True
             raise OSError("second replacement failed for test")
-        real_replace(source, target)  # type: ignore[arg-type]
+        return real_safe_replace(repo_root, source, target, label, *args, **kwargs)
 
-    with patch.object(migration.os, "replace", side_effect=fail_second_replace):
+    with patch.object(migration, "_safe_replace", side_effect=fail_second_replace):
         assert_value_error("rolled back", lambda: apply_issue_workspace_migration(repo, "tracked"))
     assert config_path.read_text(encoding="utf-8") == original_config
     assert ignore_path.read_text(encoding="utf-8") == original_ignore
@@ -406,12 +509,14 @@ def test_interrupted_transaction_recovers_without_residue(root: Path) -> None:
     real_safe_replace = migration._safe_replace
     interrupted = False
 
-    def interrupt_config_commit(repo_root: Path, source: Path, target: Path, label: str) -> None:
+    def interrupt_config_commit(
+        repo_root: Path, source: Path, target: Path, label: str, *args: object, **kwargs: object
+    ) -> object:
         nonlocal interrupted
         if not interrupted and label == "migration commit" and target == config_path:
             interrupted = True
             raise KeyboardInterrupt("simulated process interruption")
-        real_safe_replace(repo_root, source, target, label)
+        return real_safe_replace(repo_root, source, target, label, *args, **kwargs)
 
     with patch.object(migration, "_safe_replace", side_effect=interrupt_config_commit):
         try:
@@ -436,6 +541,109 @@ def test_interrupted_transaction_recovers_without_residue(root: Path) -> None:
     assert residue == [], residue
 
 
+def _leave_interrupted_transaction(repo: Path) -> Path:
+    repo.mkdir(parents=True)
+    git(repo, "init", "-q")
+    config_path = repo / ".xflow" / "xflow.json"
+    write(config_path, '{"projectOwned": true}\n')
+    write(repo / ".gitignore", ".xflow/issues/\n")
+    real_safe_replace = migration._safe_replace
+    interrupted = False
+
+    def interrupt_config_commit(
+        repo_root: Path, source: Path, target: Path, label: str, *args: object, **kwargs: object
+    ) -> object:
+        nonlocal interrupted
+        if not interrupted and label == "migration commit" and target == config_path:
+            interrupted = True
+            raise KeyboardInterrupt("simulated process interruption")
+        return real_safe_replace(repo_root, source, target, label, *args, **kwargs)
+
+    with patch.object(migration, "_safe_replace", side_effect=interrupt_config_commit):
+        try:
+            apply_issue_workspace_migration(repo, "tracked")
+        except KeyboardInterrupt:
+            pass
+        else:
+            raise AssertionError("expected simulated process interruption")
+    assert interrupted
+    journal = repo / ".xflow" / "local" / "issue-workspace-migration-journal.json"
+    assert journal.is_file()
+    return journal
+
+
+def _journal_artifact(repo: Path, value: object) -> Path:
+    if isinstance(value, dict):
+        value = value["path"]
+    assert isinstance(value, str)
+    path = Path(value)
+    return path if path.is_absolute() else repo / path
+
+
+def test_crafted_journal_artifact_is_rejected(root: Path) -> None:
+    repo = root / "crafted-journal"
+    journal = _leave_interrupted_transaction(repo)
+    payload = json.loads(journal.read_text(encoding="utf-8"))
+    config_entry = next(entry for entry in payload["entries"] if entry["target"] == ".xflow/xflow.json")
+    backup = _journal_artifact(repo, config_entry["backup"])
+    write(backup, '{"crafted": true}\n')
+
+    assert_value_error("manual recovery", lambda: apply_issue_workspace_migration(repo, "tracked"))
+    assert json.loads((repo / ".xflow" / "xflow.json").read_text(encoding="utf-8")) == {"projectOwned": True}
+    assert journal.is_file()
+
+    tampered_repo = root / "tampered-journal"
+    tampered_journal = _leave_interrupted_transaction(tampered_repo)
+    tampered_payload = json.loads(tampered_journal.read_text(encoding="utf-8"))
+    tampered_payload["entries"][0]["state"] = "pending"
+    write(tampered_journal, json.dumps(tampered_payload, ensure_ascii=True, indent=2) + "\n")
+
+    assert_value_error("manual recovery", lambda: apply_issue_workspace_migration(tampered_repo, "tracked"))
+    assert json.loads((tampered_repo / ".xflow" / "xflow.json").read_text(encoding="utf-8")) == {
+        "projectOwned": True
+    }
+    assert tampered_journal.is_file()
+
+
+def test_post_crash_project_edit_is_preserved(root: Path) -> None:
+    repo = root / "post-crash-edit"
+    journal = _leave_interrupted_transaction(repo)
+    config_path = repo / ".xflow" / "xflow.json"
+    concurrent = {"projectOwned": "edited-after-crash"}
+    write_json(config_path, concurrent)
+
+    assert_value_error("manual recovery", lambda: apply_issue_workspace_migration(repo, "tracked"))
+    assert json.loads(config_path.read_text(encoding="utf-8")) == concurrent
+    assert journal.is_file()
+
+
+def test_cleanup_interruption_leaves_no_live_journal(root: Path) -> None:
+    repo = root / "cleanup-interruption"
+    write_json(repo / ".xflow" / "xflow.json", {"projectOwned": True})
+    live_journal = repo / ".xflow" / "local" / "issue-workspace-migration-journal.json"
+    cleanup_reached = False
+
+    def interrupt_cleanup(*args: object, **kwargs: object) -> None:
+        nonlocal cleanup_reached
+        cleanup_reached = True
+        assert not live_journal.exists(), "live journal must be finalized before rollback material cleanup"
+        raise KeyboardInterrupt("simulated cleanup interruption")
+
+    with patch.object(migration, "_cleanup_transaction", side_effect=interrupt_cleanup):
+        try:
+            apply_issue_workspace_migration(repo, "local")
+        except KeyboardInterrupt:
+            pass
+        else:
+            raise AssertionError("expected simulated cleanup interruption")
+    assert cleanup_reached
+    assert not live_journal.exists()
+    apply_issue_workspace_migration(repo, "local")
+    saved = json.loads((repo / ".xflow" / "xflow.json").read_text(encoding="utf-8"))
+    assert saved["projectOwned"] is True
+    assert saved["issueWorkspace"] == {"mode": "local"}
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
@@ -452,8 +660,13 @@ def main() -> None:
         test_secret_and_local_path_detection(root / "patterns")
         test_scan_failures_and_growth_block_apply(root / "scan-failures")
         test_apply_revalidates_config_and_issue_snapshots(root / "toctou")
+        test_final_commit_window_changes_are_preserved(root / "commit-window")
+        test_repository_lock_blocks_parallel_apply(root / "repository-lock")
         test_second_commit_failure_rolls_back_both_targets(root / "transaction")
         test_interrupted_transaction_recovers_without_residue(root / "recovery")
+        test_crafted_journal_artifact_is_rejected(root / "crafted-journal")
+        test_post_crash_project_edit_is_preserved(root / "post-crash-edit")
+        test_cleanup_interruption_leaves_no_live_journal(root / "cleanup-interruption")
     print("project config ok")
 
 
