@@ -130,6 +130,12 @@ def main() -> None:
         run_devctl(worktree_a, "task", "activate", "--issue", "303")
         assert load_active_task(worktree_a).issue == "303"
 
+        legacy_compat = worktree_a / ".xflow" / "current-task.md"
+        write(legacy_compat, "# XFlow Current Task\n\nIssue: 303\nState: S2_REMOTE_ISSUE_CREATED\n\n## Allowed Actions\n- clarify-contract\n\n## Forbidden Actions\n- push\n")
+        git(worktree_a, "checkout", "--detach", "-q")
+        assert_value_error("cannot bind XFlow task to detached HEAD", lambda: check_current_task(worktree_a, "303"))
+        git(worktree_a, "checkout", "feature/303-c", "-q")
+
         accepted = state("404", "feature/404-d", phase="accepted-design", approval="approvals/history/design.md")
         accepted_path = write_state(worktree_a, accepted)
         assert accepted_path.is_file()
@@ -149,8 +155,33 @@ def main() -> None:
             ("- edit-implementation\n- push\n- create-mr", "", "Forbidden Actions must not be empty"),
         )
         template = render_task_state(state("505", "feature/505-e"))
+        for invalid_issue in ("ABC-1", "A_B", "A.B"):
+            assert_value_error("letters and numbers", lambda invalid_issue=invalid_issue: render_task_state(state(invalid_issue, "feature/505-e")))
+            invalid_issue_path = worktree_a / ".xflow" / "issues" / f"issue-{invalid_issue}" / "task-state.md"
+            write(invalid_issue_path, template.replace("Issue: 505", f"Issue: {invalid_issue}"))
+            assert_value_error("letters and numbers", lambda invalid_issue_path=invalid_issue_path: parse_task_state(invalid_issue_path))
+            invalid_issue_path.unlink()
         for old, new, expected in invalid_cases:
             write(invalid_path, template.replace(old, new))
+            assert_value_error(expected, lambda: parse_task_state(invalid_path))
+        ambiguous_cases = (
+            (template.replace("Issue: 505", "Issue: 505\nIssue: 606"), "duplicate task-state field: Issue"),
+            (
+                template.replace("Human Approval Ref: none", "Human Approval Ref: none\nHuman Approval Ref: approvals/history/design.md"),
+                "duplicate task-state field: Human Approval Ref",
+            ),
+            (
+                template.replace("Contract: example.contract.capability-name@0.1.0\n", "").replace(
+                    "## Allowed Actions\n", "## Allowed Actions\nContract: supplied-in-action-section\n"
+                ),
+                "unexpected non-list line in ## Allowed Actions",
+            ),
+            (template.replace("## Allowed Actions", "## Allowed Actions\n## Allowed Actions", 1), "duplicate task-state heading: ## Allowed Actions"),
+            (template.replace("# XFlow Task State", "# XFlow Task State\n# XFlow Task State", 1), "duplicate task-state heading: # XFlow Task State"),
+            (template.replace("- clarify-contract", "not-a-list-item\n- clarify-contract"), "unexpected non-list line in ## Allowed Actions"),
+        )
+        for malformed, expected in ambiguous_cases:
+            write(invalid_path, malformed)
             assert_value_error(expected, lambda: parse_task_state(invalid_path))
         wrong_path = worktree_a / ".xflow" / "issues" / "issue-OTHER" / "task-state.md"
         write(wrong_path, template)
@@ -167,11 +198,16 @@ def main() -> None:
         migrated = migrate_legacy_current_task(worktree_a)
         assert migrated.issue == "LEGACY7"
         assert legacy.is_file()
-        assert (worktree_a / ".xflow" / "issues" / "issue-LEGACY7" / "task-state.md").is_file()
+        migrated_path = worktree_a / ".xflow" / "issues" / "issue-LEGACY7" / "task-state.md"
+        assert migrated_path.is_file()
+        migrated_bytes = migrated_path.read_bytes()
+        write(legacy, "# XFlow Current Task\n\nIssue: LEGACY7\nState: S5_LOCAL_VERIFICATION\n\n## Allowed Actions\n- verify\n\n## Forbidden Actions\n- push\n")
+        assert_value_error("task-state already exists", lambda: migrate_legacy_current_task(worktree_a))
+        assert migrated_path.read_bytes() == migrated_bytes
         legacy.write_text("# XFlow Current Task\n\nIssue: ../invalid\n", encoding="utf-8", newline="\n")
         assert_value_error("current task Issue", lambda: migrate_legacy_current_task(worktree_a))
         assert not (worktree_a / ".xflow" / "issues" / "issue-invalid" / "task-state.md").exists()
-        write(legacy, "# XFlow Current Task\n\nIssue: LEGACY7\nState: S2_REMOTE_ISSUE_CREATED\n\n## Allowed Actions\n- clarify-contract\n\n## Forbidden Actions\n- push\n")
+        write(legacy, "# XFlow Current Task\n\nIssue: CLI7\nState: S2_REMOTE_ISSUE_CREATED\n\n## Allowed Actions\n- clarify-contract\n\n## Forbidden Actions\n- push\n")
 
         status = run_devctl(worktree_a, "task", "status")
         for field in ("repository", "worktree", "branch", "Issue", "Execution State", "Semantic Phase", "Classification", "Contract"):
@@ -179,7 +215,7 @@ def main() -> None:
         listed = run_devctl(worktree_a, "task", "list")
         assert "#101" in listed.stdout
         migrated_output = run_devctl(worktree_a, "task", "migrate-current")
-        assert "LEGACY7" in migrated_output.stdout
+        assert "CLI7" in migrated_output.stdout
 
     print("task state ok")
 

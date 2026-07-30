@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .bindings import GitBindings, resolve_bindings
 from .io import read_text
-from .paths import active_task_pointer_file, normalized_issue, task_state_file
+from .paths import active_task_pointer_file, task_state_file
 
 
 EXECUTION_STATES = (
@@ -47,6 +47,23 @@ CLASSIFICATIONS = (
 )
 POINTER_VERSION = 1
 POINTER_FIELDS = {"version", "repository", "worktree", "branch", "issue", "activatedAt"}
+TASK_ISSUE_ID_RE = re.compile(r"[A-Za-z0-9]+")
+TASK_STATE_FIELDS = (
+    "Issue",
+    "Execution State",
+    "Semantic Phase",
+    "Classification",
+    "Contract",
+    "Contract File",
+    "Contract Change Required",
+    "Branch",
+    "Base",
+    "Human Gate",
+    "Human Approval Ref",
+)
+TASK_STATE_TITLE = "# XFlow Task State"
+ALLOWED_ACTIONS_HEADING = "## Allowed Actions"
+FORBIDDEN_ACTIONS_HEADING = "## Forbidden Actions"
 LEGACY_GATE_STATES = {
     "G1_APPROVE_ISSUE_CREATE": "S1_LOCAL_ISSUE_DRAFT",
     "G2_APPROVE_DEVELOPMENT_START": "S2_REMOTE_ISSUE_CREATED",
@@ -103,14 +120,65 @@ def _actions(text: str, heading: str) -> tuple[str, ...]:
     return actions
 
 
+def _heading_index(lines: list[str], heading: str) -> int:
+    matches = [index for index, line in enumerate(lines) if line.strip() == heading]
+    if not matches:
+        raise ValueError(f"missing required task-state heading: {heading}")
+    if len(matches) > 1:
+        raise ValueError(f"duplicate task-state heading: {heading}")
+    return matches[0]
+
+
+def _structured_actions(lines: list[str], heading: str) -> tuple[str, ...]:
+    actions = []
+    for line in lines:
+        if not line.strip():
+            continue
+        item = re.fullmatch(r"[ \t]*-[ \t]+(\S.*?)[ \t]*", line)
+        if not item:
+            raise ValueError(f"unexpected non-list line in {heading}: {line.strip()}")
+        actions.append(item.group(1).strip())
+    if not actions:
+        raise ValueError(f"task-state {heading[3:]} must not be empty")
+    return tuple(actions)
+
+
+def _parse_task_state_markdown(text: str) -> tuple[dict[str, str], tuple[str, ...], tuple[str, ...]]:
+    lines = text.splitlines()
+    title_index = _heading_index(lines, TASK_STATE_TITLE)
+    allowed_index = _heading_index(lines, ALLOWED_ACTIONS_HEADING)
+    forbidden_index = _heading_index(lines, FORBIDDEN_ACTIONS_HEADING)
+    if not title_index < allowed_index < forbidden_index:
+        raise ValueError("task-state headings are out of order")
+    if any(line.strip() for line in lines[:title_index]):
+        raise ValueError("unexpected content before task-state heading")
+
+    fields: dict[str, str] = {}
+    for line in lines[title_index + 1 : allowed_index]:
+        if not line.strip():
+            continue
+        match = re.fullmatch(r"[ \t]*([^:\r\n]+?)[ \t]*:[ \t]*([^\r\n]*)[ \t]*", line)
+        if not match:
+            raise ValueError(f"unexpected task-state preamble line: {line.strip()}")
+        name = match.group(1).strip()
+        if name not in TASK_STATE_FIELDS:
+            raise ValueError(f"unexpected task-state field: {name}")
+        if name in fields:
+            raise ValueError(f"duplicate task-state field: {name}")
+        fields[name] = match.group(2).strip()
+
+    allowed = _structured_actions(lines[allowed_index + 1 : forbidden_index], ALLOWED_ACTIONS_HEADING)
+    forbidden = _structured_actions(lines[forbidden_index + 1 :], FORBIDDEN_ACTIONS_HEADING)
+    for name in TASK_STATE_FIELDS:
+        if name not in fields:
+            raise ValueError(f"missing required task-state field: {name}")
+    return fields, allowed, forbidden
+
+
 def _normalized_issue(value: str) -> str:
-    try:
-        issue = normalized_issue(value)
-    except ValueError as exc:
-        raise ValueError(f"invalid task-state Issue: {exc}") from exc
-    if issue != value:
-        raise ValueError("task-state Issue identifier is not normalized")
-    return issue
+    if not isinstance(value, str) or not TASK_ISSUE_ID_RE.fullmatch(value):
+        raise ValueError("task-state Issue must contain only letters and numbers")
+    return value
 
 
 def _required(text: str, label: str) -> str:
@@ -129,9 +197,8 @@ def parse_task_state(path: Path) -> TaskState:
     if not path.is_file():
         raise ValueError(f"missing task-state file: {path}")
     text = read_text(path)
-    if not re.search(r"(?m)^# XFlow Task State\s*$", text):
-        raise ValueError("missing required task-state heading: # XFlow Task State")
-    issue = _normalized_issue(_required(_field(text, "Issue"), "Issue"))
+    fields, allowed_actions, forbidden_actions = _parse_task_state_markdown(text)
+    issue = _normalized_issue(_required(fields["Issue"], "Issue"))
     resolved = path.resolve()
     expected_parent = f"issue-{issue}"
     if (
@@ -140,20 +207,20 @@ def parse_task_state(path: Path) -> TaskState:
         or resolved.parent.parent.parent.name != ".xflow"
     ):
         raise ValueError("task-state file must be inside the matching Issue directory")
-    execution_state = _required(_field(text, "Execution State"), "Execution State")
+    execution_state = _required(fields["Execution State"], "Execution State")
     if execution_state not in EXECUTION_STATES:
         raise ValueError(f"unknown task-state Execution State: {execution_state}")
-    semantic_phase = _required(_field(text, "Semantic Phase"), "Semantic Phase")
+    semantic_phase = _required(fields["Semantic Phase"], "Semantic Phase")
     if semantic_phase not in SEMANTIC_PHASES:
         raise ValueError(f"unknown task-state Semantic Phase: {semantic_phase}")
-    classification = _required(_field(text, "Classification"), "Classification")
+    classification = _required(fields["Classification"], "Classification")
     if classification not in CLASSIFICATIONS:
         raise ValueError(f"unknown task-state Classification: {classification}")
-    boolean = _required(_field(text, "Contract Change Required"), "Contract Change Required")
+    boolean = _required(fields["Contract Change Required"], "Contract Change Required")
     if boolean not in {"yes", "no"}:
         raise ValueError("Contract Change Required must be yes or no")
-    human_gate = _required(_field(text, "Human Gate"), "Human Gate")
-    human_approval_ref = _required(_field(text, "Human Approval Ref"), "Human Approval Ref")
+    human_gate = _required(fields["Human Gate"], "Human Gate")
+    human_approval_ref = _required(fields["Human Approval Ref"], "Human Approval Ref")
     needs_approval = SEMANTIC_PHASES.index(semantic_phase) >= SEMANTIC_PHASES.index("accepted-design")
     if needs_approval:
         if human_approval_ref == "none":
@@ -166,13 +233,13 @@ def parse_task_state(path: Path) -> TaskState:
         execution_state=execution_state,
         semantic_phase=semantic_phase,
         classification=classification,
-        contract=_required(_field(text, "Contract"), "Contract"),
-        contract_file=_required(_field(text, "Contract File"), "Contract File"),
+        contract=_required(fields["Contract"], "Contract"),
+        contract_file=_required(fields["Contract File"], "Contract File"),
         contract_change_required=boolean == "yes",
-        branch=_required(_field(text, "Branch"), "Branch"),
-        base=_required(_field(text, "Base"), "Base"),
-        allowed_actions=_actions(text, "## Allowed Actions"),
-        forbidden_actions=_actions(text, "## Forbidden Actions"),
+        branch=_required(fields["Branch"], "Branch"),
+        base=_required(fields["Base"], "Base"),
+        allowed_actions=allowed_actions,
+        forbidden_actions=forbidden_actions,
         human_gate=human_gate,
         human_approval_ref=human_approval_ref,
     )
@@ -369,5 +436,8 @@ def migrate_legacy_current_task(repo_root: Path) -> TaskState:
         human_gate="legacy task state requires human gate confirmation", human_approval_ref="none",
     )
     target = task_state_file(repo_root, issue)
-    _write_atomic(target, render_task_state(state))
+    rendered = render_task_state(state)
+    if target.exists():
+        raise ValueError(f"task-state already exists: {target}")
+    _write_atomic(target, rendered)
     return state
