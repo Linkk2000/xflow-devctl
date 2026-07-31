@@ -6,7 +6,15 @@ import subprocess
 from pathlib import Path
 
 from .io import read_text
+from .local_artifacts import (
+    StableFileSnapshot,
+    capture_stable_file,
+    contains_forbidden_object_storage_reference,
+    contains_forbidden_remote_reference,
+    safe_relative_reference,
+)
 from .paths import normalized_issue
+from .project_config import require_safe_repo_path
 
 
 ISSUE_REQUIRED = (
@@ -109,7 +117,6 @@ SUBTASK_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 SUBTASK_NAME_RE = re.compile(r"subtask-(\d{3})")
 FINDING_BLOCK_RE = re.compile(r"(?ms)^### Finding F-(\d{3}):\s*(\S[^\n]*)\n(.*?)(?=^### Finding F-\d{3}:|\Z)")
 COMPLETION_CRITERION_RE = re.compile(r"(?ms)^### Criterion C-(\d{3}):\s*(\S[^\n]*)\n(.*?)(?=^### Criterion C-\d{3}:|\Z)")
-REMOTE_EVIDENCE_RE = re.compile(r"(?i)(https?://|oss://|cos://|aliyuncs\.com|myqcloud\.com|qcloudcos|cos\.)")
 ISSUE_WORKSPACE_REMOTE_RE = re.compile(
     r"(?i)(oss://|cos://|aliyuncs\.com|myqcloud\.com|qcloudcos|/xflow/issues/issue-[^\s)\"']+/attachments/)"
 )
@@ -300,27 +307,28 @@ def require_issue_workspace_file(repo_root: Path, issue: str, path: Path, label:
     return current_issue_dir, resolved
 
 
-def check_issue_local_evidence(current_issue_dir: Path, raw: str, label: str) -> list[Path]:
-    if REMOTE_EVIDENCE_RE.search(raw):
+def issue_local_evidence_snapshots(current_issue_dir: Path, raw: str, label: str) -> list[StableFileSnapshot]:
+    if contains_forbidden_remote_reference(raw):
         raise ValueError(f"{label} evidence must stay in the repository; do not use COS/OSS/http(s) links")
     entries = section_entries(raw)
     if not entries:
         raise ValueError(f"{label} evidence must reference at least one repository-local file")
-    evidence_paths = []
+    repo_root = current_issue_dir.parents[2]
+    snapshots = []
     for entry in entries:
         if not entry or entry.startswith("#"):
             continue
-        if re.search(r"(?i)^[a-z][a-z0-9+.-]*://", entry):
-            raise ValueError(f"{label} evidence links must be repository-local paths")
-        evidence_path = resolve_repo_path(current_issue_dir, Path(entry))
-        require_inside(evidence_path, current_issue_dir, f"{label} evidence links must stay inside the issue directory")
+        relative_path = safe_relative_reference(entry, f"{label} evidence link")
+        evidence_path = require_safe_repo_path(repo_root, current_issue_dir / relative_path, f"{label} evidence link")
         relative = evidence_path.relative_to(current_issue_dir)
         if not relative.parts or relative.parts[0] != "evidence":
             raise ValueError(f"{label} evidence links must stay under the issue evidence directory")
-        if not evidence_path.exists():
-            raise ValueError(f"{label} evidence file does not exist: {entry}")
-        evidence_paths.append(evidence_path)
-    return evidence_paths
+        snapshots.append(capture_stable_file(repo_root, evidence_path, current_issue_dir, f"{label} evidence file"))
+    return snapshots
+
+
+def check_issue_local_evidence(current_issue_dir: Path, raw: str, label: str) -> list[Path]:
+    return [snapshot.path for snapshot in issue_local_evidence_snapshots(current_issue_dir, raw, label)]
 
 
 def require_checklist_item(raw: str, label: str) -> None:
@@ -417,7 +425,7 @@ def check_subtask(repo_root: Path, issue: str, subtask_path: Path | None = None)
         raise ValueError(f"subtask Source file does not exist: {source}")
 
     evidence = sections["## Evidence"]
-    if REMOTE_EVIDENCE_RE.search(evidence):
+    if contains_forbidden_remote_reference(evidence):
         raise ValueError("subtask evidence must stay in the repository; do not use COS/OSS/http(s) links")
     evidence_entries = section_entries(evidence)
     if not evidence_entries:
@@ -469,15 +477,21 @@ def check_gap_analysis(repo_root: Path, issue: str, file_path: Path | None = Non
 
 
 def check_resolution_report(repo_root: Path, issue: str, file_path: Path | None = None) -> Path:
-    current_issue_dir, path = require_issue_workspace_file(
-        repo_root,
-        issue,
-        issue_file_path(repo_root, issue, file_path, "resolution-report.md"),
-        "resolution report",
-    )
-    text = read_text(path)
+    root = repo_root.resolve(strict=False)
+    current_issue_dir = require_safe_repo_path(root, issue_dir(root, issue), "resolution report Issue directory")
+    requested = file_path or current_issue_dir / "resolution-report.md"
+    path = require_safe_repo_path(root, requested if requested.is_absolute() else root / requested, "resolution report")
+    try:
+        path.relative_to(current_issue_dir)
+    except ValueError as exc:
+        raise ValueError("resolution report must stay under .xflow/issues/issue-<id>") from exc
+    report_snapshot = capture_stable_file(root, path, current_issue_dir, "resolution report")
+    try:
+        text = (report_snapshot.content or b"").decode("utf-8-sig", errors="strict")
+    except UnicodeError as exc:
+        raise ValueError(f"resolution report must be valid UTF-8: {path}") from exc
     sections = required_sections(text, RESOLUTION_REPORT_REQUIRED_SECTIONS, "resolution-report")
-    report_evidence = set(check_issue_local_evidence(current_issue_dir, sections["## Evidence Index"], "resolution-report"))
+    report_evidence = issue_local_evidence_snapshots(current_issue_dir, sections["## Evidence Index"], "resolution-report")
     validate_evidence_blocks(
         current_issue_dir,
         sections["## Completion Verification"],
@@ -495,11 +509,20 @@ def check_resolution_report(repo_root: Path, issue: str, file_path: Path | None 
     if not conclusion_match or conclusion_match.group(1).lower() not in RESOLUTION_CONCLUSIONS:
         raise ValueError("resolution-report Closure Conclusion must be resolved, reduced, or blocked with a reason")
     conclusion = conclusion_match.group(1).lower()
-    dependencies_path = current_issue_dir / "dependencies.yaml"
-    if dependencies_path.is_file():
+    report_criteria = tuple(match.group(1) for match in COMPLETION_CRITERION_RE.finditer(sections["## Completion Verification"]))
+    if len(report_criteria) != len(set(report_criteria)):
+        raise ValueError("resolution-report Criterion C-NNN bindings must be unique")
+    dependency_snapshot = capture_stable_file(
+        root,
+        current_issue_dir / "dependencies.yaml",
+        current_issue_dir,
+        "resolution-report dependencies",
+        required=False,
+    )
+    if dependency_snapshot.exists:
         from .dependencies import check_dependencies, check_dependency_closure
 
-        dependency_result = check_dependencies(repo_root, issue, dependencies_path)
+        dependency_result = check_dependencies(repo_root, issue, dependency_snapshot.path)
         closure_violations = check_dependency_closure(dependency_result, conclusion)
         if closure_violations:
             raise ValueError(
@@ -507,11 +530,17 @@ def check_resolution_report(repo_root: Path, issue: str, file_path: Path | None 
             )
     if conclusion in {"resolved", "reduced"} and has_unchecked_checklist_item(sections["## AI Self-Review Result"]):
         raise ValueError("resolved/reduced resolution-report must not contain unchecked AI self-review items")
-    matrix_path = current_issue_dir / "traceability-matrix.yaml"
-    if matrix_path.exists():
-        from .traceability import check_traceability_resolution
+    from .traceability import check_traceability_resolution
 
-        check_traceability_resolution(repo_root, issue, conclusion, report_evidence)
+    check_traceability_resolution(
+        root,
+        issue,
+        conclusion,
+        tuple(report_evidence),
+        report_criteria=report_criteria,
+        report_snapshot=report_snapshot,
+        support_snapshots=(dependency_snapshot,),
+    )
     return path
 
 
@@ -529,7 +558,7 @@ def check_issue_evidence(repo_root: Path, issue: str, publish_root: Path | None 
         if not file_path.is_file() or file_path.suffix.lower() not in ISSUE_WORKSPACE_TEXT_SUFFIXES:
             continue
         text = read_text(file_path)
-        if ISSUE_WORKSPACE_REMOTE_RE.search(text):
+        if ISSUE_WORKSPACE_REMOTE_RE.search(text) or contains_forbidden_object_storage_reference(text):
             raise ValueError(f"issue workspace must not contain COS/OSS/published attachment URLs: {file_path}")
         if PUBLISHED_URL_RE.search(text):
             raise ValueError(f"issue workspace must not contain publishedUrl values: {file_path}")

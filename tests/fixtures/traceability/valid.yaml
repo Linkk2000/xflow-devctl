@@ -15,7 +15,10 @@ entries:
         selector: test_operation_success
     evidence:
       before: [evidence/api/operation-before.json]
-      after: [evidence/api/operation-after.json]
+      after:
+        - evidence/api/operation-after.json
+        - evidence/screenshots/c-001-after.png
+        - evidence/dom/c-001-after.json
     conclusion: resolved
     ui:
       claimScope: product-integration

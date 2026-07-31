@@ -113,7 +113,7 @@ class _PosixApi:
         os.close(descriptor)
 
 
-def _posix_snapshot(path_stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
+def _posix_snapshot(path_stat: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
     return (
         int(path_stat.st_dev),
         int(path_stat.st_ino),
@@ -121,6 +121,7 @@ def _posix_snapshot(path_stat: os.stat_result) -> tuple[int, int, int, int, int,
         int(path_stat.st_size),
         int(path_stat.st_mtime_ns),
         int(path_stat.st_ctime_ns),
+        int(getattr(path_stat, "st_nlink", 1)),
     )
 
 
@@ -178,6 +179,8 @@ def _read_stable_bytes_posix(repo_root: Path, path: Path, api: Any | None = None
             raise ValueError(f"cannot open classification file safely: {path}: {exc}") from exc
         if not stat.S_ISREG(file_stat.st_mode):
             raise ValueError(f"classification file must be a regular file: {path}")
+        if int(getattr(file_stat, "st_nlink", 1)) != 1:
+            raise ValueError(f"classification file must have exactly one filesystem link: {path}")
         if file_stat.st_size > MAX_CLASSIFICATION_BYTES:
             raise ValueError(f"classification file exceeds {MAX_CLASSIFICATION_BYTES} bytes: {path}")
 
@@ -321,7 +324,10 @@ class _WindowsApi:
         information = self._information(handle)
         return (int(information.nFileSizeHigh) << 32) | int(information.nFileSizeLow)  # type: ignore[union-attr]
 
-    def snapshot(self, handle: int) -> tuple[int, int, int, int, int]:
+    def link_count(self, handle: int) -> int:
+        return int(self._information(handle).nNumberOfLinks)  # type: ignore[union-attr]
+
+    def snapshot(self, handle: int) -> tuple[int, int, int, int, int, int]:
         information = self._information(handle)
         basic = self._file_basic_information_type()
         if not self._get_information_ex(
@@ -339,6 +345,7 @@ class _WindowsApi:
             size,
             int(basic.LastWriteTime),
             int(basic.ChangeTime),
+            int(information.nNumberOfLinks),  # type: ignore[union-attr]
         )
 
     def final_path(self, handle: int) -> Path:
@@ -444,6 +451,8 @@ def _read_stable_bytes_windows(
         try:
             if not native.is_regular_file(descriptor):
                 raise ValueError(f"classification file must be a regular file: {path}")
+            if int(native.link_count(descriptor) if hasattr(native, "link_count") else 1) != 1:
+                raise ValueError(f"classification file must have exactly one filesystem link: {path}")
             initial_snapshot = native.snapshot(descriptor)
             if native.file_size(descriptor) > MAX_CLASSIFICATION_BYTES:
                 raise ValueError(f"classification file exceeds {MAX_CLASSIFICATION_BYTES} bytes: {path}")
@@ -634,8 +643,16 @@ def check_classification(
 ) -> ClassificationCheckResult:
     path = _classification_file(repo_root, issue, file_path)
     issue_directory = repo_root.resolve() / ".xflow" / "issues" / f"issue-{normalized_issue(issue)}"
+    raw = _load_yaml(_read_stable_text(repo_root.resolve(), path, issue_directory))
+    return validate_classification_document(path, issue, raw)
+
+
+def validate_classification_document(path: Path, issue: str, raw: object) -> ClassificationCheckResult:
+    expected_directory = f"issue-{normalized_issue(issue)}"
+    if path.parent.name != expected_directory:
+        raise ValueError(f"classification Issue mismatch: expected {normalized_issue(issue)}")
     document = _mapping(
-        _load_yaml(_read_stable_text(repo_root.resolve(), path, issue_directory)),
+        raw,
         "classification document",
         _ROOT_FIELDS,
     )

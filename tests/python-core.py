@@ -1251,7 +1251,7 @@ def test_dependency_parser(repo: Path) -> None:
         (base.replace("        - evidence/logs/c-004-integration-tests.txt", "        - https://example.test/evidence.txt"), "stay in the repository"),
         (base.replace("        - evidence/logs/c-004-integration-tests.txt", "        - oss://bucket/evidence.txt"), "stay in the repository"),
         (base.replace("        - evidence/logs/c-004-integration-tests.txt", "        - cos://bucket/evidence.txt"), "stay in the repository"),
-        (base.replace("        - evidence/logs/c-004-integration-tests.txt", "        - ../issue-IK17AW/resolution-report.md"), "inside the issue directory"),
+        (base.replace("        - evidence/logs/c-004-integration-tests.txt", "        - ../issue-IK17AW/resolution-report.md"), "must not contain '..'"),
     )
     for yaml_text, expected in cases:
         assert_dependency_error(invalid_root, "IK152D", yaml_text, expected)
@@ -1360,7 +1360,7 @@ dependencies:
         "evidence/logs/c-004-integration-tests.txt",
         "evidence/logs",
     )
-    assert_dependency_error(invalid_root, "IK152D", evidence_directory, "must be a file")
+    assert_dependency_error(invalid_root, "IK152D", evidence_directory, "must be a regular file")
 
     issue_root = invalid_root / ".xflow" / "issues" / "issue-IK152D"
     outside_evidence = invalid_root / "outside-evidence.txt"
@@ -1498,6 +1498,15 @@ def test_resolution_report_traceability_closure(repo: Path) -> None:
     write(repo / ".xflow" / "xflow.json", '{"contracts":{"root":"contracts"}}\n')
     (repo / "contracts").mkdir(parents=True, exist_ok=True)
     shutil.copyfile(fixture_root / "contracts" / "valid.yaml", repo / "contracts" / "contract.yaml")
+    contract_path = repo / "contracts" / "contract.yaml"
+    write(
+        contract_path,
+        contract_path.read_text(encoding="utf-8").replace(
+            "      - type: automated\n        target: contract-test",
+            "      - type: product-integration\n        target: http://127.0.0.1:5173/design/42",
+            1,
+        ),
+    )
     issue_root = repo / ".xflow" / "issues" / "issue-101"
     issue_root.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(fixture_root / "traceability" / "valid.yaml", issue_root / "traceability-matrix.yaml")
@@ -1508,14 +1517,143 @@ def test_resolution_report_traceability_closure(repo: Path) -> None:
         "evidence/api/operation-after.json",
         "evidence/api/rejection-before.json",
         "evidence/api/rejection-after.json",
-        "evidence/screenshots/c-001-after.png",
-        "evidence/dom/c-001-after.json",
     ):
         write(issue_root / relative, f"trace fixture: {relative}\n")
-    report = resolution_report_text("resolved").replace(
-        "- [resolution note](evidence/resolution-note.txt)",
-        "- [operation after](evidence/api/operation-after.json)\n- [rejection after](evidence/api/rejection-after.json)",
+    screenshot = issue_root / "evidence" / "screenshots" / "c-001-after.png"
+    screenshot.parent.mkdir(parents=True, exist_ok=True)
+    screenshot.write_bytes(b"\x89PNG\r\n\x1a\ntrace-image")
+    write(
+        issue_root / "evidence" / "dom" / "c-001-after.json",
+        json.dumps(
+            {
+                "surface": "product",
+                "targetUrl": "http://127.0.0.1:5173/design/42",
+                "pageTitle": "XFlow Studio",
+                "modelIdentity": "model-42",
+                "runtime": {"route": "/design/42", "modelLoaded": True},
+            },
+            ensure_ascii=True,
+        )
+        + "\n",
     )
+    state = TaskState(
+        issue="101",
+        execution_state="S5_LOCAL_VERIFICATION",
+        semantic_phase="classified",
+        classification="implementation-gap",
+        contract="example.contract.capability-name@0.1.0",
+        contract_file="contracts/contract.yaml",
+        contract_change_required=False,
+        branch="main",
+        base="main",
+        allowed_actions=("verify contract closure",),
+        forbidden_actions=("push",),
+        human_gate="human review required",
+        human_approval_ref="none",
+    )
+    write(issue_root / "task-state.md", render_task_state(state))
+    write(
+        issue_root / "classification.yaml",
+        """version: 0.1.0
+request:
+  originalStatement: Verify the accepted capability implementation.
+contractSearch:
+  status: found
+  refs: [contracts/contract.yaml]
+classification: implementation-gap
+contractChangeRequired: false
+reason: The implementation must close the existing contract.
+nextArtifact: gap-analysis.md
+decisionSource: ai-proposed
+""",
+    )
+    write(
+        issue_root / "issue-draft.md",
+        """<!-- xflow: issue-draft -->
+
+## Background
+Verify the capability contract.
+
+## Problem
+The implementation needs closure evidence.
+
+## Goal
+Close the declared verification scenarios.
+
+## Scope
+- Includes contract verification.
+
+## Acceptance Criteria
+- [ ] C-001: The successful operation is verified.
+- [ ] C-002: The rejected operation preserves state.
+
+## Verification Plan
+- Run the declared tests and collect local evidence.
+""",
+    )
+    evidence = """- [operation after](evidence/api/operation-after.json)
+- [UI screenshot](evidence/screenshots/c-001-after.png)
+- [UI state](evidence/dom/c-001-after.json)
+- [rejection after](evidence/api/rejection-after.json)"""
+    report = f"""# Resolution Report
+
+## Source Problem Or Gap
+- issue-draft.md
+
+## Actual Changes
+- Closed the capability verification chain.
+
+## Evidence Index
+{evidence}
+
+## Completion Verification
+
+### Criterion C-001: The successful operation is verified
+
+#### Verification Type
+ui
+
+#### Expected Result
+The product operation succeeds.
+
+#### Evidence
+{evidence}
+
+#### Actual Result
+The product result was observed.
+
+#### Human Review
+- [ ] Confirm criterion C-001.
+
+### Criterion C-002: The rejected operation preserves state
+
+#### Verification Type
+non-ui
+
+#### Expected Result
+The rejection preserves state.
+
+#### Evidence
+{evidence}
+
+#### Actual Result
+The preserved state was observed.
+
+#### Human Review
+- [ ] Confirm criterion C-002.
+
+## Closure Conclusion
+resolved: trace conclusions match this report.
+
+## AI Self-Review Result
+- [x] Trace and report evidence are consistent.
+
+## Remaining Risks
+- External capture authorship requires human review.
+
+## Human Review Request
+- Review the evidence identities and conclusions.
+"""
     write(issue_root / "resolution-report.md", report)
     check_resolution_report(repo, "101")
 
@@ -1527,7 +1665,7 @@ def test_resolution_report_traceability_closure(repo: Path) -> None:
         assert "every trace entry to be resolved" in str(exc), str(exc)
     else:
         raise AssertionError("resolved report should reject reduced trace entry")
-    write(issue_root / "resolution-report.md", report.replace("resolved: dependency impact is recorded.", "reduced: dependency impact is recorded."))
+    write(issue_root / "resolution-report.md", report.replace("resolved: trace conclusions match this report.", "reduced: trace conclusions match this report."))
     check_resolution_report(repo, "101")
 
 
@@ -2992,6 +3130,9 @@ resolved: the gap check now exists.
         run_devctl(repo, "check", "issue-evidence", "--issue", "2", expect=1)
 
         write(simple_issue / "walkthrough.md", "# Walkthrough\n\noss://bucket/xflow/issues/issue-2/attachments/att-001.png\n")
+        run_devctl(repo, "check", "issue-evidence", "--issue", "2", expect=1)
+
+        write(simple_issue / "walkthrough.md", "# Walkthrough\n\nbucket.r2.cloudflarestorage.com/evidence.json\n")
         run_devctl(repo, "check", "issue-evidence", "--issue", "2", expect=1)
 
         write(simple_issue / "attachments" / "manifest.json", '{"items":[{"publishedUrl":"https://img.example.test/xflow/issues/issue-2/attachments/att-001.png"}]}\n')

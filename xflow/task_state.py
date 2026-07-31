@@ -196,7 +196,16 @@ def _validate_relative_approval(value: str) -> None:
 def parse_task_state(path: Path, *, binding_mode: str = "current") -> TaskState:
     if not path.is_file():
         raise ValueError(f"missing task-state file: {path}")
-    text = read_text(path)
+    return parse_task_state_text(path, read_text(path), binding_mode=binding_mode)
+
+
+def parse_task_state_text(
+    path: Path,
+    text: str,
+    *,
+    binding_mode: str = "current",
+    validate_acceptance: bool = True,
+) -> TaskState:
     fields, allowed_actions, forbidden_actions = _parse_task_state_markdown(text)
     issue = _normalized_issue(_required(fields["Issue"], "Issue"))
     resolved = path.resolve()
@@ -243,7 +252,7 @@ def parse_task_state(path: Path, *, binding_mode: str = "current") -> TaskState:
         human_gate=human_gate,
         human_approval_ref=human_approval_ref,
     )
-    if needs_approval:
+    if needs_approval and validate_acceptance:
         from .contracts import validate_task_contract_acceptance
 
         validate_task_contract_acceptance(
