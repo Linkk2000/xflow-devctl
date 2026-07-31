@@ -228,7 +228,7 @@ def parse_task_state(path: Path) -> TaskState:
         _validate_relative_approval(human_approval_ref)
     elif human_approval_ref != "none":
         _validate_relative_approval(human_approval_ref)
-    return TaskState(
+    state = TaskState(
         issue=issue,
         execution_state=execution_state,
         semantic_phase=semantic_phase,
@@ -243,6 +243,17 @@ def parse_task_state(path: Path) -> TaskState:
         human_gate=human_gate,
         human_approval_ref=human_approval_ref,
     )
+    if needs_approval:
+        from .contracts import validate_task_contract_acceptance
+
+        validate_task_contract_acceptance(
+            resolved.parents[3],
+            state.issue,
+            state.contract,
+            state.contract_file,
+            state.human_approval_ref,
+        )
+    return state
 
 
 def render_task_state(state: TaskState) -> str:

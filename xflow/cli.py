@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import approval, attachment, providers, rules, unattended
+from .contracts import load_contract, validate_contract_acceptance
 from .checks import (
     check_current_task,
     check_gap_analysis,
@@ -147,6 +148,15 @@ def build_parser() -> argparse.ArgumentParser:
     task_sub.add_parser("status")
     task_sub.add_parser("list")
     task_sub.add_parser("migrate-current")
+
+    contract = sub.add_parser("contract")
+    contract_sub = contract.add_subparsers(dest="contract_command")
+    contract_lint = contract_sub.add_parser("lint")
+    contract_lint.add_argument("--file", required=True, type=Path)
+    contract_accept = contract_sub.add_parser("accept")
+    contract_accept.add_argument("--issue", required=True)
+    contract_accept.add_argument("--file", required=True, type=Path)
+    contract_accept.add_argument("--objects", required=True)
 
     unattended_parser = sub.add_parser("unattended")
     unattended_sub = unattended_parser.add_subparsers(dest="unattended_command")
@@ -401,6 +411,20 @@ def run_task(args: argparse.Namespace) -> int:
         print(f"[INFO] migrated current task: #{state.issue}")
         return 0
     raise ValueError(f"unknown task subcommand: {args.task_command}")
+
+
+def run_contract(args: argparse.Namespace) -> int:
+    ctx = context()
+    contract = load_contract(ctx.repo_root, args.file)
+    if args.contract_command == "lint":
+        print(f"[INFO] contract lint passed: {contract.path}")
+        return 0
+    if args.contract_command == "accept":
+        object_ids = tuple(item.strip() for item in args.objects.split(",") if item.strip())
+        record = validate_contract_acceptance(ctx.repo_root, args.issue, contract, object_ids)
+        print(f"[INFO] contract acceptance recorded: {record}")
+        return 0
+    raise ValueError(f"unknown contract subcommand: {args.contract_command}")
 
 
 def body_from_file(path: Path | None, inline: str | None, required_message: str) -> tuple[str, Path]:
@@ -1299,6 +1323,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_check(args)
         if args.command == "task":
             return run_task(args)
+        if args.command == "contract":
+            return run_contract(args)
         if args.command == "issue":
             return run_issue(args)
         if args.command == "git":

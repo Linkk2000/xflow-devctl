@@ -143,6 +143,8 @@ def main() -> None:
         write(accepted_path, malformed)
         assert_value_error("Human Approval Ref", lambda: list_task_states(worktree_a))
         write(accepted_path, render_task_state(accepted))
+        assert_value_error("missing matching human contract acceptance", lambda: list_task_states(worktree_a))
+        accepted_path.unlink()
 
         invalid_path = worktree_a / ".xflow" / "issues" / "issue-505" / "task-state.md"
         invalid_cases = (

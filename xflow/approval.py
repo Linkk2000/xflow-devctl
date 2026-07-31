@@ -33,7 +33,7 @@ APPROVAL_ACTIONS = UNATTENDED_ACTIONS | {
     "git-cleanup",
     "git-cleanup-force",
 }
-HISTORY_ACTIONS = UNATTENDED_ACTIONS | {"git-state-backfill"}
+HISTORY_ACTIONS = UNATTENDED_ACTIONS | {"contract-acceptance", "git-state-backfill"}
 REQUIRED_TEXT = (
     "# Local Review Approval",
     "Issue:",
@@ -53,6 +53,9 @@ HISTORY_COMMON_FIELDS = {
     "approvalIssue", "action", "approvedFile", "approvedSha256", "reviewerSummary", "result", "recordedAt",
 }
 HISTORY_EFFECT_FIELDS = HISTORY_COMMON_FIELDS | {"parentAction", "parentApprovalId"}
+HISTORY_CONTRACT_FIELDS = HISTORY_COMMON_FIELDS | {
+    "contractId", "contractVersion", "contractSha256", "acceptedObjects", "semanticDecision",
+}
 EFFECT_ACTION = "git-state-backfill"
 EFFECT_PARENT_ACTION = "git-mr"
 EFFECT_REVIEWER_SUMMARY = "subordinate-effect"
@@ -373,7 +376,14 @@ def _parse_history(repo_root: Path, path: Path) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise ValueError(f"approval history integrity error in {path}: expected a mapping")
     source = payload.get("source")
-    expected_fields = HISTORY_EFFECT_FIELDS if source == "effect" else HISTORY_COMMON_FIELDS
+    action = payload.get("action")
+    expected_fields = (
+        HISTORY_EFFECT_FIELDS
+        if source == "effect"
+        else HISTORY_CONTRACT_FIELDS
+        if action == "contract-acceptance"
+        else HISTORY_COMMON_FIELDS
+    )
     if set(payload) != expected_fields:
         raise ValueError(f"approval history integrity error in {path}: unexpected or missing fields")
     try:
@@ -414,6 +424,24 @@ def _parse_history(repo_root: Path, path: Path) -> dict[str, object]:
                 raise ValueError("invalid unattended reviewerSummary")
             if source == "local-review" and payload["reviewerSummary"] == EFFECT_REVIEWER_SUMMARY:
                 raise ValueError("reserved local-review reviewerSummary")
+            if payload["action"] == "contract-acceptance":
+                if source != "local-review":
+                    raise ValueError("contract acceptance must use local-review")
+                for name in ("contractId", "contractVersion", "semanticDecision"):
+                    if not isinstance(payload[name], str) or not payload[name]:
+                        raise ValueError(f"invalid {name}")
+                if not FINGERPRINT_RE.fullmatch(str(payload["contractSha256"])):
+                    raise ValueError("invalid contractSha256")
+                accepted_objects = payload["acceptedObjects"]
+                if (
+                    not isinstance(accepted_objects, list)
+                    or not accepted_objects
+                    or any(not isinstance(item, str) or not item for item in accepted_objects)
+                    or len(accepted_objects) != len(set(accepted_objects))
+                ):
+                    raise ValueError("invalid acceptedObjects")
+                if payload["semanticDecision"] != "accepted-design":
+                    raise ValueError("invalid semanticDecision")
         expected_path = _history_path(
             repo_root,
             str(payload["issue"]),
@@ -706,6 +734,8 @@ def record_consumed_approval(
 ) -> Path:
     if result != "success":
         raise ValueError("consumed approval records require confirmed success")
+    if grant.action == "contract-acceptance":
+        raise ValueError("contract-acceptance must use contract acceptance history")
     repo_root = repo_root.resolve()
     _validate_grant(grant)
     reject_consumed_approval(repo_root, grant.approval_id)
@@ -717,6 +747,53 @@ def record_consumed_approval(
     reject_credentials(content)
     _write_history_atomic(history_file, content)
     return history_file
+
+
+def record_contract_acceptance(
+    repo_root: Path,
+    grant: ApprovalGrant,
+    *,
+    contract_id: str,
+    contract_version: str,
+    contract_sha256: str,
+    accepted_objects: tuple[str, ...],
+) -> Path:
+    repo_root = repo_root.resolve()
+    _validate_grant(grant)
+    if grant.source != "local-review" or grant.action != "contract-acceptance":
+        raise ValueError("contract acceptance requires exact local-review contract-acceptance grant")
+    if not FINGERPRINT_RE.fullmatch(contract_sha256) or contract_sha256 != grant.approved_sha256:
+        raise ValueError("contract acceptance SHA256 must match the approved file")
+    if not isinstance(contract_id, str) or not contract_id or not isinstance(contract_version, str) or not contract_version:
+        raise ValueError("contract acceptance requires contract ID and version")
+    if not accepted_objects or len(accepted_objects) != len(set(accepted_objects)):
+        raise ValueError("contract acceptance requires unique accepted objects")
+    if any(not isinstance(item, str) or not item for item in accepted_objects):
+        raise ValueError("contract acceptance requires valid accepted objects")
+    reject_consumed_approval(repo_root, grant.approval_id)
+    recorded_at = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    history_file = _history_path(repo_root, grant.approval_issue, grant.action, recorded_at)
+    payload = _record_payload(grant, grant.approval_issue, recorded_at)
+    payload.update(
+        {
+            "contractId": contract_id,
+            "contractVersion": contract_version,
+            "contractSha256": contract_sha256,
+            "acceptedObjects": list(accepted_objects),
+            "semanticDecision": "accepted-design",
+        }
+    )
+    content = yaml.safe_dump(payload, sort_keys=False, allow_unicode=False)
+    reject_credentials(content)
+    _write_history_atomic(history_file, content)
+    return history_file
+
+
+def parse_contract_acceptance_history(repo_root: Path, path: Path) -> dict[str, object]:
+    record = _parse_history(repo_root.resolve(), path)
+    if record.get("action") != "contract-acceptance" or record.get("source") != "local-review":
+        raise ValueError("record is not a local contract acceptance")
+    return record
 
 
 def record_subordinate_effect(

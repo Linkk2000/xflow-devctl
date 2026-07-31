@@ -147,8 +147,8 @@ def assert_no_legacy_run_command() -> None:
     assert 'run_script "$OPS/git/status.sh"' not in entrypoint
     assert "|app)" not in entrypoint
     assert not (OPS_ROOT / "run.sh").exists()
-    assert "preflight|approval|attachment|rules|migrate|unattended|task" in entrypoint
-    assert "preflight|approval|attachment|rules|migrate|unattended|task)" in entrypoint
+    assert "preflight|approval|attachment|rules|migrate|unattended|task|contract" in entrypoint
+    assert "preflight|approval|attachment|rules|migrate|unattended|task|contract)" in entrypoint
 
 
 def assert_powershell_help_alias() -> None:
@@ -269,6 +269,28 @@ def assert_task_commands_are_discoverable() -> None:
             assert name in result.stdout, (command, name, result.stdout)
 
 
+def assert_contract_commands_are_discoverable() -> None:
+    env = test_env()
+    commands = (
+        [sys.executable, "-m", "xflow", "contract", "--help"],
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(OPS_ROOT / "devctl.ps1"),
+            "contract",
+            "--help",
+        ],
+    )
+    for command in commands:
+        result = subprocess.run(command, cwd=OPS_ROOT, env=env, text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert result.returncode == 0, result.stderr
+        for name in ("lint", "accept"):
+            assert name in result.stdout, (command, name, result.stdout)
+
+
 def assert_issue_workspace_migration_is_discoverable() -> None:
     env = test_env()
     commands = (
@@ -351,6 +373,7 @@ def main() -> None:
     assert_check_commands_are_discoverable()
     assert_unattended_commands_are_discoverable()
     assert_task_commands_are_discoverable()
+    assert_contract_commands_are_discoverable()
     assert_issue_workspace_migration_is_discoverable()
 
     with tempfile.TemporaryDirectory() as raw:
