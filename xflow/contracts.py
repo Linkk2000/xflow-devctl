@@ -11,6 +11,7 @@ from typing import Literal, Mapping, Sequence
 
 from . import approval
 from .classification import _decode_classification_bytes, _load_yaml, _read_stable_bytes
+from .local_artifacts import MAX_TEXT_ARTIFACT_BYTES
 from .project_config import load_project_config, require_safe_repo_path
 
 
@@ -206,7 +207,7 @@ def _contract_path(repo_root: Path, file_path: Path) -> tuple[Path, Path]:
 
 def _stable_contract_bytes(repo_root: Path, contract_root: Path, path: Path) -> bytes:
     try:
-        return _read_stable_bytes(repo_root, path, contract_root)
+        return _read_stable_bytes(repo_root, path, contract_root, max_bytes=MAX_TEXT_ARTIFACT_BYTES)
     except ValueError as exc:
         raise ValueError(str(exc).replace("classification", "contract")) from exc
 

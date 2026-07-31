@@ -11,16 +11,22 @@ from .classification import _read_stable_bytes
 from .project_config import _is_reparse_point, require_safe_repo_path
 
 
+MAX_SMALL_ARTIFACT_BYTES = 262_144
+MAX_TEXT_ARTIFACT_BYTES = 4 * 1024 * 1024
+MAX_STRUCTURED_EVIDENCE_BYTES = 16 * 1024 * 1024
+MAX_IMAGE_EVIDENCE_BYTES = 64 * 1024 * 1024
+
+
 URI_REFERENCE_RE = re.compile(r"(?i)(?:^|[\\/\s(\[{'\"`])(?:[a-z][a-z0-9+.-]*):(?=\S)")
 OBJECT_STORAGE_DOMAIN_RE = re.compile(
     r"(?i)(?:"
     r"aliyuncs\.com|"
     r"(?:cos\.[a-z0-9-]+\.)?myqcloud\.com|qcloudcos|"
     r"(?:^|[./])s3(?:[.-][a-z0-9-]+)*\.amazonaws\.com|amazonaws\.com|cloudfront\.net|"
-    r"(?:blob|dfs|file)\.core\.windows\.net|"
+    r"(?:blob|dfs|file)\.core\.(?:windows\.net|usgovcloudapi\.net|chinacloudapi\.cn)|"
     r"storage\.googleapis\.com|storage\.cloud\.google\.com|"
     r"(?:^|[./])obs(?:[.-][a-z0-9-]+)*\.myhuaweicloud\.com|myhuaweicloud\.com|"
-    r"r2\.cloudflarestorage\.com|"
+    r"r2\.cloudflarestorage\.com|(?:^|[./])[a-z0-9-]+\.r2\.dev|"
     r"objectstorage(?:\.[a-z0-9-]+)*\.oraclecloud\.com|"
     r"cloud-object-storage\.appdomain\.cloud|"
     r"digitaloceanspaces\.com|wasabisys\.com|backblazeb2\.com"
@@ -31,6 +37,7 @@ OBJECT_STORAGE_SCHEME_RE = re.compile(r"(?i)(?:^|[\\/\s(\[{'\"`])(?:oss|cos|s3|g
 
 @dataclass(frozen=True)
 class StableFileSnapshot:
+    read_root: Path
     path: Path
     allowed_root: Path
     exists: bool
@@ -89,6 +96,7 @@ def capture_stable_file(
     label: str,
     *,
     required: bool = True,
+    max_bytes: int = MAX_SMALL_ARTIFACT_BYTES,
 ) -> StableFileSnapshot:
     root = repo_root.resolve(strict=False)
     allowed = require_safe_repo_path(root, allowed_root, f"{label} owner")
@@ -102,7 +110,7 @@ def capture_stable_file(
     except FileNotFoundError as exc:
         if required:
             raise ValueError(f"missing {label}: {target}") from exc
-        return StableFileSnapshot(target, allowed, False, None, None, None, None, None, None, None)
+        return StableFileSnapshot(root, target, allowed, False, None, None, None, None, None, None, None)
     except OSError as exc:
         raise ValueError(f"cannot inspect {label}: {target}: {exc}") from exc
     if _is_reparse_point(before):
@@ -112,7 +120,7 @@ def capture_stable_file(
     if int(before.st_nlink) != 1:
         raise ValueError(f"{label} must have exactly one filesystem link: {target}")
     try:
-        content = _read_stable_bytes(root, target, allowed)
+        content = _read_stable_bytes(root, target, allowed, max_bytes=max_bytes)
     except ValueError as exc:
         raise ValueError(str(exc).replace("classification file", label).replace("classification", label)) from exc
     try:
@@ -124,6 +132,7 @@ def capture_stable_file(
     if _is_reparse_point(after) or not stat.S_ISREG(after.st_mode) or int(after.st_nlink) != 1:
         raise ValueError(f"{label} identity changed while reading: {target}")
     return StableFileSnapshot(
+        root,
         target,
         allowed,
         True,
@@ -144,11 +153,12 @@ def revalidate_snapshots(repo_root: Path, snapshots: tuple[StableFileSnapshot, .
             continue
         seen.add(expected.path)
         actual = capture_stable_file(
-            repo_root,
+            expected.read_root,
             expected.path,
             expected.allowed_root,
             label,
             required=expected.exists,
+            max_bytes=max(expected.size or 0, MAX_SMALL_ARTIFACT_BYTES),
         )
         if actual != expected:
             raise ValueError(f"{label} changed during closure validation: {expected.path}")

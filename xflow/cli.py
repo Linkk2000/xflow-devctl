@@ -25,6 +25,7 @@ from .checks import (
 from .commit_message import check_commit_message
 from .bindings import resolve_bindings
 from .classification import check_classification
+from .collaboration import repository_lock
 from .env import RuntimeContext, load_env_files, python_version, token_status_lines
 from .dependencies import check_dependencies
 from .migration import apply_issue_workspace_migration, inspect, inspect_issue_workspace_migration, write_wrappers
@@ -1357,32 +1358,33 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        if args.command == "preflight":
-            return run_preflight()
-        if args.command == "check":
-            return run_check(args)
-        if args.command == "task":
-            return run_task(args)
-        if args.command == "contract":
-            return run_contract(args)
-        if args.command == "trace":
-            return run_trace(args)
-        if args.command == "issue":
-            return run_issue(args)
-        if args.command == "git":
-            return run_git(args)
-        if args.command == "approval":
-            return run_approval(args)
-        if args.command == "unattended":
-            return run_unattended(args)
-        if args.command == "attachment":
-            return run_attachment(args)
-        if args.command == "rules":
-            return run_rules(args)
-        if args.command == "migrate":
-            return run_migrate(args)
-        parser.print_help()
-        return 0
+        with repository_lock(context().repo_root):
+            if args.command == "preflight":
+                return run_preflight()
+            if args.command == "check":
+                return run_check(args)
+            if args.command == "task":
+                return run_task(args)
+            if args.command == "contract":
+                return run_contract(args)
+            if args.command == "trace":
+                return run_trace(args)
+            if args.command == "issue":
+                return run_issue(args)
+            if args.command == "git":
+                return run_git(args)
+            if args.command == "approval":
+                return run_approval(args)
+            if args.command == "unattended":
+                return run_unattended(args)
+            if args.command == "attachment":
+                return run_attachment(args)
+            if args.command == "rules":
+                return run_rules(args)
+            if args.command == "migrate":
+                return run_migrate(args)
+            parser.print_help()
+            return 0
     except ValueError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1

@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import yaml
+from PIL import Image
 
 
 OPS_ROOT = Path(__file__).resolve().parents[1]
@@ -1420,7 +1421,8 @@ The dependency closure matrix returned the expected result.
 - [ ] Confirm this evidence supports the reported closure.
 
 ## Closure Conclusion
-{conclusion}: dependency impact is recorded.
+Conclusion: {conclusion}
+Reason: Dependency impact is recorded.
 
 ## AI Self-Review Result
 - [x] Dependency state and closure assessment are consistent.
@@ -1455,6 +1457,10 @@ def assert_resolution_closure_error(repo: Path, dependencies: str, expected_issu
 
 def test_resolution_report_dependency_closure(repo: Path) -> None:
     issue_root = repo / ".xflow" / "issues" / "issue-IK152D"
+    write(
+        repo / ".xflow" / "current-task.md",
+        "# XFlow Current Task\n\nIssue: IK152D\nState: S5_LOCAL_VERIFICATION\n",
+    )
     write(issue_root / "evidence" / "resolution-note.txt", "resolution evidence\n")
     write(issue_root / "evidence" / "logs" / "c-004-integration-tests.txt", "integration evidence\n")
     report = issue_root / "resolution-report.md"
@@ -1521,7 +1527,7 @@ def test_resolution_report_traceability_closure(repo: Path) -> None:
         write(issue_root / relative, f"trace fixture: {relative}\n")
     screenshot = issue_root / "evidence" / "screenshots" / "c-001-after.png"
     screenshot.parent.mkdir(parents=True, exist_ok=True)
-    screenshot.write_bytes(b"\x89PNG\r\n\x1a\ntrace-image")
+    Image.new("RGB", (4, 4), (18, 92, 140)).save(screenshot, format="PNG")
     write(
         issue_root / "evidence" / "dom" / "c-001-after.json",
         json.dumps(
@@ -1540,11 +1546,11 @@ def test_resolution_report_traceability_closure(repo: Path) -> None:
         issue="101",
         execution_state="S5_LOCAL_VERIFICATION",
         semantic_phase="classified",
-        classification="implementation-gap",
+        classification="ui-defect",
         contract="example.contract.capability-name@0.1.0",
         contract_file="contracts/contract.yaml",
         contract_change_required=False,
-        branch="main",
+        branch=resolve_bindings(repo).branch,
         base="main",
         allowed_actions=("verify contract closure",),
         forbidden_actions=("push",),
@@ -1560,10 +1566,10 @@ request:
 contractSearch:
   status: found
   refs: [contracts/contract.yaml]
-classification: implementation-gap
+classification: ui-defect
 contractChangeRequired: false
 reason: The implementation must close the existing contract.
-nextArtifact: gap-analysis.md
+nextArtifact: issue-draft.md
 decisionSource: ai-proposed
 """,
     )
@@ -1611,7 +1617,7 @@ Close the declared verification scenarios.
 ### Criterion C-001: The successful operation is verified
 
 #### Verification Type
-ui
+product-integration
 
 #### Expected Result
 The product operation succeeds.
@@ -1628,7 +1634,7 @@ The product result was observed.
 ### Criterion C-002: The rejected operation preserves state
 
 #### Verification Type
-non-ui
+automated
 
 #### Expected Result
 The rejection preserves state.
@@ -1643,7 +1649,8 @@ The preserved state was observed.
 - [ ] Confirm criterion C-002.
 
 ## Closure Conclusion
-resolved: trace conclusions match this report.
+Conclusion: resolved
+Reason: Trace conclusions match this report.
 
 ## AI Self-Review Result
 - [x] Trace and report evidence are consistent.
@@ -1654,6 +1661,18 @@ resolved: trace conclusions match this report.
 ## Human Review Request
 - Review the evidence identities and conclusions.
 """
+    before_time = screenshot.stat().st_mtime_ns - 1_000_000_000
+    for relative in ("evidence/api/operation-before.json", "evidence/api/rejection-before.json"):
+        os.utime(issue_root / relative, ns=(before_time, before_time))
+    after_time = screenshot.stat().st_mtime_ns
+    for relative in (
+        "evidence/api/operation-after.json",
+        "evidence/api/rejection-after.json",
+        "evidence/screenshots/c-001-after.png",
+        "evidence/dom/c-001-after.json",
+    ):
+        os.utime(issue_root / relative, ns=(after_time, after_time))
+    activate_task(repo, "101")
     write(issue_root / "resolution-report.md", report)
     check_resolution_report(repo, "101")
 
@@ -1665,8 +1684,9 @@ resolved: trace conclusions match this report.
         assert "every trace entry to be resolved" in str(exc), str(exc)
     else:
         raise AssertionError("resolved report should reject reduced trace entry")
-    write(issue_root / "resolution-report.md", report.replace("resolved: trace conclusions match this report.", "reduced: trace conclusions match this report."))
+    write(issue_root / "resolution-report.md", report.replace("Conclusion: resolved", "Conclusion: reduced"))
     check_resolution_report(repo, "101")
+    active_task_pointer_file(repo, resolve_bindings(repo).worktree).unlink()
 
 
 def assert_commit_message_error(message: str, expected: str, branch_issue: str | None = None) -> None:
@@ -3057,7 +3077,8 @@ The focused verification command returned the expected rejection.
 - [ ] Confirm this evidence supports the reported closure.
 
 ## Closure Conclusion
-resolved: the gap check now exists.
+Conclusion: resolved
+Reason: The gap check now exists.
 
 ## AI Self-Review Result
 - [x] Gap analysis is checked.
@@ -3099,11 +3120,11 @@ resolved: the gap check now exists.
         run_devctl(repo, "check", "resolution-report", "--issue", "1", "--file", str(ui_resolution_without_dom), expect=1)
 
         reduced_resolution = resolution.with_name("resolution-report-reduced.md")
-        write(reduced_resolution, resolution.read_text(encoding="utf-8").replace("resolved: the gap check now exists.", "reduced: the main gap is smaller but follow-up remains."))
+        write(reduced_resolution, resolution.read_text(encoding="utf-8").replace("Conclusion: resolved\nReason: The gap check now exists.", "Conclusion: reduced\nReason: The main gap is smaller but follow-up remains."))
         run_devctl(repo, "check", "resolution-report", "--issue", "1", "--file", str(reduced_resolution))
 
         blocked_resolution = resolution.with_name("resolution-report-blocked.md")
-        write(blocked_resolution, resolution.read_text(encoding="utf-8").replace("resolved: the gap check now exists.", "blocked: human must choose the rollout path.").replace("- [x] Resolution report is checked.", "- [ ] Waiting for human rollout choice."))
+        write(blocked_resolution, resolution.read_text(encoding="utf-8").replace("Conclusion: resolved\nReason: The gap check now exists.", "Conclusion: blocked\nReason: Human must choose the rollout path.").replace("- [x] Resolution report is checked.", "- [ ] Waiting for human rollout choice."))
         run_devctl(repo, "check", "resolution-report", "--issue", "1", "--file", str(blocked_resolution))
 
         unchecked_resolution = resolution.with_name("resolution-report-unchecked.md")
@@ -3111,7 +3132,7 @@ resolved: the gap check now exists.
         run_devctl(repo, "check", "resolution-report", "--issue", "1", "--file", str(unchecked_resolution), expect=1)
 
         bad_conclusion = resolution.with_name("resolution-report-bad-conclusion.md")
-        write(bad_conclusion, resolution.read_text(encoding="utf-8").replace("resolved: the gap check now exists.", "done: looks good."))
+        write(bad_conclusion, resolution.read_text(encoding="utf-8").replace("Conclusion: resolved\nReason: The gap check now exists.", "Conclusion: done\nReason: Looks good."))
         run_devctl(repo, "check", "resolution-report", "--issue", "1", "--file", str(bad_conclusion), expect=1)
 
         remote_resolution_evidence = resolution.with_name("resolution-report-remote-evidence.md")

@@ -1,19 +1,26 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
+import warnings
+from io import BytesIO
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlparse
 
+from PIL import Image, UnidentifiedImageError
+
 from . import approval
+from .bindings import git_path, resolve_bindings
 from .classification import (
     _decode_classification_bytes,
     _load_yaml,
     validate_classification_document,
 )
+from .collaboration import repository_locked
 from .contracts import (
     ContractDocument,
     _build_document,
@@ -23,15 +30,19 @@ from .contracts import (
     _validate_contract_schema,
 )
 from .local_artifacts import (
+    MAX_IMAGE_EVIDENCE_BYTES,
+    MAX_SMALL_ARTIFACT_BYTES,
+    MAX_STRUCTURED_EVIDENCE_BYTES,
+    MAX_TEXT_ARTIFACT_BYTES,
     StableFileSnapshot,
     capture_stable_file,
     contains_forbidden_remote_reference,
     revalidate_snapshots,
     safe_relative_reference,
 )
-from .paths import normalized_issue
+from .paths import active_task_pointer_file, normalized_issue
 from .project_config import require_safe_repo_path
-from .task_state import TaskState, parse_task_state_text
+from .task_state import TaskState, _pointer, parse_task_state_text
 
 
 SUPPORTED_VERSION = "0.1.0"
@@ -42,12 +53,9 @@ UI_SURFACES = {"product", "component-harness"}
 PLACEHOLDERS = {"-", "n/a", "na", "none", "placeholder", "tbd", "todo", "unknown", "待定", "待补充", "占位"}
 CRITERION_RE = re.compile(r"^criterion-(\d{3})$")
 SOURCE_CRITERION_RE = re.compile(
-    r"(?im)^\s*(?:[-*]\s+(?:\[[ xX]\]\s+)?|\d+[.)]\s+)(?:criterion\s+)?C-(\d{3})\s*[:：-]\s*\S"
+    r"(?im)^\s*(?:[-*]\s+(?:\[[ xX]\]\s+)?)(?:criterion\s+)?C-(\d{3})\s*[:：-]\s*(\S.*)$"
 )
-IMAGE_SIGNATURES = (
-    ("PNG", b"\x89PNG\r\n\x1a\n"),
-    ("JPEG", b"\xff\xd8\xff"),
-)
+ORDERED_CRITERION_RE = re.compile(r"(?m)^\s*(\d{1,3})[.)]\s+(\S.*)$")
 
 
 @dataclass(frozen=True)
@@ -68,6 +76,13 @@ class TraceabilityResult:
     issue_directory: Path
     entries: tuple[TraceEntry, ...]
     _snapshots: tuple[tuple[StableFileSnapshot, str], ...] = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class CriterionIdentity:
+    number: str
+    title: str
+    summary_sha256: str
 
 
 @dataclass(frozen=True)
@@ -146,8 +161,17 @@ def _parse_yaml_snapshot(snapshot: StableFileSnapshot, label: str) -> object:
         raise ValueError(str(exc).replace("classification", label)) from exc
 
 
-def _load_matrix_snapshot(root: Path, issue_directory: Path, path: Path) -> tuple[StableFileSnapshot, dict[str, object]]:
-    snapshot = capture_stable_file(root, path, issue_directory, "required traceability matrix")
+def _load_matrix_snapshot(
+    root: Path,
+    issue_directory: Path,
+    path: Path,
+    snapshot: StableFileSnapshot | None = None,
+) -> tuple[StableFileSnapshot, dict[str, object]]:
+    snapshot = snapshot or capture_stable_file(
+        root, path, issue_directory, "required traceability matrix", max_bytes=MAX_SMALL_ARTIFACT_BYTES
+    )
+    if not snapshot.exists:
+        raise ValueError(f"missing required traceability matrix: {path}")
     document = _mapping(
         _parse_yaml_snapshot(snapshot, "traceability"),
         "traceability matrix",
@@ -173,15 +197,29 @@ def _decode_utf8(snapshot: StableFileSnapshot, label: str) -> str:
 
 def _load_contract_snapshot(root: Path, file_path: str) -> tuple[StableFileSnapshot, ContractDocument]:
     contract_root, path = _contract_path(root, Path(file_path))
-    snapshot = capture_stable_file(root, path, contract_root, "contract file")
+    snapshot = capture_stable_file(root, path, contract_root, "contract file", max_bytes=MAX_TEXT_ARTIFACT_BYTES)
     assert snapshot.content is not None
     raw = _parse_contract_yaml(_decode_utf8(snapshot, "contract file"))
     _validate_contract_schema(raw)
     return snapshot, _build_document(path, raw, snapshot.content)
 
 
-def _optional_snapshot(root: Path, issue_directory: Path, name: str, label: str) -> StableFileSnapshot:
-    return capture_stable_file(root, issue_directory / name, issue_directory, label, required=False)
+def _optional_snapshot(
+    root: Path,
+    issue_directory: Path,
+    name: str,
+    label: str,
+    *,
+    max_bytes: int = MAX_SMALL_ARTIFACT_BYTES,
+) -> StableFileSnapshot:
+    return capture_stable_file(
+        root,
+        issue_directory / name,
+        issue_directory,
+        label,
+        required=False,
+        max_bytes=max_bytes,
+    )
 
 
 def _load_context(
@@ -194,9 +232,73 @@ def _load_context(
 ) -> _ClosureContext:
     root, issue_directory, matrix_path = _issue_paths(repo_root, issue, matrix)
     tracked: list[tuple[StableFileSnapshot, str]] = []
+    bindings = resolve_bindings(root)
+    common_dir = git_path(root, "--git-common-dir")
+    pointer_path = active_task_pointer_file(root, bindings.worktree)
+    pointer_snapshot = capture_stable_file(
+        common_dir,
+        pointer_path,
+        common_dir,
+        "active task pointer",
+        required=False,
+        max_bytes=MAX_SMALL_ARTIFACT_BYTES,
+    )
     task_snapshot = _optional_snapshot(root, issue_directory, "task-state.md", "task-state")
     classification_snapshot = _optional_snapshot(root, issue_directory, "classification.yaml", "classification")
-    tracked.extend(((task_snapshot, "task-state"), (classification_snapshot, "classification")))
+    matrix_snapshot = capture_stable_file(
+        root,
+        matrix_path,
+        issue_directory,
+        "required traceability matrix",
+        required=False,
+        max_bytes=MAX_SMALL_ARTIFACT_BYTES,
+    )
+    tracked.extend(
+        (
+            (pointer_snapshot, "active task pointer"),
+            (task_snapshot, "task-state"),
+            (classification_snapshot, "classification"),
+            (matrix_snapshot, "traceability matrix"),
+        )
+    )
+
+    local_contract_signal = task_snapshot.exists or classification_snapshot.exists or matrix_snapshot.exists
+    if not pointer_snapshot.exists:
+        if local_contract_signal or require_task_state:
+            raise ValueError("contract closure requires the git common-dir active task pointer")
+        legacy_snapshot = capture_stable_file(
+            root,
+            root / ".xflow" / "current-task.md",
+            root,
+            "legacy current task",
+            max_bytes=MAX_SMALL_ARTIFACT_BYTES,
+        )
+        tracked.append((legacy_snapshot, "legacy current task"))
+        legacy_text = _decode_utf8(legacy_snapshot, "legacy current task")
+        issue_match = re.search(r"(?im)^\s*Issue\s*:\s*(\S+)\s*$", legacy_text)
+        state_match = re.search(r"(?im)^\s*State\s*:\s*(\S+)\s*$", legacy_text)
+        if not issue_match or not state_match:
+            raise ValueError("legacy current-task.md must contain anchored Issue and State fields")
+        legacy_issue = normalized_issue(issue_match.group(1))
+        if legacy_issue != normalized_issue(issue):
+            raise ValueError(
+                f"legacy current task Issue mismatch: expected {normalized_issue(issue)}, found {legacy_issue}"
+            )
+        return _ClosureContext(root, issue_directory, False, None, None, None, None, tuple(tracked))
+    try:
+        pointer_payload = json.loads(_decode_utf8(pointer_snapshot, "active task pointer"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid active task pointer JSON") from exc
+    pointer = _pointer(pointer_payload)
+    if pointer.repository != bindings.repository:
+        raise ValueError("active task repository mismatch")
+    if pointer.worktree != bindings.worktree:
+        raise ValueError("active task worktree mismatch")
+    if pointer.branch != bindings.branch:
+        raise ValueError(f"active task branch mismatch: expected {bindings.branch}, found {pointer.branch}")
+    expected_issue = normalized_issue(issue)
+    if pointer.issue != expected_issue:
+        raise ValueError(f"active task Issue mismatch: expected {expected_issue}, found {pointer.issue}")
 
     state: TaskState | None = None
     if task_snapshot.exists:
@@ -208,33 +310,32 @@ def _load_context(
         )
         if state.issue != normalized_issue(issue):
             raise ValueError(f"task-state Issue mismatch: expected {normalized_issue(issue)}, found {state.issue}")
-    elif require_task_state:
-        raise ValueError("contract trace requires the current Issue task-state.md")
+    else:
+        raise ValueError("active contract closure requires matching task-state.md")
 
-    classification = None
-    refs: tuple[str, ...] = ()
-    if classification_snapshot.exists:
-        classification = validate_classification_document(
-            classification_snapshot.path,
-            issue,
-            _parse_yaml_snapshot(classification_snapshot, "classification"),
-        )
-        contract_search = classification.raw["contractSearch"]
-        assert isinstance(contract_search, dict)
-        raw_refs = contract_search["refs"]
-        assert isinstance(raw_refs, list)
-        refs = tuple(str(item) for item in raw_refs)
-
-    required = state is not None or bool(refs)
+    modern_contract = state.contract != "legacy.current-task@0.1.0"
+    required = matrix_snapshot.exists or modern_contract or classification_snapshot.exists
     if not required:
-        return _ClosureContext(root, issue_directory, False, None, None, None, None, tuple(tracked))
-    if state is None:
-        raise ValueError("contract-bearing Issue requires current task-state.md")
-    if classification is not None:
-        if classification.classification != state.classification:
-            raise ValueError("classification does not match task-state Classification")
-        if refs and state.contract_file not in refs:
-            raise ValueError("classification contractSearch.refs must contain the task-state Contract File")
+        return _ClosureContext(root, issue_directory, False, state, None, None, None, tuple(tracked))
+    if not classification_snapshot.exists:
+        raise ValueError("contract-bearing Issue requires classification.yaml")
+    if not matrix_snapshot.exists:
+        raise ValueError(f"missing required traceability matrix: {matrix_path}")
+
+    classification = validate_classification_document(
+        classification_snapshot.path,
+        issue,
+        _parse_yaml_snapshot(classification_snapshot, "classification"),
+    )
+    contract_search = classification.raw["contractSearch"]
+    assert isinstance(contract_search, dict)
+    raw_refs = contract_search["refs"]
+    assert isinstance(raw_refs, list)
+    refs = tuple(str(item) for item in raw_refs)
+    if classification.classification != state.classification:
+        raise ValueError("classification does not match task-state Classification")
+    if state.contract_file not in refs:
+        raise ValueError("classification contractSearch.refs must contain the task-state Contract File")
 
     contract_snapshot, contract = _load_contract_snapshot(root, state.contract_file)
     tracked.append((contract_snapshot, "contract file"))
@@ -251,13 +352,24 @@ def _load_context(
             issue_directory / state.human_approval_ref,
             issue_directory,
             "accepted contract reference",
+            max_bytes=MAX_TEXT_ARTIFACT_BYTES,
         )
         tracked.append((approval_snapshot, "accepted contract reference"))
         try:
-            record = approval.validate_contract_acceptance_history(root, approval_snapshot.path)
+            validated = approval.validate_contract_acceptance_history(
+                root,
+                approval_snapshot.path,
+                history_snapshot=approval_snapshot,
+                return_snapshots=True,
+            )
         except ValueError as exc:
             raise ValueError(f"missing matching human contract acceptance: {exc}") from exc
+        assert isinstance(validated, tuple)
+        record, acceptance_snapshots = validated
+        tracked.extend((snapshot, "contract acceptance supporting artifact") for snapshot in acceptance_snapshots)
         expected_record = {
+            "repository": bindings.repository,
+            "worktree": bindings.worktree,
             "issue": state.issue,
             "approvalIssue": state.issue,
             "branch": state.branch,
@@ -278,10 +390,13 @@ def _load_context(
             or tuple(accepted) != approval.normalize_accepted_objects(accepted)
             or any(identifier not in contract.objects_by_id for identifier in accepted)
         ):
-            raise ValueError("accepted contract reference does not match the current task-state contract bytes/path")
+            raise ValueError(
+                "accepted contract reference does not match the current repository/worktree/branch/Issue and contract bytes/path"
+            )
 
-    matrix_snapshot, matrix_document = _load_matrix_snapshot(root, issue_directory, matrix_path)
-    tracked.append((matrix_snapshot, "traceability matrix"))
+    matrix_snapshot, matrix_document = _load_matrix_snapshot(
+        root, issue_directory, matrix_path, matrix_snapshot
+    )
     matrix_contract = _mapping(matrix_document["contract"], "matrix contract", {"id", "version", "file"})
     matrix_id = _identifier(matrix_contract["id"], "matrix contract.id")
     matrix_version = _meaningful(matrix_contract["version"], "matrix contract.version")
@@ -310,13 +425,14 @@ def _issue_file_snapshot(
     label: str,
     *,
     evidence: bool = False,
+    max_bytes: int = MAX_TEXT_ARTIFACT_BYTES,
 ) -> StableFileSnapshot:
     relative = safe_relative_reference(value, label)
     target = require_safe_repo_path(root, issue_directory / relative, label)
     relative_target = target.relative_to(issue_directory)
     if evidence and (not relative_target.parts or relative_target.parts[0] != "evidence"):
         raise ValueError(f"{label} must stay under the issue evidence directory")
-    snapshot = capture_stable_file(root, target, issue_directory, label)
+    snapshot = capture_stable_file(root, target, issue_directory, label, max_bytes=max_bytes)
     if not snapshot.content:
         raise ValueError(f"{label} must be non-empty: {relative.as_posix()}")
     return snapshot
@@ -345,10 +461,18 @@ def _verification_types(verification: object) -> tuple[str, ...]:
     return tuple(str(method["type"]).strip().lower() for method in methods if isinstance(method, dict))
 
 
-def _is_supported_image(content: bytes) -> bool:
-    if any(content.startswith(signature) for _, signature in IMAGE_SIGNATURES):
-        return True
-    return len(content) >= 12 and content.startswith(b"RIFF") and content[8:12] == b"WEBP"
+def _validate_image(content: bytes) -> None:
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(BytesIO(content)) as candidate:
+                if candidate.format not in {"PNG", "JPEG", "WEBP"}:
+                    raise ValueError("ui.screenshot must be a fully decodable PNG/JPEG/WebP image")
+                candidate.verify()
+            with Image.open(BytesIO(content)) as decoded:
+                decoded.load()
+    except (OSError, SyntaxError, UnidentifiedImageError, Image.DecompressionBombWarning) as exc:
+        raise ValueError("ui.screenshot must be a fully decodable PNG/JPEG/WebP image") from exc
 
 
 def _verify_ui(
@@ -362,7 +486,12 @@ def _verify_ui(
     if claim_scope not in UI_CLAIM_SCOPES or surface not in UI_SURFACES:
         raise ValueError("ui claimScope/surface is invalid")
     verification_types = _verification_types(verification)
-    if claim_scope == "product-integration":
+    if "product-integration" in verification_types:
+        if claim_scope != "product-integration" or surface != "product":
+            raise ValueError(
+                "product-integration verification requires ui.claimScope: product-integration and ui.surface: product"
+            )
+    elif claim_scope == "product-integration":
         if "product-integration" not in verification_types:
             raise ValueError("product-integration claim requires contract verification type product-integration")
         if surface != "product":
@@ -387,8 +516,7 @@ def _verify_ui(
     structured = after_by_relative[structured_ref]
     if screenshot.object_identity == structured.object_identity:
         raise ValueError("UI screenshot and structured evidence must have distinct identities")
-    if not _is_supported_image(screenshot.content or b""):
-        raise ValueError("ui.screenshot must have a supported PNG/JPEG/WebP signature")
+    _validate_image(screenshot.content or b"")
     try:
         structured_document = json.loads((structured.content or b"").decode("utf-8-sig", errors="strict"))
     except (UnicodeError, json.JSONDecodeError) as exc:
@@ -452,7 +580,15 @@ def _verify_entry(
         if selector in selectors:
             raise ValueError("tests selectors must be unique within a trace entry")
         selectors.add(selector)
-        tests.append(_issue_file_snapshot(context.root, context.issue_directory, test["path"], "tests path"))
+        tests.append(
+            _issue_file_snapshot(
+                context.root,
+                context.issue_directory,
+                test["path"],
+                "tests path",
+                max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+            )
+        )
 
     evidence = _mapping(entry["evidence"], "evidence", {"before"}, {"after"})
     before_values = _string_list(evidence["before"], "evidence.before")
@@ -472,14 +608,38 @@ def _verify_entry(
     if conclusion != "blocked" and parsed_blocker is not None:
         raise ValueError("blocker is only allowed for blocked entries")
 
-    before = tuple(
-        _issue_file_snapshot(context.root, context.issue_directory, value, "evidence.before", evidence=True)
-        for value in before_values
-    )
-    after = tuple(
-        _issue_file_snapshot(context.root, context.issue_directory, value, "evidence.after", evidence=True)
-        for value in after_values
-    )
+    screenshot_ref = ""
+    structured_ref = ""
+    if isinstance(entry.get("ui"), dict):
+        raw_ui = entry["ui"]
+        assert isinstance(raw_ui, dict)
+        if "screenshot" in raw_ui:
+            screenshot_ref = safe_relative_reference(raw_ui["screenshot"], "ui.screenshot").as_posix()
+        if "structured" in raw_ui:
+            structured_ref = safe_relative_reference(raw_ui["structured"], "ui.structured").as_posix()
+
+    def evidence_snapshot(value: object, *, before: bool) -> StableFileSnapshot:
+        relative = safe_relative_reference(value, "evidence.before" if before else "evidence.after").as_posix()
+        if relative == screenshot_ref:
+            label = "screenshot evidence"
+            maximum = MAX_IMAGE_EVIDENCE_BYTES
+        elif relative == structured_ref:
+            label = "structured evidence"
+            maximum = MAX_STRUCTURED_EVIDENCE_BYTES
+        else:
+            label = "before evidence" if before else "after evidence"
+            maximum = MAX_STRUCTURED_EVIDENCE_BYTES
+        return _issue_file_snapshot(
+            context.root,
+            context.issue_directory,
+            value,
+            label,
+            evidence=True,
+            max_bytes=maximum,
+        )
+
+    before = tuple(evidence_snapshot(value, before=True) for value in before_values)
+    after = tuple(evidence_snapshot(value, before=False) for value in after_values)
     after_by_relative = {
         snapshot.path.relative_to(context.issue_directory).as_posix(): snapshot for snapshot in after
     }
@@ -494,27 +654,76 @@ def _verify_entry(
     return TraceEntry(entry_id, object_ids, verification_id, criterion, conclusion, tuple(tests), before, after)
 
 
-def _acceptance_criteria(context: _ClosureContext) -> tuple[set[str], tuple[tuple[StableFileSnapshot, str], ...]]:
-    snapshots: list[tuple[StableFileSnapshot, str]] = []
-    numbers: set[str] = set()
-    for name, label in (("gap-analysis.md", "gap analysis"), ("issue-draft.md", "issue draft")):
-        snapshot = _optional_snapshot(context.root, context.issue_directory, name, label)
-        snapshots.append((snapshot, label))
-        if not snapshot.exists:
-            continue
-        text = _decode_utf8(snapshot, label)
-        match = re.search(r"(?ms)^\s*## Acceptance Criteria\s*$\n(.*?)(?=^\s*##\s+|\Z)", text)
-        if match:
-            body = match.group(1)
-            numbers.update(SOURCE_CRITERION_RE.findall(body))
-            for ordered in re.finditer(r"(?m)^\s*(\d{1,3})[.)]\s+\S", body):
-                numbers.add(ordered.group(1).zfill(3))
-    if not numbers:
-        raise ValueError("contract trace requires numbered Acceptance Criteria in gap-analysis.md or issue-draft.md")
-    return numbers, tuple(snapshots)
+def _normalize_criterion_title(value: str) -> str:
+    normalized = " ".join(value.strip().split())
+    return normalized.rstrip(".。;；")
 
 
-def _verify_closure(context: _ClosureContext, entries: tuple[TraceEntry, ...]) -> tuple[tuple[StableFileSnapshot, str], ...]:
+def _criterion_registry(text: str, label: str) -> dict[str, CriterionIdentity]:
+    section = re.search(r"(?ms)^\s*## Acceptance Criteria\s*$\n(.*?)(?=^\s*##\s+|\Z)", text)
+    if not section:
+        raise ValueError(f"{label} must contain an Acceptance Criteria section")
+    body = section.group(1)
+    rows = [(number, title) for number, title in SOURCE_CRITERION_RE.findall(body)]
+    rows.extend((number.zfill(3), title) for number, title in ORDERED_CRITERION_RE.findall(body))
+    criteria: dict[str, CriterionIdentity] = {}
+    for number, raw_title in rows:
+        title = _normalize_criterion_title(raw_title)
+        if not title:
+            raise ValueError(f"{label} Acceptance Criterion C-{number} title must be non-empty")
+        if number in criteria:
+            raise ValueError(f"{label} Acceptance Criterion C-{number} must be unique")
+        summary = hashlib.sha256(f"C-{number}\0{title}".encode("utf-8")).hexdigest()
+        criteria[number] = CriterionIdentity(number, title, summary)
+    if not criteria:
+        raise ValueError(f"{label} requires numbered Acceptance Criteria")
+    return criteria
+
+
+def _acceptance_criteria(
+    context: _ClosureContext,
+) -> tuple[dict[str, CriterionIdentity], tuple[tuple[StableFileSnapshot, str], ...]]:
+    assert context.task_state is not None
+    gap = _optional_snapshot(
+        context.root,
+        context.issue_directory,
+        "gap-analysis.md",
+        "gap analysis",
+        max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+    )
+    snapshots: list[tuple[StableFileSnapshot, str]] = [(gap, "gap analysis")]
+    if context.task_state.classification == "implementation-gap":
+        if not gap.exists:
+            raise ValueError("implementation-gap requires gap-analysis.md")
+        from .checks import validate_gap_analysis_snapshot
+
+        support = validate_gap_analysis_snapshot(context.root, context.task_state.issue, gap)
+        snapshots.extend((snapshot, "gap-analysis supporting evidence") for snapshot in support)
+        return _criterion_registry(_decode_utf8(gap, "gap analysis"), "gap-analysis"), tuple(snapshots)
+    if gap.exists:
+        raise ValueError("gap-analysis.md is authoritative only for implementation-gap classification")
+
+    issue_draft = _optional_snapshot(
+        context.root,
+        context.issue_directory,
+        "issue-draft.md",
+        "issue draft",
+        max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+    )
+    snapshots.append((issue_draft, "issue draft"))
+    if not issue_draft.exists:
+        raise ValueError("contract trace requires a structurally valid issue-draft.md when no gap-analysis exists")
+    from .checks import _validate_issue_draft_text
+
+    text = _decode_utf8(issue_draft, "issue draft")
+    _validate_issue_draft_text(text, issue_draft.path)
+    return _criterion_registry(text, "issue-draft"), tuple(snapshots)
+
+
+def _verify_closure(
+    context: _ClosureContext,
+    entries: tuple[TraceEntry, ...],
+) -> tuple[tuple[tuple[StableFileSnapshot, str], ...], dict[str, CriterionIdentity]]:
     assert context.contract is not None
     entry_ids = tuple(entry.id for entry in entries)
     verification_ids = tuple(entry.verification for entry in entries)
@@ -554,6 +763,26 @@ def _verify_closure(context: _ClosureContext, entries: tuple[TraceEntry, ...]) -
     before_digests = {snapshot.digest for snapshot in before}
     if any(snapshot.digest in before_digests for snapshot in after):
         raise ValueError("after evidence digest must differ from every before evidence digest")
+    digest_owner: dict[str, str] = {}
+    for entry in entries:
+        for snapshot in entry.after_evidence:
+            assert snapshot.digest is not None
+            owner = digest_owner.setdefault(snapshot.digest, entry.verification)
+            if owner != entry.verification:
+                raise ValueError("after evidence digest must be unique across verifications")
+    for entry in entries:
+        if not entry.after_evidence:
+            continue
+        before_times = tuple(snapshot.mtime_ns for snapshot in entry.before_evidence)
+        after_times = tuple(snapshot.mtime_ns for snapshot in entry.after_evidence)
+        if any(value is None for value in before_times + after_times):
+            raise ValueError(f"evidence mtime_ns is unavailable for verification {entry.verification}")
+        latest_before = max(int(value) for value in before_times)
+        if any(int(value) <= latest_before for value in after_times):
+            raise ValueError(
+                "after evidence mtime_ns must be strictly later than its verification before evidence: "
+                f"{entry.verification}"
+            )
     artifact_snapshots = tuple(
         (snapshot, label)
         for entry in entries
@@ -564,7 +793,7 @@ def _verify_closure(context: _ClosureContext, entries: tuple[TraceEntry, ...]) -
         )
         for snapshot in group
     )
-    return source_snapshots + artifact_snapshots
+    return source_snapshots + artifact_snapshots, source_criteria
 
 
 def _entries_from_context(context: _ClosureContext) -> tuple[TraceEntry, ...]:
@@ -587,6 +816,7 @@ def _revalidate(root: Path, snapshots: tuple[tuple[StableFileSnapshot, str], ...
         revalidate_snapshots(root, (snapshot,), label)
 
 
+@repository_locked
 def check_traceability(
     repo_root: Path,
     issue: str,
@@ -596,21 +826,22 @@ def check_traceability(
     context = _load_context(repo_root, issue, matrix, require_task_state=True, supplied_contract=contract)
     assert context.required and context.matrix_snapshot is not None
     entries = _entries_from_context(context)
-    artifact_snapshots = _verify_closure(context, entries)
+    artifact_snapshots, _ = _verify_closure(context, entries)
     snapshots = context.snapshots + artifact_snapshots
     _revalidate(context.root, snapshots)
     return TraceabilityResult(context.matrix_snapshot.path, context.issue_directory, entries, snapshots)
 
 
+@repository_locked
 def check_traceability_resolution(
     repo_root: Path,
     issue: str,
     conclusion: str,
     report_evidence: tuple[StableFileSnapshot, ...] | set[Path],
     *,
-    report_criteria: tuple[str, ...] | None = None,
+    report_criteria: Mapping[str, tuple[str, str]] | tuple[str, ...] | None = None,
     report_snapshot: StableFileSnapshot | None = None,
-    support_snapshots: tuple[StableFileSnapshot, ...] = (),
+    support_snapshots: tuple[tuple[StableFileSnapshot, str], ...] = (),
 ) -> None:
     context = _load_context(repo_root, issue, None, require_task_state=False, supplied_contract=None)
     report_snapshots: tuple[StableFileSnapshot, ...]
@@ -624,12 +855,12 @@ def check_traceability_resolution(
     base_snapshots = tuple((snapshot, "resolution-report indexed evidence") for snapshot in report_snapshots)
     if report_snapshot is not None:
         base_snapshots += ((report_snapshot, "resolution report"),)
-    base_snapshots += tuple((snapshot, "resolution-report supporting artifact") for snapshot in support_snapshots)
+    base_snapshots += support_snapshots
     if not context.required:
         _revalidate(context.root, context.snapshots + base_snapshots)
         return
     entries = _entries_from_context(context)
-    artifact_snapshots = _verify_closure(context, entries)
+    artifact_snapshots, source_criteria = _verify_closure(context, entries)
     conclusions = tuple(entry.conclusion for entry in entries)
     if conclusion == "resolved":
         if any(value != "resolved" for value in conclusions):
@@ -648,7 +879,30 @@ def check_traceability_resolution(
         raise ValueError("resolution-report evidence must reference every trace after-evidence file, including UI artifacts")
     if report_criteria is not None:
         expected_numbers = {_criterion_number(entry.acceptance_criterion)[1] for entry in entries}
-        if set(report_criteria) != expected_numbers:
+        actual_numbers = set(report_criteria)
+        if actual_numbers != expected_numbers:
             raise ValueError("resolution-report Criterion C-NNN bindings must exactly match matrix acceptanceCriterion bindings")
+        if isinstance(report_criteria, Mapping):
+            entries_by_number = {
+                _criterion_number(entry.acceptance_criterion)[1]: entry for entry in entries
+            }
+            assert context.contract is not None
+            for number, (raw_title, report_type) in report_criteria.items():
+                source = source_criteria[number]
+                if _normalize_criterion_title(raw_title) != source.title:
+                    raise ValueError(
+                        f"resolution-report Criterion C-{number} title must match authoritative Acceptance Criteria"
+                    )
+                entry = entries_by_number[number]
+                verification = context.contract.verification_by_id[entry.verification]
+                verification_types = set(_verification_types(verification))
+                if "product-integration" in verification_types:
+                    matches = report_type == "product-integration"
+                else:
+                    matches = report_type in verification_types
+                if not matches:
+                    raise ValueError(
+                        f"resolution-report Criterion C-{number} Verification Type must match matrix verification {entry.verification}"
+                    )
     snapshots = context.snapshots + artifact_snapshots + base_snapshots
     _revalidate(context.root, snapshots)

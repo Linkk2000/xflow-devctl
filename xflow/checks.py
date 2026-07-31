@@ -7,12 +7,16 @@ from pathlib import Path
 
 from .io import read_text
 from .local_artifacts import (
+    MAX_IMAGE_EVIDENCE_BYTES,
+    MAX_STRUCTURED_EVIDENCE_BYTES,
+    MAX_TEXT_ARTIFACT_BYTES,
     StableFileSnapshot,
     capture_stable_file,
     contains_forbidden_object_storage_reference,
     contains_forbidden_remote_reference,
     safe_relative_reference,
 )
+from .collaboration import repository_locked
 from .paths import normalized_issue
 from .project_config import require_safe_repo_path
 
@@ -95,7 +99,7 @@ RESOLUTION_REPORT_REQUIRED_SECTIONS = (
     "## Remaining Risks",
     "## Human Review Request",
 )
-RESOLUTION_CONCLUSIONS = {"resolved", "reduced", "blocked"}
+UI_EVIDENCE_VERIFICATION_TYPES = {"browser", "product-integration", "ui", "visual"}
 GAP_FINDING_REQUIRED_SECTIONS = (
     "#### Finding Type",
     "#### Observation",
@@ -141,8 +145,16 @@ def require_template(path: Path, needles: tuple[str, ...]) -> None:
 
 
 def check_issue_draft(path: Path) -> None:
-    reject_publish_heading(path, ("# Issue Draft", "# Academic Issue Draft"))
-    require_template(path, ISSUE_REQUIRED)
+    _validate_issue_draft_text(read_text(path), path)
+
+
+def _validate_issue_draft_text(text: str, path: Path) -> None:
+    for heading in ("# Issue Draft", "# Academic Issue Draft"):
+        if re.search(rf"(?m)^\s*{re.escape(heading)}\s*$", text):
+            raise ValueError(f"internal draft heading is not allowed in remote body: {heading}")
+    for needle in ISSUE_REQUIRED:
+        if needle not in text:
+            raise ValueError(f"missing required text '{needle}' in {path}")
 
 
 def check_mr_draft(path: Path) -> None:
@@ -323,7 +335,20 @@ def issue_local_evidence_snapshots(current_issue_dir: Path, raw: str, label: str
         relative = evidence_path.relative_to(current_issue_dir)
         if not relative.parts or relative.parts[0] != "evidence":
             raise ValueError(f"{label} evidence links must stay under the issue evidence directory")
-        snapshots.append(capture_stable_file(repo_root, evidence_path, current_issue_dir, f"{label} evidence file"))
+        maximum = (
+            MAX_IMAGE_EVIDENCE_BYTES
+            if evidence_path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+            else MAX_STRUCTURED_EVIDENCE_BYTES
+        )
+        snapshots.append(
+            capture_stable_file(
+                repo_root,
+                evidence_path,
+                current_issue_dir,
+                f"{label} evidence file",
+                max_bytes=maximum,
+            )
+        )
     return snapshots
 
 
@@ -343,20 +368,22 @@ def validate_evidence_bundle(
     evidence_field: str,
     human_review_field: str,
     label: str,
-) -> None:
-    evidence_paths = check_issue_local_evidence(current_issue_dir, fields[evidence_field], label)
+) -> tuple[StableFileSnapshot, ...]:
+    evidence_snapshots = issue_local_evidence_snapshots(current_issue_dir, fields[evidence_field], label)
+    evidence_paths = [snapshot.path for snapshot in evidence_snapshots]
     require_checklist_item(fields[human_review_field], f"{label} Human Review")
     evidence_type = fields[type_field].strip().lower()
-    if evidence_type not in {"ui", "non-ui"}:
-        raise ValueError(f"{label} {type_field[5:]} must be ui or non-ui")
-    if evidence_type != "ui":
-        return
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", evidence_type):
+        raise ValueError(f"{label} {type_field[5:]} must be a canonical verification type")
+    if evidence_type not in UI_EVIDENCE_VERIFICATION_TYPES:
+        return tuple(evidence_snapshots)
 
     relative_paths = [path.relative_to(current_issue_dir) for path in evidence_paths]
     has_screenshot = any("screenshots" in path.parts for path in relative_paths)
     has_dom = any("dom" in path.parts for path in relative_paths)
     if not has_screenshot or not has_dom:
         raise ValueError(f"{label} UI evidence must include both evidence/screenshots and evidence/dom artifacts")
+    return tuple(evidence_snapshots)
 
 
 def validate_evidence_blocks(
@@ -366,23 +393,27 @@ def validate_evidence_blocks(
     required_fields: tuple[str, ...],
     type_field: str,
     label: str,
-) -> None:
+) -> tuple[StableFileSnapshot, ...]:
     blocks = list(pattern.finditer(raw))
     if not blocks:
         raise ValueError(f"{label} must contain at least one numbered evidence bundle")
+    snapshots: list[StableFileSnapshot] = []
     for block in blocks:
         identifier, title, content = block.groups()
         if not title.strip():
             raise ValueError(f"{label} {identifier} must have a title")
         fields = required_subsections(content, required_fields, f"{label} {identifier}")
-        validate_evidence_bundle(
-            current_issue_dir,
-            fields,
-            type_field,
-            "#### Evidence",
-            "#### Human Review",
-            f"{label} {identifier}",
+        snapshots.extend(
+            validate_evidence_bundle(
+                current_issue_dir,
+                fields,
+                type_field,
+                "#### Evidence",
+                "#### Human Review",
+                f"{label} {identifier}",
+            )
         )
+    return tuple(snapshots)
 
 
 def has_unchecked_checklist_item(raw: str) -> bool:
@@ -458,24 +489,43 @@ def check_gap_analysis(repo_root: Path, issue: str, file_path: Path | None = Non
         issue_file_path(repo_root, issue, file_path, "gap-analysis.md"),
         "gap analysis",
     )
-    text = read_text(path)
+    snapshot = capture_stable_file(
+        repo_root.resolve(), path, current_issue_dir, "gap analysis", max_bytes=MAX_TEXT_ARTIFACT_BYTES
+    )
+    validate_gap_analysis_snapshot(repo_root, issue, snapshot)
+    return path
+
+
+def validate_gap_analysis_snapshot(
+    repo_root: Path,
+    issue: str,
+    snapshot: StableFileSnapshot,
+) -> tuple[StableFileSnapshot, ...]:
+    current_issue_dir = issue_dir(repo_root.resolve(), issue).resolve()
+    try:
+        text = (snapshot.content or b"").decode("utf-8-sig", errors="strict")
+    except UnicodeError as exc:
+        raise ValueError(f"gap-analysis must be valid UTF-8: {snapshot.path}") from exc
     sections = required_sections(text, GAP_ANALYSIS_REQUIRED_SECTIONS, "gap-analysis")
-    check_issue_local_evidence(current_issue_dir, sections["## Evidence"], "gap-analysis")
-    validate_evidence_blocks(
-        current_issue_dir,
-        sections["## Evidence-Backed Findings"],
-        FINDING_BLOCK_RE,
-        GAP_FINDING_REQUIRED_SECTIONS,
-        "#### Finding Type",
-        "gap-analysis finding",
+    snapshots = issue_local_evidence_snapshots(current_issue_dir, sections["## Evidence"], "gap-analysis")
+    snapshots.extend(
+        validate_evidence_blocks(
+            current_issue_dir,
+            sections["## Evidence-Backed Findings"],
+            FINDING_BLOCK_RE,
+            GAP_FINDING_REQUIRED_SECTIONS,
+            "#### Finding Type",
+            "gap-analysis finding",
+        )
     )
 
     recognition = markdown_field(sections["## Human Recognition"], "Recognized").lower()
     if recognition != "yes":
         raise ValueError("gap-analysis Human Recognition must contain Recognized: yes before implementation")
-    return path
+    return tuple(snapshots)
 
 
+@repository_locked
 def check_resolution_report(repo_root: Path, issue: str, file_path: Path | None = None) -> Path:
     root = repo_root.resolve(strict=False)
     current_issue_dir = require_safe_repo_path(root, issue_dir(root, issue), "resolution report Issue directory")
@@ -485,14 +535,16 @@ def check_resolution_report(repo_root: Path, issue: str, file_path: Path | None 
         path.relative_to(current_issue_dir)
     except ValueError as exc:
         raise ValueError("resolution report must stay under .xflow/issues/issue-<id>") from exc
-    report_snapshot = capture_stable_file(root, path, current_issue_dir, "resolution report")
+    report_snapshot = capture_stable_file(
+        root, path, current_issue_dir, "resolution report", max_bytes=MAX_TEXT_ARTIFACT_BYTES
+    )
     try:
         text = (report_snapshot.content or b"").decode("utf-8-sig", errors="strict")
     except UnicodeError as exc:
         raise ValueError(f"resolution report must be valid UTF-8: {path}") from exc
     sections = required_sections(text, RESOLUTION_REPORT_REQUIRED_SECTIONS, "resolution-report")
     report_evidence = issue_local_evidence_snapshots(current_issue_dir, sections["## Evidence Index"], "resolution-report")
-    validate_evidence_blocks(
+    criterion_evidence = validate_evidence_blocks(
         current_issue_dir,
         sections["## Completion Verification"],
         COMPLETION_CRITERION_RE,
@@ -501,15 +553,30 @@ def check_resolution_report(repo_root: Path, issue: str, file_path: Path | None 
         "resolution-report criterion",
     )
 
-    conclusion_match = re.search(
-        r"\b(resolved|reduced|blocked)\b\s*[:\uFF1A-]\s*(\S.+)",
-        sections["## Closure Conclusion"],
-        re.IGNORECASE,
+    conclusion_lines = [line.strip() for line in sections["## Closure Conclusion"].splitlines() if line.strip()]
+    if len(conclusion_lines) > 2:
+        raise ValueError("resolution-report Closure Conclusion contains unexpected prose")
+    if not conclusion_lines or not re.fullmatch(
+        r"Conclusion:\s*(resolved|reduced|blocked)", conclusion_lines[0], re.IGNORECASE
+    ):
+        raise ValueError("resolution-report Closure Conclusion requires one canonical Conclusion field")
+    if len(conclusion_lines) != 2 or not conclusion_lines[1].lower().startswith("reason:"):
+        raise ValueError("resolution-report Closure Conclusion requires a non-empty Reason field")
+    reason = conclusion_lines[1][len("Reason:"):].strip()
+    if not reason:
+        raise ValueError("resolution-report Closure Conclusion requires a non-empty Reason field")
+    conclusion_match = re.fullmatch(
+        r"Conclusion:\s*(resolved|reduced|blocked)", conclusion_lines[0], re.IGNORECASE
     )
-    if not conclusion_match or conclusion_match.group(1).lower() not in RESOLUTION_CONCLUSIONS:
-        raise ValueError("resolution-report Closure Conclusion must be resolved, reduced, or blocked with a reason")
+    assert conclusion_match is not None
     conclusion = conclusion_match.group(1).lower()
-    report_criteria = tuple(match.group(1) for match in COMPLETION_CRITERION_RE.finditer(sections["## Completion Verification"]))
+    report_criteria: dict[str, tuple[str, str]] = {}
+    for match in COMPLETION_CRITERION_RE.finditer(sections["## Completion Verification"]):
+        number, title, content = match.groups()
+        fields = required_subsections(content, COMPLETION_VERIFICATION_REQUIRED_SECTIONS, f"resolution-report criterion {number}")
+        if number in report_criteria:
+            raise ValueError("resolution-report Criterion C-NNN bindings must be unique")
+        report_criteria[number] = (title.strip(), fields["#### Verification Type"].strip().lower())
     if len(report_criteria) != len(set(report_criteria)):
         raise ValueError("resolution-report Criterion C-NNN bindings must be unique")
     dependency_snapshot = capture_stable_file(
@@ -518,11 +585,19 @@ def check_resolution_report(repo_root: Path, issue: str, file_path: Path | None 
         current_issue_dir,
         "resolution-report dependencies",
         required=False,
+        max_bytes=MAX_TEXT_ARTIFACT_BYTES,
     )
+    dependency_support: tuple[StableFileSnapshot, ...] = ()
     if dependency_snapshot.exists:
         from .dependencies import check_dependencies, check_dependency_closure
 
-        dependency_result = check_dependencies(repo_root, issue, dependency_snapshot.path)
+        dependency_result = check_dependencies(
+            repo_root,
+            issue,
+            dependency_snapshot.path,
+            content=dependency_snapshot.content,
+        )
+        dependency_support = dependency_result.snapshots
         closure_violations = check_dependency_closure(dependency_result, conclusion)
         if closure_violations:
             raise ValueError(
@@ -539,7 +614,11 @@ def check_resolution_report(repo_root: Path, issue: str, file_path: Path | None 
         tuple(report_evidence),
         report_criteria=report_criteria,
         report_snapshot=report_snapshot,
-        support_snapshots=(dependency_snapshot,),
+        support_snapshots=(
+            (dependency_snapshot, "dependencies"),
+            *((snapshot, "resolution-report criterion evidence") for snapshot in criterion_evidence),
+            *((snapshot, "dependency integration evidence") for snapshot in dependency_support),
+        ),
     )
     return path
 

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .local_artifacts import StableFileSnapshot
 from .paths import normalized_issue
 
 
@@ -19,6 +20,7 @@ class DependencyCheckResult:
     path: Path
     entries: tuple[dict[str, Any], ...]
     warnings: tuple[str, ...]
+    snapshots: tuple[StableFileSnapshot, ...] = ()
 
 
 def check_dependency_closure(
@@ -56,14 +58,18 @@ def check_dependency_closure(
     return tuple(violations)
 
 
-def load_yaml(path: Path) -> object:
+def load_yaml(path: Path, content: bytes | None = None) -> object:
     try:
         import yaml
     except ImportError as exc:
         raise RuntimeError(
             "dependency checks require PyYAML; run: python -m pip install -r requirements.txt"
         ) from exc
-    return yaml.safe_load(path.read_text(encoding="utf-8-sig"))
+    try:
+        text = content.decode("utf-8-sig", errors="strict") if content is not None else path.read_text(encoding="utf-8-sig")
+    except UnicodeError as exc:
+        raise ValueError(f"dependencies file must be valid UTF-8: {path}") from exc
+    return yaml.safe_load(text)
 
 
 def _mapping(value: object, label: str) -> dict[str, Any]:
@@ -142,21 +148,24 @@ def _validate_external_shape(entry: dict[str, Any], dependency: str) -> None:
             _non_empty(entry[field], f"dependency #{dependency} {field}")
 
 
-def _validate_integration(entry: dict[str, Any], dependency: str, issue_directory: Path) -> None:
+def _validate_integration(
+    entry: dict[str, Any], dependency: str, issue_directory: Path
+) -> tuple[StableFileSnapshot, ...]:
     integration = _mapping(entry.get("integration"), f"dependency #{dependency} integration")
     _non_empty(integration.get("commit"), f"dependency #{dependency} integration.commit")
     _non_empty_list(integration.get("verifiedBy"), f"dependency #{dependency} integration.verifiedBy")
     evidence = _non_empty_list(integration.get("evidence"), f"dependency #{dependency} integration.evidence")
 
     # Import lazily so checks.py can call this module without a module-import cycle.
-    from .checks import check_issue_local_evidence
+    from .checks import issue_local_evidence_snapshots
 
     raw_evidence = "\n".join(f"- {item}" for item in evidence)
-    evidence_paths = check_issue_local_evidence(
+    evidence_snapshots = issue_local_evidence_snapshots(
         issue_directory,
         raw_evidence,
         f"dependency #{dependency} integration",
     )
+    evidence_paths = [snapshot.path for snapshot in evidence_snapshots]
     for evidence_path in evidence_paths:
         if not evidence_path.is_file():
             raise ValueError(
@@ -167,6 +176,7 @@ def _validate_integration(entry: dict[str, Any], dependency: str, issue_director
         raise ValueError(
             f"dependency #{dependency} integration evidence must be fresh parent-side evidence, not a dependency resolution-report"
         )
+    return tuple(evidence_snapshots)
 
 
 def _validate_integration_shape(entry: dict[str, Any], dependency: str) -> None:
@@ -182,6 +192,8 @@ def check_dependencies(
     repo_root: Path,
     issue: str,
     file_path: Path | None = None,
+    *,
+    content: bytes | None = None,
 ) -> DependencyCheckResult:
     from .checks import issue_dir, require_inside, resolve_repo_path
 
@@ -193,7 +205,7 @@ def check_dependencies(
     if not path.is_file():
         raise ValueError(f"missing dependencies file: {path}")
 
-    document = _mapping(load_yaml(path), "dependencies document")
+    document = _mapping(load_yaml(path, content), "dependencies document")
     _non_empty(document.get("version"), "dependencies version")
     document_issue = _issue_identifier(document.get("issue"), "top-level issue")
     if document_issue != expected_issue:
@@ -204,6 +216,7 @@ def check_dependencies(
 
     entries: list[dict[str, Any]] = []
     warnings: list[str] = []
+    snapshots: list[StableFileSnapshot] = []
     for index, raw_entry in enumerate(raw_entries, start=1):
         entry = dict(_mapping(raw_entry, f"dependency entry {index}"))
         dependency = _issue_identifier(entry.get("issue"), f"dependency entry {index} issue")
@@ -246,7 +259,7 @@ def check_dependencies(
             else:
                 _validate_delivery(entry, dependency)
         if status == "integrated":
-            _validate_integration(entry, dependency, issue_directory)
+            snapshots.extend(_validate_integration(entry, dependency, issue_directory))
         if status == "superseded":
             closure = _mapping(entry.get("closureAssessment"), f"superseded dependency #{dependency} closureAssessment")
             if closure.get("decision") != "superseded" or not str(closure.get("rationale", "")).strip():
@@ -257,4 +270,9 @@ def check_dependencies(
             warnings.append(f"dependency #{dependency} is {status}; developer decision remains {decision}")
         entries.append(entry)
 
-    return DependencyCheckResult(path=path, entries=tuple(entries), warnings=tuple(warnings))
+    return DependencyCheckResult(
+        path=path,
+        entries=tuple(entries),
+        warnings=tuple(warnings),
+        snapshots=tuple(snapshots),
+    )

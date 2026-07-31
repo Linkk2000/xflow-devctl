@@ -13,6 +13,7 @@ sys.path.insert(0, str(OPS_ROOT))
 
 from xflow.bindings import resolve_bindings
 from xflow.checks import check_current_task
+from xflow.paths import active_task_pointer_file
 from xflow.task_state import (
     TaskState,
     activate_task,
@@ -118,7 +119,7 @@ def main() -> None:
         assert_value_error("active task Issue mismatch", lambda: check_task_binding(worktree_b, "101"))
         assert [item.issue for item in list_task_states(worktree_a)] == ["101", "202", "IK3RR6"]
 
-        pointer = worktree_a / ".xflow" / "local" / "worktrees" / resolve_bindings(worktree_a).worktree / "active-task.json"
+        pointer = active_task_pointer_file(worktree_a, resolve_bindings(worktree_a).worktree)
         payload = json.loads(pointer.read_text(encoding="utf-8"))
         assert set(payload) == {"version", "repository", "worktree", "branch", "issue", "activatedAt"}
         assert payload["version"] == 1

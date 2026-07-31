@@ -18,6 +18,7 @@ import yaml
 from .bindings import GitBindings, resolve_bindings
 from .classification import _decode_classification_bytes, _load_yaml, _read_stable_bytes
 from .io import read_text
+from .local_artifacts import MAX_TEXT_ARTIFACT_BYTES, StableFileSnapshot, capture_stable_file
 from .paths import default_approval_file, issue_dir, normalized_issue
 from .project_config import require_safe_repo_path
 from .unattended import require_active
@@ -436,7 +437,7 @@ def _validate_review_text(
 def _stable_approval_bytes(repo_root: Path, path: Path, owner: Path, label: str) -> bytes:
     safe_path = require_safe_repo_path(repo_root, path, label)
     try:
-        return _read_stable_bytes(repo_root, safe_path, owner)
+        return _read_stable_bytes(repo_root, safe_path, owner, max_bytes=MAX_TEXT_ARTIFACT_BYTES)
     except ValueError as exc:
         raise ValueError(str(exc).replace("classification", label)) from exc
 
@@ -497,10 +498,14 @@ def _effect_identity(payload: dict[str, object]) -> str:
     return hashlib.sha256(f"xflow-approval-effect-v1\0{material}".encode("utf-8")).hexdigest()
 
 
-def _parse_history_snapshot(repo_root: Path, path: Path) -> tuple[dict[str, object], bytes]:
+def _parse_history_snapshot(
+    repo_root: Path,
+    path: Path,
+    content: bytes | None = None,
+) -> tuple[dict[str, object], bytes]:
     try:
         issue_root = path.resolve().parents[2]
-        raw_bytes = _stable_approval_bytes(repo_root, path, issue_root, "approval history")
+        raw_bytes = content if content is not None else _stable_approval_bytes(repo_root, path, issue_root, "approval history")
         payload = _load_yaml(_decode_approval_bytes(raw_bytes, path, "approval history"))
     except (OSError, UnicodeError, ValueError) as exc:
         raise ValueError(f"approval history integrity error in {path}: invalid YAML: {exc}") from exc
@@ -1355,10 +1360,17 @@ def _contract_history_artifact(
     return target
 
 
-def _parse_contract_claim(repo_root: Path, path: Path, issue_root: Path) -> tuple[dict[str, object], bytes]:
+def _parse_contract_claim(
+    repo_root: Path,
+    path: Path,
+    issue_root: Path,
+    content: bytes | None = None,
+) -> tuple[dict[str, object], bytes]:
     if not path.is_file():
         raise ValueError("missing atomic contract acceptance claim")
-    raw_bytes = _stable_approval_bytes(repo_root, path, issue_root, "contract acceptance claim")
+    raw_bytes = content if content is not None else _stable_approval_bytes(
+        repo_root, path, issue_root, "contract acceptance claim"
+    )
     try:
         payload = _load_yaml(_decode_approval_bytes(raw_bytes, path, "contract acceptance claim"))
     except ValueError as exc:
@@ -1397,9 +1409,21 @@ def _parse_contract_claim(repo_root: Path, path: Path, issue_root: Path) -> tupl
     return payload, raw_bytes
 
 
-def validate_contract_acceptance_history(repo_root: Path, path: Path) -> dict[str, object]:
+def validate_contract_acceptance_history(
+    repo_root: Path,
+    path: Path,
+    *,
+    history_snapshot: StableFileSnapshot | None = None,
+    return_snapshots: bool = False,
+) -> dict[str, object] | tuple[dict[str, object], tuple[StableFileSnapshot, ...]]:
     repo_root = repo_root.resolve()
-    record, history_bytes = _parse_history_snapshot(repo_root, path)
+    if history_snapshot is not None and history_snapshot.path != path:
+        raise ValueError("contract acceptance history snapshot path mismatch")
+    record, history_bytes = _parse_history_snapshot(
+        repo_root,
+        path,
+        history_snapshot.content if history_snapshot is not None else None,
+    )
     if record.get("action") != "contract-acceptance" or record.get("source") != "local-review":
         raise ValueError("record is not a local contract acceptance")
     issue = normalized_issue(str(record["issue"]))
@@ -1412,9 +1436,14 @@ def validate_contract_acceptance_history(repo_root: Path, path: Path) -> dict[st
         "consumed",
         f"{approval_id}-local-review.md",
     )
-    if not review_path.is_file():
-        raise ValueError("missing archived approved review")
-    review_bytes = _stable_approval_bytes(repo_root, review_path, issue_root, "archived approved review")
+    review_snapshot = capture_stable_file(
+        repo_root,
+        review_path,
+        issue_root,
+        "archived approved review",
+        max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+    )
+    review_bytes = review_snapshot.content or b""
     review_sha256 = hashlib.sha256(review_bytes).hexdigest()
     if review_sha256 != record["approvedReviewSha256"]:
         raise ValueError("archived approved review SHA256 mismatch")
@@ -1453,7 +1482,14 @@ def validate_contract_acceptance_history(repo_root: Path, path: Path) -> dict[st
         "claims",
         f"{approval_id}.yaml",
     )
-    claim, _ = _parse_contract_claim(repo_root, claim_path, issue_root)
+    claim_snapshot = capture_stable_file(
+        repo_root,
+        claim_path,
+        issue_root,
+        "contract acceptance claim",
+        max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+    )
+    claim, _ = _parse_contract_claim(repo_root, claim_path, issue_root, claim_snapshot.content)
     inherited = {
         "approvalId": record["approvalId"],
         "repository": record["repository"],
@@ -1481,6 +1517,8 @@ def validate_contract_acceptance_history(repo_root: Path, path: Path) -> dict[st
     ):
         raise ValueError("contract acceptance claim does not seal exact history")
     _validate_acceptance_chronology(review_bytes, review_path, claim)
+    if return_snapshots:
+        return record, (review_snapshot, claim_snapshot)
     return record
 
 

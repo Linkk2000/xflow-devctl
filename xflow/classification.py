@@ -125,23 +125,34 @@ def _posix_snapshot(path_stat: os.stat_result) -> tuple[int, int, int, int, int,
     )
 
 
-def _read_bounded_posix(native: Any, descriptor: int, path: Path) -> bytes:
+def _read_bounded_posix(
+    native: Any,
+    descriptor: int,
+    path: Path,
+    max_bytes: int = MAX_CLASSIFICATION_BYTES,
+) -> bytes:
     chunks: list[bytes] = []
     total = 0
     while True:
         try:
-            chunk = native.read(descriptor, min(READ_CHUNK_SIZE, MAX_CLASSIFICATION_BYTES + 1 - total))
+            chunk = native.read(descriptor, min(READ_CHUNK_SIZE, max_bytes + 1 - total))
         except OSError as exc:
             raise ValueError(f"cannot read classification file: {path}: {exc}") from exc
         if not chunk:
             return b"".join(chunks)
         chunks.append(chunk)
         total += len(chunk)
-        if total > MAX_CLASSIFICATION_BYTES:
-            raise ValueError(f"classification file exceeds {MAX_CLASSIFICATION_BYTES} bytes: {path}")
+        if total > max_bytes:
+            raise ValueError(f"classification file exceeds {max_bytes} bytes: {path}")
 
 
-def _read_stable_bytes_posix(repo_root: Path, path: Path, api: Any | None = None) -> bytes:
+def _read_stable_bytes_posix(
+    repo_root: Path,
+    path: Path,
+    api: Any | None = None,
+    *,
+    max_bytes: int = MAX_CLASSIFICATION_BYTES,
+) -> bytes:
     native = api if api is not None else _PosixApi()
     descriptors: list[int] = []
     parts = _relative_classification_parts(repo_root, path)
@@ -181,11 +192,11 @@ def _read_stable_bytes_posix(repo_root: Path, path: Path, api: Any | None = None
             raise ValueError(f"classification file must be a regular file: {path}")
         if int(getattr(file_stat, "st_nlink", 1)) != 1:
             raise ValueError(f"classification file must have exactly one filesystem link: {path}")
-        if file_stat.st_size > MAX_CLASSIFICATION_BYTES:
-            raise ValueError(f"classification file exceeds {MAX_CLASSIFICATION_BYTES} bytes: {path}")
+        if file_stat.st_size > max_bytes:
+            raise ValueError(f"classification file exceeds {max_bytes} bytes: {path}")
 
         initial_snapshot = _posix_snapshot(file_stat)
-        first_content = _read_bounded_posix(native, descriptor, path)
+        first_content = _read_bounded_posix(native, descriptor, path, max_bytes)
         try:
             middle_snapshot = _posix_snapshot(native.stat(descriptor))
             native.rewind(descriptor)
@@ -194,7 +205,7 @@ def _read_stable_bytes_posix(repo_root: Path, path: Path, api: Any | None = None
         if middle_snapshot != initial_snapshot:
             raise ValueError(f"classification file changed while reading: {path}")
 
-        second_content = _read_bounded_posix(native, descriptor, path)
+        second_content = _read_bounded_posix(native, descriptor, path, max_bytes)
         try:
             final_snapshot = _posix_snapshot(native.stat(descriptor))
         except OSError as exc:
@@ -387,6 +398,8 @@ def _read_stable_bytes_windows(
     path: Path,
     issue_directory: Path,
     api: Any | None = None,
+    *,
+    max_bytes: int = MAX_CLASSIFICATION_BYTES,
 ) -> bytes:
     native = api if api is not None else _WindowsApi()
     handles: list[int] = []
@@ -423,7 +436,9 @@ def _read_stable_bytes_windows(
     try:
         _, parent_final = open_checked(repo_root, directory=True, expected_final=None)
         current = repo_root
-        held_issue_final: Path | None = None
+        held_issue_final: Path | None = (
+            parent_final if _windows_path_key(repo_root) == _windows_path_key(issue_directory) else None
+        )
         descriptor = 0
         final_file_path: Path | None = None
         for index, part in enumerate(parts):
@@ -454,8 +469,8 @@ def _read_stable_bytes_windows(
             if int(native.link_count(descriptor) if hasattr(native, "link_count") else 1) != 1:
                 raise ValueError(f"classification file must have exactly one filesystem link: {path}")
             initial_snapshot = native.snapshot(descriptor)
-            if native.file_size(descriptor) > MAX_CLASSIFICATION_BYTES:
-                raise ValueError(f"classification file exceeds {MAX_CLASSIFICATION_BYTES} bytes: {path}")
+            if native.file_size(descriptor) > max_bytes:
+                raise ValueError(f"classification file exceeds {max_bytes} bytes: {path}")
         except OSError as exc:
             raise ValueError(f"classification file changed while opening: {path}: {exc}") from exc
 
@@ -463,15 +478,15 @@ def _read_stable_bytes_windows(
         total = 0
         while True:
             try:
-                chunk = native.read(descriptor, min(READ_CHUNK_SIZE, MAX_CLASSIFICATION_BYTES + 1 - total))
+                chunk = native.read(descriptor, min(READ_CHUNK_SIZE, max_bytes + 1 - total))
             except OSError as exc:
                 raise ValueError(f"cannot read classification file: {path}: {exc}") from exc
             if not chunk:
                 break
             chunks.append(chunk)
             total += len(chunk)
-            if total > MAX_CLASSIFICATION_BYTES:
-                raise ValueError(f"classification file exceeds {MAX_CLASSIFICATION_BYTES} bytes: {path}")
+            if total > max_bytes:
+                raise ValueError(f"classification file exceeds {max_bytes} bytes: {path}")
         try:
             final_snapshot = native.snapshot(descriptor)
         except OSError as exc:
@@ -497,10 +512,16 @@ def _read_stable_text_windows(repo_root: Path, path: Path, issue_directory: Path
     )
 
 
-def _read_stable_bytes(repo_root: Path, path: Path, issue_directory: Path) -> bytes:
+def _read_stable_bytes(
+    repo_root: Path,
+    path: Path,
+    issue_directory: Path,
+    *,
+    max_bytes: int = MAX_CLASSIFICATION_BYTES,
+) -> bytes:
     if os.name == "nt":
-        return _read_stable_bytes_windows(repo_root, path, issue_directory)
-    return _read_stable_bytes_posix(repo_root, path)
+        return _read_stable_bytes_windows(repo_root, path, issue_directory, max_bytes=max_bytes)
+    return _read_stable_bytes_posix(repo_root, path, max_bytes=max_bytes)
 
 
 def _read_stable_text(repo_root: Path, path: Path, issue_directory: Path) -> str:
