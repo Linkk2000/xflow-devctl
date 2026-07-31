@@ -443,6 +443,106 @@ def test_supersedes_many_to_many_is_human_review(repo: Path) -> None:
     )
 
 
+def test_exact_split_warns_without_false_missing_lineage_error(repo: Path) -> None:
+    old_path = copied_contract(repo, "valid.yaml", "exact-split-old.yaml")
+    old_payload = yaml.safe_load(old_path.read_text(encoding="utf-8"))
+    predecessor = old_payload["futureCapabilitiesOutOfScope"][0]
+
+    candidate_path = copied_contract(repo, "valid.yaml", "exact-split-new.yaml")
+    candidate_payload = copy.deepcopy(old_payload)
+    candidate_payload["version"] = "0.2.0"
+    exact_successor = copy.deepcopy(predecessor)
+    exact_successor["id"] = "example.future.optional-extension-v2"
+    exact_successor["supersedes"] = ["example.future.optional-extension"]
+    edited_successor = copy.deepcopy(predecessor)
+    edited_successor["id"] = "example.future.optional-extension-audit"
+    edited_successor["capability"] = "可选审计扩展能力"
+    edited_successor["supersedes"] = ["example.future.optional-extension"]
+    candidate_payload["futureCapabilitiesOutOfScope"] = [exact_successor, edited_successor]
+    write(candidate_path, candidate_payload)
+
+    diff = diff_contracts(load_contract(repo, old_path), load_contract(repo, candidate_path))
+    impacts = "\n".join(diff.review_impacts)
+    assert diff.required_bump == "human-review"
+    assert (
+        "[WARN] one old object is superseded by multiple new objects: example.future.optional-extension"
+        in impacts
+    )
+    assert "exact stable-ID replacement lacks one-to-one supersedes" not in impacts
+    run_devctl(repo, "contract", "diff", "--old", str(old_path), "--new", str(candidate_path), expect=0)
+
+
+def test_exact_merge_warns_without_false_missing_lineage_error(repo: Path) -> None:
+    old_path = copied_contract(repo, "valid.yaml", "exact-merge-old.yaml")
+    old_payload = yaml.safe_load(old_path.read_text(encoding="utf-8"))
+    old_payload["futureCapabilitiesOutOfScope"].append(
+        {
+            "id": "example.future.optional-extension-b",
+            "version": "0.1.0",
+            "capability": "另一个可选扩展能力",
+            "reason": "不属于当前承诺且不进入当前验证",
+        }
+    )
+    write(old_path, old_payload)
+
+    candidate_path = copied_contract(repo, "valid.yaml", "exact-merge-new.yaml")
+    candidate_payload = copy.deepcopy(old_payload)
+    candidate_payload["version"] = "0.2.0"
+    exact_successor = copy.deepcopy(old_payload["futureCapabilitiesOutOfScope"][0])
+    exact_successor["id"] = "example.future.optional-extension-merged"
+    exact_successor["supersedes"] = [
+        "example.future.optional-extension",
+        "example.future.optional-extension-b",
+    ]
+    candidate_payload["futureCapabilitiesOutOfScope"] = [exact_successor]
+    write(candidate_path, candidate_payload)
+
+    diff = diff_contracts(load_contract(repo, old_path), load_contract(repo, candidate_path))
+    impacts = "\n".join(diff.review_impacts)
+    assert diff.required_bump == "human-review"
+    assert (
+        "[WARN] one new object supersedes multiple old objects: example.future.optional-extension-merged"
+        in impacts
+    )
+    assert "exact stable-ID replacement lacks one-to-one supersedes" not in impacts
+    run_devctl(repo, "contract", "diff", "--old", str(old_path), "--new", str(candidate_path), expect=0)
+
+
+def test_persisted_edges_warn_when_predecessor_is_removed(repo: Path) -> None:
+    old_path = copied_contract(repo, "valid.yaml", "persisted-split-old.yaml")
+    old_payload = yaml.safe_load(old_path.read_text(encoding="utf-8"))
+    old_payload["futureCapabilitiesOutOfScope"].extend(
+        [
+            {
+                "id": f"example.future.optional-extension-{suffix}",
+                "version": "0.1.0",
+                "capability": f"已建立血缘的可选扩展能力 {suffix}",
+                "reason": "不属于当前承诺且不进入当前验证",
+                "supersedes": ["example.future.optional-extension"],
+            }
+            for suffix in ("a", "b")
+        ]
+    )
+    write(old_path, old_payload)
+
+    candidate_path = copied_contract(repo, "valid.yaml", "persisted-split-new.yaml")
+    candidate_payload = copy.deepcopy(old_payload)
+    candidate_payload["version"] = "0.1.1"
+    candidate_payload["futureCapabilitiesOutOfScope"] = candidate_payload["futureCapabilitiesOutOfScope"][1:]
+    write(candidate_path, candidate_payload)
+
+    diff = diff_contracts(load_contract(repo, old_path), load_contract(repo, candidate_path))
+    impacts = "\n".join(diff.review_impacts)
+    assert diff.required_bump == "human-review"
+    assert (
+        "[WARN] one old object is superseded by multiple new objects: example.future.optional-extension"
+        in impacts
+    )
+    assert "invalid historical supersedes" not in impacts
+    assert not any(impact.startswith("[ERROR]") for impact in diff.review_impacts)
+    run_devctl(repo, "contract", "diff", "--old", str(old_path), "--new", str(candidate_path), expect=0)
+
+
 def test_persisted_supersedes_edges_are_canonical_sets(repo: Path) -> None:
     old_path = copied_contract(repo, "valid.yaml", "lineage-order-old.yaml")
     old_payload = yaml.safe_load(old_path.read_text(encoding="utf-8"))
@@ -803,6 +903,12 @@ def main() -> None:
         test_changed_object_supersedes_must_resolve_in_old_document(init_repo(Path(raw)))
     with tempfile.TemporaryDirectory() as raw:
         test_supersedes_many_to_many_is_human_review(init_repo(Path(raw)))
+    with tempfile.TemporaryDirectory() as raw:
+        test_exact_split_warns_without_false_missing_lineage_error(init_repo(Path(raw)))
+    with tempfile.TemporaryDirectory() as raw:
+        test_exact_merge_warns_without_false_missing_lineage_error(init_repo(Path(raw)))
+    with tempfile.TemporaryDirectory() as raw:
+        test_persisted_edges_warn_when_predecessor_is_removed(init_repo(Path(raw)))
     with tempfile.TemporaryDirectory() as raw:
         test_persisted_supersedes_edges_are_canonical_sets(init_repo(Path(raw)))
     with tempfile.TemporaryDirectory() as raw:

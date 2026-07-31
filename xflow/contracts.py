@@ -740,7 +740,7 @@ def diff_contracts(old: ContractDocument, new: ContractDocument) -> ContractDiff
 
     removed_by_id = {item.id: item for key, item in before.items() if key in removed_keys}
     old_by_id = old.objects_by_id
-    valid_supersedes: dict[str, set[str]] = {}
+    transition_supersedes: dict[str, set[str]] = {}
     lineage_keys = set(added_keys) | shared_keys
     for key in lineage_keys:
         item = after[key]
@@ -748,6 +748,9 @@ def diff_contracts(old: ContractDocument, new: ContractDocument) -> ContractDiff
         new_edges = set(item.value.get("supersedes", ()))
         for predecessor in sorted(old_edges - new_edges):
             errors.append(f"removed historical supersedes edge: {item.id} -> {predecessor}")
+        for predecessor in new_edges:
+            if predecessor in removed_by_id:
+                transition_supersedes.setdefault(item.id, set()).add(predecessor)
         for predecessor in sorted(new_edges - old_edges):
             historical = old_by_id.get(predecessor)
             if historical is None:
@@ -765,13 +768,12 @@ def diff_contracts(old: ContractDocument, new: ContractDocument) -> ContractDiff
             if predecessor not in removed_by_id:
                 errors.append(f"invalid historical supersedes target is not removed for {item.id}: {predecessor}")
                 continue
-            valid_supersedes.setdefault(item.id, set()).add(predecessor)
 
-    for successor, predecessors in valid_supersedes.items():
+    for successor, predecessors in transition_supersedes.items():
         if len(predecessors) > 1:
             ambiguous.append(f"one new object supersedes multiple old objects: {successor}")
     successors_by_predecessor: dict[str, set[str]] = {}
-    for successor, predecessors in valid_supersedes.items():
+    for successor, predecessors in transition_supersedes.items():
         for predecessor in predecessors:
             successors_by_predecessor.setdefault(predecessor, set()).add(successor)
     for predecessor, successors in successors_by_predecessor.items():
@@ -783,7 +785,7 @@ def diff_contracts(old: ContractDocument, new: ContractDocument) -> ContractDiff
         kind_added_ids = {identifier for candidate_kind, identifier in added_keys if candidate_kind == kind}
         removed_ids = {identifier for candidate_kind, identifier in removed_keys if candidate_kind == kind}
         mapped = {
-            successor: valid_supersedes.get(successor, set()) & removed_ids
+            successor: transition_supersedes.get(successor, set()) & removed_ids
             for successor in kind_added_ids
         }
         mapped_back = {
@@ -812,7 +814,7 @@ def diff_contracts(old: ContractDocument, new: ContractDocument) -> ContractDiff
             successor = next(iter(successors))
             if len(exact_candidates_back[successor]) != 1:
                 continue
-            if mapped.get(successor) != {predecessor} or mapped_back.get(predecessor) != {successor}:
+            if predecessor not in transition_supersedes.get(successor, set()):
                 errors.append(
                     f"exact stable-ID replacement lacks one-to-one supersedes: {predecessor} -> {successor}"
                 )
