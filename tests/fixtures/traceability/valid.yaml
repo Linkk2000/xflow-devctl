@@ -1,0 +1,40 @@
+version: 0.1.0
+issue: "101"
+contract:
+  id: example.contract.capability-name
+  version: 0.1.0
+  file: contracts/contract.yaml
+entries:
+  - id: trace-001
+    contractObjects:
+      - example.interaction.perform-operation
+    verification: example.verify.case.operation-success
+    acceptanceCriterion: criterion-001
+    tests:
+      - path: tests/test_operation.py
+        selector: test_operation_success
+    evidence:
+      before: [evidence/api/operation-before.json]
+      after: [evidence/api/operation-after.json]
+    conclusion: resolved
+    ui:
+      claimScope: product-integration
+      surface: product
+      targetUrl: http://127.0.0.1:5173/design/42
+      pageTitle: XFlow Studio
+      modelIdentity: model-42
+      screenshot: evidence/screenshots/c-001-after.png
+      structured: evidence/dom/c-001-after.json
+  - id: trace-002
+    contractObjects:
+      - example.interaction.perform-operation
+      - example.constraint.preserve-state-on-rejection
+    verification: example.verify.case.operation-rejection
+    acceptanceCriterion: criterion-002
+    tests:
+      - path: tests/test_rejection.py
+        selector: test_operation_rejection
+    evidence:
+      before: [evidence/api/rejection-before.json]
+      after: [evidence/api/rejection-after.json]
+    conclusion: resolved

@@ -477,7 +477,7 @@ def check_resolution_report(repo_root: Path, issue: str, file_path: Path | None 
     )
     text = read_text(path)
     sections = required_sections(text, RESOLUTION_REPORT_REQUIRED_SECTIONS, "resolution-report")
-    check_issue_local_evidence(current_issue_dir, sections["## Evidence Index"], "resolution-report")
+    report_evidence = set(check_issue_local_evidence(current_issue_dir, sections["## Evidence Index"], "resolution-report"))
     validate_evidence_blocks(
         current_issue_dir,
         sections["## Completion Verification"],
@@ -507,6 +507,11 @@ def check_resolution_report(repo_root: Path, issue: str, file_path: Path | None 
             )
     if conclusion in {"resolved", "reduced"} and has_unchecked_checklist_item(sections["## AI Self-Review Result"]):
         raise ValueError("resolved/reduced resolution-report must not contain unchecked AI self-review items")
+    matrix_path = current_issue_dir / "traceability-matrix.yaml"
+    if matrix_path.exists():
+        from .traceability import check_traceability_resolution
+
+        check_traceability_resolution(repo_root, issue, conclusion, report_evidence)
     return path
 
 

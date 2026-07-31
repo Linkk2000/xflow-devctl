@@ -9,6 +9,7 @@ from pathlib import Path
 
 from . import approval, attachment, providers, rules, unattended
 from .contracts import contract_diff_exit_code, diff_contracts, load_contract, render_contract_diff, validate_contract_acceptance
+from .traceability import check_traceability
 from .checks import (
     check_current_task,
     check_gap_analysis,
@@ -160,6 +161,13 @@ def build_parser() -> argparse.ArgumentParser:
     contract_diff = contract_sub.add_parser("diff")
     contract_diff.add_argument("--old", required=True, type=Path)
     contract_diff.add_argument("--new", required=True, type=Path)
+
+    trace = sub.add_parser("trace")
+    trace_sub = trace.add_subparsers(dest="trace_command", required=True)
+    trace_check = trace_sub.add_parser("check")
+    trace_check.add_argument("--issue", required=True)
+    trace_check.add_argument("--contract", required=True, type=Path)
+    trace_check.add_argument("--matrix", required=True, type=Path)
 
     unattended_parser = sub.add_parser("unattended")
     unattended_sub = unattended_parser.add_subparsers(dest="unattended_command")
@@ -435,6 +443,16 @@ def run_contract(args: argparse.Namespace) -> int:
         print(f"[INFO] contract acceptance recorded: {record}")
         return 0
     raise ValueError(f"unknown contract subcommand: {args.contract_command}")
+
+
+def run_trace(args: argparse.Namespace) -> int:
+    ctx = context()
+    if args.trace_command != "check":
+        raise ValueError(f"unknown trace subcommand: {args.trace_command}")
+    contract = load_contract(ctx.repo_root, args.contract)
+    result = check_traceability(ctx.repo_root, args.issue, contract, args.matrix)
+    print(f"[INFO] trace check passed: {result.path}")
+    return 0
 
 
 def body_from_file(path: Path | None, inline: str | None, required_message: str) -> tuple[str, Path]:
@@ -1347,6 +1365,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_task(args)
         if args.command == "contract":
             return run_contract(args)
+        if args.command == "trace":
+            return run_trace(args)
         if args.command == "issue":
             return run_issue(args)
         if args.command == "git":

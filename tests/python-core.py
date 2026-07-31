@@ -1493,6 +1493,44 @@ def test_resolution_report_dependency_closure(repo: Path) -> None:
         check_resolution_report(repo, "IK152D")
 
 
+def test_resolution_report_traceability_closure(repo: Path) -> None:
+    fixture_root = OPS_ROOT / "tests" / "fixtures"
+    write(repo / ".xflow" / "xflow.json", '{"contracts":{"root":"contracts"}}\n')
+    (repo / "contracts").mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(fixture_root / "contracts" / "valid.yaml", repo / "contracts" / "contract.yaml")
+    issue_root = repo / ".xflow" / "issues" / "issue-101"
+    issue_root.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(fixture_root / "traceability" / "valid.yaml", issue_root / "traceability-matrix.yaml")
+    for relative in (
+        "tests/test_operation.py",
+        "tests/test_rejection.py",
+        "evidence/api/operation-before.json",
+        "evidence/api/operation-after.json",
+        "evidence/api/rejection-before.json",
+        "evidence/api/rejection-after.json",
+        "evidence/screenshots/c-001-after.png",
+        "evidence/dom/c-001-after.json",
+    ):
+        write(issue_root / relative, f"trace fixture: {relative}\n")
+    report = resolution_report_text("resolved").replace(
+        "- [resolution note](evidence/resolution-note.txt)",
+        "- [operation after](evidence/api/operation-after.json)\n- [rejection after](evidence/api/rejection-after.json)",
+    )
+    write(issue_root / "resolution-report.md", report)
+    check_resolution_report(repo, "101")
+
+    matrix = issue_root / "traceability-matrix.yaml"
+    write(matrix, matrix.read_text(encoding="utf-8").replace("conclusion: resolved", "conclusion: reduced", 1))
+    try:
+        check_resolution_report(repo, "101")
+    except ValueError as exc:
+        assert "every trace entry to be resolved" in str(exc), str(exc)
+    else:
+        raise AssertionError("resolved report should reject reduced trace entry")
+    write(issue_root / "resolution-report.md", report.replace("resolved: dependency impact is recorded.", "reduced: dependency impact is recorded."))
+    check_resolution_report(repo, "101")
+
+
 def assert_commit_message_error(message: str, expected: str, branch_issue: str | None = None) -> None:
     try:
         check_commit_message(message, branch_issue=branch_issue)
@@ -2520,6 +2558,7 @@ def main() -> None:
         test_issue_identifiers_are_portable(repo)
         test_dependency_parser(repo)
         test_resolution_report_dependency_closure(repo / "dependency-closure")
+        test_resolution_report_traceability_closure(repo / "traceability-closure")
         test_commit_message_validator()
         test_commit_message_cli(repo / "commit-message-cli")
         test_commit_message_generator(repo / "commit-message-generator")
