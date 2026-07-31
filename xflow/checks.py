@@ -17,6 +17,7 @@ from .local_artifacts import (
     safe_relative_reference,
 )
 from .collaboration import repository_locked
+from .contracts import normalize_verification_type
 from .paths import normalized_issue
 from .project_config import require_safe_repo_path
 
@@ -178,16 +179,27 @@ def git_config(repo_root: Path, key: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
+@repository_locked
 def check_current_task(repo_root: Path, issue: str | None = None, *, check_stale_pr: bool = True) -> None:
     from .task_state import check_task_binding
     from .bindings import fingerprint, git_path
-    from .paths import active_task_pointer_file
+    from .paths import active_task_pointer_file, legacy_active_task_pointer_file
 
     worktree = git_path(repo_root, "--show-toplevel")
     worktree_fingerprint = fingerprint("worktree", worktree)
-    if active_task_pointer_file(repo_root, worktree_fingerprint).exists():
+    pointer = active_task_pointer_file(repo_root, worktree_fingerprint)
+    legacy_pointer = legacy_active_task_pointer_file(repo_root, worktree_fingerprint)
+    if pointer.exists() or legacy_pointer.exists():
         check_task_binding(repo_root, issue)
         return
+    issues = repo_root.resolve() / ".xflow" / "issues"
+    modern_authority = any(
+        candidate.is_file()
+        for pattern in ("issue-*/task-state.md", "issue-*/classification.yaml", "issue-*/traceability-matrix.yaml")
+        for candidate in issues.glob(pattern)
+    ) if issues.is_dir() else False
+    if modern_authority:
+        raise ValueError(f"missing active task pointer: {pointer}")
     path = repo_root / ".xflow" / "current-task.md"
     if not path.is_file():
         raise ValueError(f"missing current task state file: {path}")
@@ -372,9 +384,7 @@ def validate_evidence_bundle(
     evidence_snapshots = issue_local_evidence_snapshots(current_issue_dir, fields[evidence_field], label)
     evidence_paths = [snapshot.path for snapshot in evidence_snapshots]
     require_checklist_item(fields[human_review_field], f"{label} Human Review")
-    evidence_type = fields[type_field].strip().lower()
-    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", evidence_type):
-        raise ValueError(f"{label} {type_field[5:]} must be a canonical verification type")
+    evidence_type = normalize_verification_type(fields[type_field], f"{label} {type_field[5:]}")
     if evidence_type not in UI_EVIDENCE_VERIFICATION_TYPES:
         return tuple(evidence_snapshots)
 
@@ -576,7 +586,13 @@ def check_resolution_report(repo_root: Path, issue: str, file_path: Path | None 
         fields = required_subsections(content, COMPLETION_VERIFICATION_REQUIRED_SECTIONS, f"resolution-report criterion {number}")
         if number in report_criteria:
             raise ValueError("resolution-report Criterion C-NNN bindings must be unique")
-        report_criteria[number] = (title.strip(), fields["#### Verification Type"].strip().lower())
+        report_criteria[number] = (
+            title.strip(),
+            normalize_verification_type(
+                fields["#### Verification Type"],
+                f"resolution-report criterion {number} Verification Type",
+            ),
+        )
     if len(report_criteria) != len(set(report_criteria)):
         raise ValueError("resolution-report Criterion C-NNN bindings must be unique")
     dependency_snapshot = capture_stable_file(

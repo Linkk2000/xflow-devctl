@@ -9,7 +9,7 @@ from io import BytesIO
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
-from urllib.parse import urlparse
+from urllib.parse import urlsplit, urlunsplit
 
 from PIL import Image, UnidentifiedImageError
 
@@ -28,6 +28,7 @@ from .contracts import (
     _identifier as contract_identifier,
     _parse_contract_yaml,
     _validate_contract_schema,
+    normalize_verification_type,
 )
 from .local_artifacts import (
     MAX_IMAGE_EVIDENCE_BYTES,
@@ -40,9 +41,15 @@ from .local_artifacts import (
     revalidate_snapshots,
     safe_relative_reference,
 )
-from .paths import active_task_pointer_file, normalized_issue
+from .paths import active_task_pointer_file, legacy_active_task_pointer_file, normalized_issue
 from .project_config import require_safe_repo_path
-from .task_state import TaskState, _pointer, parse_task_state_text
+from .task_state import (
+    TaskState,
+    _pointer,
+    _validate_pointer_state,
+    load_active_pointer,
+    parse_task_state_text,
+)
 
 
 SUPPORTED_VERSION = "0.1.0"
@@ -235,6 +242,9 @@ def _load_context(
     bindings = resolve_bindings(root)
     common_dir = git_path(root, "--git-common-dir")
     pointer_path = active_task_pointer_file(root, bindings.worktree)
+    legacy_pointer_path = legacy_active_task_pointer_file(root, bindings.worktree)
+    if pointer_path.is_file() or legacy_pointer_path.is_file():
+        load_active_pointer(root)
     pointer_snapshot = capture_stable_file(
         common_dir,
         pointer_path,
@@ -310,12 +320,13 @@ def _load_context(
         )
         if state.issue != normalized_issue(issue):
             raise ValueError(f"task-state Issue mismatch: expected {normalized_issue(issue)}, found {state.issue}")
+        _validate_pointer_state(pointer, state, bindings)
     else:
         raise ValueError("active contract closure requires matching task-state.md")
 
-    modern_contract = state.contract != "legacy.current-task@0.1.0"
-    required = matrix_snapshot.exists or modern_contract or classification_snapshot.exists
-    if not required:
+    if pointer.taskMode == "legacy":
+        if classification_snapshot.exists or matrix_snapshot.exists:
+            raise ValueError("legacy active task pointer conflicts with modern contract authority")
         return _ClosureContext(root, issue_directory, False, state, None, None, None, tuple(tracked))
     if not classification_snapshot.exists:
         raise ValueError("contract-bearing Issue requires classification.yaml")
@@ -372,7 +383,7 @@ def _load_context(
             "worktree": bindings.worktree,
             "issue": state.issue,
             "approvalIssue": state.issue,
-            "branch": state.branch,
+            "branch": bindings.branch,
             "approvedFile": approval.display_path(root, contract.path),
             "approvedSha256": contract.sha256,
             "contractId": contract.raw["id"],
@@ -458,7 +469,42 @@ def _verification_types(verification: object) -> tuple[str, ...]:
     value = verification.value  # type: ignore[attr-defined]
     methods = value["verifyBy"]
     assert isinstance(methods, list)
-    return tuple(str(method["type"]).strip().lower() for method in methods if isinstance(method, dict))
+    return tuple(
+        normalize_verification_type(method["type"], "verificationMatrix.verifyBy.type")
+        for method in methods
+        if isinstance(method, dict)
+    )
+
+
+def _product_targets(verification: object) -> tuple[str, ...]:
+    value = verification.value  # type: ignore[attr-defined]
+    methods = value["verifyBy"]
+    assert isinstance(methods, list)
+    return tuple(
+        _meaningful(method["target"], "verificationMatrix.verifyBy.target")
+        for method in methods
+        if isinstance(method, dict)
+        and normalize_verification_type(method["type"], "verificationMatrix.verifyBy.type")
+        == "product-integration"
+    )
+
+
+def _normalize_http_url(value: object, label: str) -> tuple[str, str]:
+    text = _meaningful(value, label)
+    try:
+        parsed = urlsplit(text)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{label} must be a complete HTTP(S) URL") from exc
+    scheme = parsed.scheme.casefold()
+    if scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError(f"{label} must be a complete HTTP(S) URL")
+    hostname = parsed.hostname.casefold()
+    normalized_host = f"[{hostname}]" if ":" in hostname else hostname
+    if port is not None and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+        normalized_host = f"{normalized_host}:{port}"
+    normalized = urlunsplit((scheme, normalized_host, parsed.path or "/", parsed.query, parsed.fragment))
+    return text, normalized
 
 
 def _validate_image(content: bytes) -> None:
@@ -471,7 +517,13 @@ def _validate_image(content: bytes) -> None:
                 candidate.verify()
             with Image.open(BytesIO(content)) as decoded:
                 decoded.load()
-    except (OSError, SyntaxError, UnidentifiedImageError, Image.DecompressionBombWarning) as exc:
+    except (
+        OSError,
+        SyntaxError,
+        UnidentifiedImageError,
+        Image.DecompressionBombWarning,
+        Image.DecompressionBombError,
+    ) as exc:
         raise ValueError("ui.screenshot must be a fully decodable PNG/JPEG/WebP image") from exc
 
 
@@ -498,10 +550,19 @@ def _verify_ui(
             raise ValueError("product-integration requires ui.surface: product")
     elif surface != "component-harness":
         raise ValueError("component-harness cannot claim product integration")
-    target_url = _meaningful(ui["targetUrl"], "ui.targetUrl")
-    parsed = urlparse(target_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("ui.targetUrl must be a complete HTTP(S) URL")
+    target_url, normalized_target_url = _normalize_http_url(ui["targetUrl"], "ui.targetUrl")
+    if "product-integration" in verification_types:
+        normalized_product_targets = []
+        for target in _product_targets(verification):
+            try:
+                _, normalized_target = _normalize_http_url(target, "product-integration verifyBy.target")
+            except ValueError as exc:
+                raise ValueError("product-integration verifyBy.target must be a complete HTTP(S) URL") from exc
+            normalized_product_targets.append(normalized_target)
+        if not normalized_product_targets or any(
+            target != normalized_target_url for target in normalized_product_targets
+        ):
+            raise ValueError("ui.targetUrl must match product-integration verifyBy.target after normalization")
     page_title = _meaningful(ui["pageTitle"], "ui.pageTitle")
     model_identity = _meaningful(ui["modelIdentity"], "ui.modelIdentity")
     if contains_forbidden_remote_reference(page_title) or contains_forbidden_remote_reference(model_identity):
@@ -816,6 +877,31 @@ def _revalidate(root: Path, snapshots: tuple[tuple[StableFileSnapshot, str], ...
         revalidate_snapshots(root, (snapshot,), label)
 
 
+def _compatibility_evidence_limit(context: _ClosureContext, path: Path) -> int:
+    try:
+        relative = path.resolve(strict=False).relative_to(context.issue_directory).as_posix()
+    except ValueError:
+        relative = ""
+    screenshot_refs: set[str] = set()
+    structured_refs: set[str] = set()
+    if context.matrix_document is not None:
+        raw_entries = context.matrix_document.get("entries")
+        if isinstance(raw_entries, list):
+            for raw_entry in raw_entries:
+                if not isinstance(raw_entry, dict) or not isinstance(raw_entry.get("ui"), dict):
+                    continue
+                ui = raw_entry["ui"]
+                if isinstance(ui.get("screenshot"), str):
+                    screenshot_refs.add(ui["screenshot"])
+                if isinstance(ui.get("structured"), str):
+                    structured_refs.add(ui["structured"])
+    if relative in screenshot_refs or path.suffix.casefold() in {".png", ".jpg", ".jpeg", ".webp"}:
+        return MAX_IMAGE_EVIDENCE_BYTES
+    if relative in structured_refs or path.suffix.casefold() == ".json":
+        return MAX_STRUCTURED_EVIDENCE_BYTES
+    return MAX_TEXT_ARTIFACT_BYTES
+
+
 @repository_locked
 def check_traceability(
     repo_root: Path,
@@ -847,7 +933,13 @@ def check_traceability_resolution(
     report_snapshots: tuple[StableFileSnapshot, ...]
     if isinstance(report_evidence, set):
         report_snapshots = tuple(
-            capture_stable_file(context.root, path, context.issue_directory, "resolution-report indexed evidence")
+            capture_stable_file(
+                context.root,
+                path,
+                context.issue_directory,
+                "resolution-report indexed evidence",
+                max_bytes=_compatibility_evidence_limit(context, path),
+            )
             for path in sorted(report_evidence)
         )
     else:

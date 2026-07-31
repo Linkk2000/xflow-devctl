@@ -41,3 +41,14 @@ def active_task_pointer_file(repo_root: Path, worktree_fingerprint: str) -> Path
 
     common_dir = git_path(repo_root, "--git-common-dir")
     return common_dir / "xflow" / "local" / "worktrees" / worktree_fingerprint / "active-task.json"
+
+
+def legacy_active_task_pointer_file(repo_root: Path, worktree_fingerprint: str) -> Path:
+    return (
+        repo_root.resolve()
+        / ".xflow"
+        / "local"
+        / "worktrees"
+        / worktree_fingerprint
+        / "active-task.json"
+    )

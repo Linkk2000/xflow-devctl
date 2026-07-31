@@ -13,7 +13,7 @@ sys.path.insert(0, str(OPS_ROOT))
 
 from xflow.bindings import resolve_bindings
 from xflow.checks import check_current_task
-from xflow.paths import active_task_pointer_file
+from xflow.paths import active_task_pointer_file, legacy_active_task_pointer_file
 from xflow.task_state import (
     TaskState,
     activate_task,
@@ -76,6 +76,7 @@ def run_devctl(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONIOENCODING": "utf-8",
         "PYTHONPATH": str(OPS_ROOT),
+        "XFLOW_COLLABORATION_LOCK_TIMEOUT": "0.2",
     }
     result = subprocess.run(
         [sys.executable, "-m", "xflow", *args],
@@ -88,6 +89,49 @@ def run_devctl(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
     assert result.returncode == 0, result.stderr
     return result
+
+
+def v1_pointer(payload: dict[str, object]) -> dict[str, object]:
+    return {
+        "version": 1,
+        "repository": payload["repository"],
+        "worktree": payload["worktree"],
+        "branch": payload["branch"],
+        "issue": payload["issue"],
+        "activatedAt": payload["activatedAt"],
+    }
+
+
+def test_git_hook_devctl_reentry(root: Path) -> None:
+    repo = root / "hook-reentry"
+    git(root, "init", "-q", str(repo))
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test User")
+    git(repo, "checkout", "-b", "feature/77-hook", "-q")
+    write(repo / "README.md", "# Hook reentry\n")
+    git(repo, "add", "README.md")
+    git(repo, "commit", "-m", "test: initialize hook fixture", "-q")
+    write_state(repo, state("77", "feature/77-hook"))
+    activate_task(repo, "77")
+    git(repo, "config", "extensions.worktreeConfig", "true")
+    git(repo, "config", "--worktree", "devctl.issue", "77")
+
+    hook_result = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--git-path", "hooks/pre-commit"],
+        check=True,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    hook = Path(hook_result.stdout.strip())
+    if not hook.is_absolute():
+        hook = repo / hook
+    python_executable = Path(sys.executable).as_posix()
+    write(hook, f'#!/bin/sh\n"{python_executable}" -m xflow task status >/dev/null\n')
+    hook.chmod(0o755)
+    write(repo / "README.md", "# Hook reentry\n\nchanged\n")
+    run_devctl(repo, "git", "commit-msg", "-a", "-c", "验证钩子重入")
 
 
 def main() -> None:
@@ -121,9 +165,48 @@ def main() -> None:
 
         pointer = active_task_pointer_file(worktree_a, resolve_bindings(worktree_a).worktree)
         payload = json.loads(pointer.read_text(encoding="utf-8"))
-        assert set(payload) == {"version", "repository", "worktree", "branch", "issue", "activatedAt"}
-        assert payload["version"] == 1
+        assert set(payload) == {
+            "version", "repository", "worktree", "branch", "issue", "taskMode",
+            "contractId", "contractVersion", "contractFile", "activatedAt",
+        }
+        assert payload["version"] == 2
         assert payload["issue"] == "101"
+        assert payload["taskMode"] == "modern-contract"
+        assert payload["contractId"] == "example.contract.capability-name"
+        assert payload["contractVersion"] == "0.1.0"
+        assert payload["contractFile"] == "docs/requirements/example/contract.yaml"
+
+        old_payload = v1_pointer(payload)
+        write(pointer, json.dumps(old_payload, ensure_ascii=True, indent=2) + "\n")
+        assert load_active_task(worktree_a).issue == "101"
+        migrated_payload = json.loads(pointer.read_text(encoding="utf-8"))
+        assert migrated_payload["version"] == 2
+        assert migrated_payload["taskMode"] == "modern-contract"
+
+        old_location = legacy_active_task_pointer_file(worktree_a, resolve_bindings(worktree_a).worktree)
+        pointer.unlink()
+        write(old_location, json.dumps(old_payload, ensure_ascii=True, indent=2) + "\n")
+        check_current_task(worktree_a, "101")
+        assert pointer.is_file()
+        assert not old_location.exists()
+        assert json.loads(pointer.read_text(encoding="utf-8"))["version"] == 2
+
+        write(old_location, json.dumps(old_payload, ensure_ascii=True, indent=2) + "\n")
+        assert_value_error("conflicting active task pointers", lambda: load_active_task(worktree_a))
+        old_location.unlink()
+
+        pointer.unlink()
+        stale_payload = {**old_payload, "branch": "feature/stale"}
+        write(old_location, json.dumps(stale_payload, ensure_ascii=True, indent=2) + "\n")
+        write(
+            worktree_a / ".xflow" / "current-task.md",
+            "# XFlow Current Task\n\nIssue: 101\nState: S2_REMOTE_ISSUE_CREATED\n\n"
+            "## Allowed Actions\n- clarify-contract\n\n## Forbidden Actions\n- push\n",
+        )
+        assert_value_error("active task branch mismatch", lambda: check_current_task(worktree_a, "101"))
+        old_location.unlink()
+        assert_value_error("active task pointer", lambda: check_current_task(worktree_a, "101"))
+        activate_task(worktree_a, "101")
 
         git(worktree_a, "checkout", "-b", "feature/303-c", "-q")
         assert_value_error("active task branch mismatch", lambda: load_active_task(worktree_a))
@@ -200,6 +283,18 @@ def main() -> None:
         write(legacy, "# XFlow Current Task\n\nIssue: LEGACY7\nState: S2_REMOTE_ISSUE_CREATED\n\n## Allowed Actions\n- clarify-contract\n\n## Forbidden Actions\n- push\n")
         migrated = migrate_legacy_current_task(worktree_a)
         assert migrated.issue == "LEGACY7"
+        assert load_active_task(worktree_a).issue == "LEGACY7"
+        legacy_payload = json.loads(active_task_pointer_file(worktree_a, resolve_bindings(worktree_a).worktree).read_text(encoding="utf-8"))
+        assert legacy_payload["taskMode"] == "legacy"
+        assert legacy_payload["contractId"] == "legacy.current-task"
+        assert legacy_payload["contractVersion"] == "0.1.0"
+        assert legacy_payload["contractFile"] == ".xflow/current-task.md"
+        write(
+            active_task_pointer_file(worktree_a, resolve_bindings(worktree_a).worktree),
+            json.dumps(v1_pointer(legacy_payload), ensure_ascii=True, indent=2) + "\n",
+        )
+        assert_value_error("cannot be migrated safely", lambda: load_active_task(worktree_a))
+        activate_task(worktree_a, "LEGACY7")
         assert legacy.is_file()
         migrated_path = worktree_a / ".xflow" / "issues" / "issue-LEGACY7" / "task-state.md"
         assert migrated_path.is_file()
@@ -219,6 +314,9 @@ def main() -> None:
         assert "#101" in listed.stdout
         migrated_output = run_devctl(worktree_a, "task", "migrate-current")
         assert "CLI7" in migrated_output.stdout
+        assert load_active_task(worktree_a).issue == "CLI7"
+
+        test_git_hook_devctl_reentry(root)
 
     print("task state ok")
 

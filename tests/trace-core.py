@@ -433,17 +433,33 @@ def test_durable_closure_and_authoritative_bindings(repo: Path) -> None:
     hidden_contract.rename(contract_path)
 
     state = path.with_name("task-state.md")
+    classification = path.with_name("classification.yaml")
     original_state = state.read_text(encoding="utf-8")
     write(state, original_state.replace("Contract: example.contract.capability-name@0.1.0", "Contract: unrelated.contract@9.9.9"))
     contract = load_contract(repo, repo / "contracts" / "contract.yaml")
-    assert_error("task-state Contract does not match matrix contract", lambda: check_traceability(repo, "101", contract, path))
+    assert_error("active task pointer contract binding mismatch", lambda: check_traceability(repo, "101", contract, path))
+    write(state, original_state)
+
+    write(state, original_state.replace("Branch: main", "Branch: feature/stale"))
+    assert_error("task-state branch mismatch", lambda: check_resolution_report(repo, "101"))
+    write(state, original_state)
+
+    downgraded_state = original_state.replace(
+        "Contract: example.contract.capability-name@0.1.0",
+        "Contract: legacy.current-task@0.1.0",
+    ).replace("Contract File: contracts/contract.yaml", "Contract File: .xflow/current-task.md")
+    write(state, downgraded_state)
+    classification.rename(hidden_classification := classification.with_suffix(".downgrade-hidden"))
+    path.rename(hidden_matrix := path.with_suffix(".downgrade-hidden"))
+    assert_error("active task pointer contract binding mismatch", lambda: check_resolution_report(repo, "101"))
+    hidden_classification.rename(classification)
+    hidden_matrix.rename(path)
     write(state, original_state)
 
     write(state, original_state.replace("Semantic Phase: classified", "Semantic Phase: accepted-design"))
     assert_error("Human Approval Ref is required", lambda: check_traceability(repo, "101", contract, path))
     write(state, original_state)
 
-    classification = path.with_name("classification.yaml")
     original_classification = classification.read_text(encoding="utf-8")
     write(classification, original_classification.replace("refs: [contracts/contract.yaml]", "refs: [contracts/unrelated.yaml]"))
     assert_error("classification contractSearch.refs", lambda: check_traceability(repo, "101", contract, path))
@@ -576,6 +592,54 @@ def test_contract_derived_ui_obligations(repo: Path) -> None:
     write(path, baseline.replace("claimScope: product-integration\n      surface: product", "claimScope: component-harness\n      surface: component-harness"))
     assert_error("product-integration verification requires", lambda: check_traceability(repo, "101", contract, path))
 
+    prepare_valid_chain(repo)
+    contract = load_contract(repo, contract_path)
+    baseline = path.read_text(encoding="utf-8")
+    structured = path.parent / "evidence" / "dom" / "c-001-after.json"
+    structured_text = structured.read_text(encoding="utf-8")
+    write(path, baseline.replace("http://127.0.0.1:5173/design/42", "https://example.test/component-harness"))
+    write(structured, structured_text.replace("http://127.0.0.1:5173/design/42", "https://example.test/component-harness"))
+    assert_error("must match product-integration verifyBy.target", lambda: check_traceability(repo, "101", contract, path))
+
+    prepare_valid_chain(repo)
+    contract_text = contract_path.read_text(encoding="utf-8")
+    write(
+        contract_path,
+        contract_text.replace(
+            "target: http://127.0.0.1:5173/design/42",
+            "target: product-environment",
+            1,
+        ),
+    )
+    contract = load_contract(repo, contract_path)
+    assert_error("product-integration verifyBy.target must be a complete HTTP(S) URL", lambda: check_traceability(repo, "101", contract, path))
+
+    prepare_valid_chain(repo)
+    contract_text = contract_path.read_text(encoding="utf-8")
+    write(
+        contract_path,
+        contract_text.replace(
+            "target: http://127.0.0.1:5173/design/42",
+            "target: HTTP://127.0.0.1:80/design/42",
+            1,
+        ),
+    )
+    baseline = path.read_text(encoding="utf-8")
+    write(path, baseline.replace("http://127.0.0.1:5173/design/42", "http://127.0.0.1/design/42"))
+    structured = path.parent / "evidence" / "dom" / "c-001-after.json"
+    write(
+        structured,
+        structured.read_text(encoding="utf-8").replace(
+            "http://127.0.0.1:5173/design/42",
+            "http://127.0.0.1/design/42",
+        ),
+    )
+    check_traceability(repo, "101", load_contract(repo, contract_path), path)
+
+    prepare_valid_chain(repo)
+    contract = load_contract(repo, contract_path)
+    baseline = path.read_text(encoding="utf-8")
+    screenshot = path.parent / "evidence" / "screenshots" / "c-001-after.png"
     write(path, baseline)
     write_image(screenshot, size=(512, 512), random_pixels=True)
     assert screenshot.stat().st_size > 262_144
@@ -587,6 +651,14 @@ def test_contract_derived_ui_obligations(repo: Path) -> None:
         write_image(screenshot, image_format=image_format)
         os.utime(screenshot, ns=(time.time_ns(), time.time_ns()))
         check_traceability(repo, "101", contract, path)
+
+    prepare_valid_chain(repo)
+    screenshot = path.parent / "evidence" / "screenshots" / "c-001-after.png"
+    with patch.object(Image, "MAX_IMAGE_PIXELS", 1):
+        assert_error(
+            "fully decodable PNG/JPEG/WebP",
+            lambda: traceability_module._validate_image(screenshot.read_bytes()),
+        )
 
 
 def test_criteria_schema_and_exact_conclusions(repo: Path) -> None:
@@ -638,6 +710,31 @@ def test_criteria_schema_and_exact_conclusions(repo: Path) -> None:
     write(report, report_text.replace("#### Verification Type\nproduct-integration", "#### Verification Type\nui"))
     assert_error("Verification Type must match matrix verification", lambda: check_resolution_report(repo, "101"))
 
+    for verification_type in ("manual review", "人工验收"):
+        prepare_valid_chain(repo)
+        contract_path = repo / "contracts" / "contract.yaml"
+        write(
+            contract_path,
+            contract_path.read_text(encoding="utf-8").replace(
+                "type: automated",
+                f"type: {verification_type}",
+                1,
+            ),
+        )
+        report = write_resolution_report(repo)
+        write(
+            report,
+            report.read_text(encoding="utf-8").replace(
+                "#### Verification Type\nautomated",
+                f"#### Verification Type\n{verification_type}",
+                1,
+            ),
+        )
+        check_resolution_report(repo, "101")
+
+    prepare_valid_chain(repo)
+    report = write_resolution_report(repo)
+    report_text = report.read_text(encoding="utf-8")
     conclusion_cases = (
         ("Conclusion: resolved\nReason: Trace conclusions match this report.", "Not resolved: blocked by an unavailable environment", "canonical Conclusion field"),
         ("Conclusion: resolved\nReason: Trace conclusions match this report.", "Conclusion: resolved blocked\nReason: contradictory", "canonical Conclusion field"),
@@ -984,6 +1081,19 @@ def test_caller_specific_size_limits(repo: Path) -> None:
     with screenshot.open("r+b") as stream:
         stream.truncate(64 * 1024 * 1024 + 1)
     assert_error("screenshot evidence exceeds 67108864 bytes", lambda: check_traceability(repo, "101", load_contract(repo, contract_path), path))
+
+    prepare_valid_chain(repo)
+    screenshot = path.parent / "evidence" / "screenshots" / "c-001-after.png"
+    write_image(screenshot, size=(512, 512), random_pixels=True)
+    assert screenshot.stat().st_size > 262_144
+    os.utime(screenshot, ns=(time.time_ns(), time.time_ns()))
+    report_evidence = {
+        path.parent / "evidence" / "api" / "operation-after.json",
+        screenshot,
+        path.parent / "evidence" / "dom" / "c-001-after.json",
+        path.parent / "evidence" / "api" / "rejection-after.json",
+    }
+    check_traceability_resolution(repo, "101", "resolved", report_evidence)
 
 
 def test_exact_schema_rejections(repo: Path) -> None:

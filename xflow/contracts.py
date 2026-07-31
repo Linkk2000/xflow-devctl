@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -117,6 +118,10 @@ def _meaningful(value: object, label: str) -> str:
     if not text or text.translate(_ASCII_CASEFOLD) in _PLACEHOLDERS:
         raise ValueError(f"{label} must be meaningful")
     return text
+
+
+def normalize_verification_type(value: object, label: str = "verification type") -> str:
+    return unicodedata.normalize("NFC", _meaningful(value, label)).casefold()
 
 
 def _identifier(value: object, label: str) -> str:
@@ -418,7 +423,7 @@ def _build_document(path: Path, raw: dict[str, object], raw_bytes: bytes) -> Con
             _meaningful(item.value[field], f"verificationMatrix.{field}")
         for method in _items(item.value["verifyBy"], "verificationMatrix.verifyBy"):
             mapped = _mapping(method, "verificationMatrix.verifyBy item", {"type", "target"})
-            _meaningful(mapped["type"], "verificationMatrix.verifyBy.type")
+            normalize_verification_type(mapped["type"], "verificationMatrix.verifyBy.type")
             _meaningful(mapped["target"], "verificationMatrix.verifyBy.target")
         _add_object(objects, item)
     for value in _items(raw["engineeringProjections"], "engineeringProjections", allow_empty=True):

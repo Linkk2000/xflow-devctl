@@ -23,7 +23,14 @@ from xflow import approval
 from xflow import contracts as contracts_module
 from xflow import project_config
 from xflow.contracts import ContractDocument, load_contract, validate_contract_acceptance
-from xflow.task_state import TaskState, list_task_states, parse_task_state, render_task_state
+from xflow.task_state import (
+    TaskState,
+    activate_task,
+    list_task_states,
+    migrate_legacy_current_task,
+    parse_task_state,
+    render_task_state,
+)
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "contracts" / "valid.yaml"
@@ -118,6 +125,11 @@ def current_task(issue: str) -> str:
         "## Forbidden Actions\n"
         "- Push.\n"
     )
+
+
+def activate_legacy_current_task(repo: Path, issue: str) -> TaskState:
+    write(repo / ".xflow" / "current-task.md", current_task(issue))
+    return migrate_legacy_current_task(repo)
 
 
 def task_state(issue: str, branch: str, approval_ref: str) -> TaskState:
@@ -315,8 +327,17 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
     issue = "101"
     write(repo / ".xflow" / "current-task.md", current_task(issue))
     state_path = repo / ".xflow" / "issues" / "issue-101" / "task-state.md"
-    write(state_path, render_task_state(task_state(issue, "feature/101-contract", "approvals/history/missing.yaml")))
+    accepted_state = task_state(issue, "feature/101-contract", "approvals/history/missing.yaml")
+    pre_acceptance_state = dataclass_replace(
+        accepted_state,
+        semantic_phase="classified",
+        human_approval_ref="none",
+    )
+    write(state_path, render_task_state(pre_acceptance_state))
+    activate_task(repo, issue)
+    write(state_path, render_task_state(accepted_state))
     assert_value_error("missing matching human contract acceptance", lambda: parse_task_state(state_path))
+    write(state_path, render_task_state(pre_acceptance_state))
     assert_value_error(
         "local review approval required",
         lambda: validate_contract_acceptance(repo, issue, contract, ("example.capability.capability-name",)),
@@ -378,7 +399,7 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
     assert "approvalClaimFile:" in record
     assert "approvalClaimSha256:" not in record
     assert contract.path.read_bytes() == FIXTURE.read_bytes()
-    assert "Semantic Phase: accepted-design" in state_path.read_text(encoding="utf-8")
+    assert "Semantic Phase: classified" in state_path.read_text(encoding="utf-8")
 
     reference = accepted.relative_to(state_path.parent).as_posix()
     write(state_path, render_task_state(task_state(issue, "feature/101-contract", reference)))
@@ -497,7 +518,7 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
 
 def test_draft_rejection_and_bom_acceptance(repo: Path) -> None:
     issue = "102"
-    write(repo / ".xflow" / "current-task.md", current_task(issue))
+    legacy_state = activate_legacy_current_task(repo, issue)
     draft_path = copied_contract(repo, "draft.yaml")
     replace(draft_path, "status: accepted-design", "status: draft")
     draft = load_contract(repo, draft_path)
@@ -530,7 +551,8 @@ def test_draft_rejection_and_bom_acceptance(repo: Path) -> None:
     )
     write(stale_state_path, render_task_state(stale_state))
     assert_value_error("contract status is incompatible", lambda: parse_task_state(stale_state_path))
-    stale_state_path.unlink()
+    write(stale_state_path, render_task_state(legacy_state))
+    activate_task(repo, issue)
 
     bom_path = repo / "contracts" / "bom.yaml"
     bom_path.write_bytes(b"\xef\xbb\xbf" + FIXTURE.read_bytes())
@@ -581,7 +603,7 @@ def test_windows_final_path_normalization_keeps_lock_containment(repo: Path) -> 
 def test_atomic_contract_acceptance_claim(repo: Path) -> None:
     for run in range(5):
         issue = f"15{run}"
-        write(repo / ".xflow" / "current-task.md", current_task(issue))
+        activate_legacy_current_task(repo, issue)
         contract = load_contract(repo, copied_contract(repo, f"concurrent-{run}.yaml"))
         review = approval.prepare(
             repo, issue, "contract-acceptance", contract.path, reviewer="reviewer", force=True,
@@ -618,7 +640,7 @@ def test_contract_acceptance_recovers_partial_publication(repo: Path) -> None:
         ("106", "archived contract approval collision", True),
     )
     for issue, failure_point, archive_expected in cases:
-        write(repo / ".xflow" / "current-task.md", current_task(issue))
+        legacy_state = activate_legacy_current_task(repo, issue)
         contract = load_contract(repo, copied_contract(repo, f"recover-{issue}.yaml"))
         review = approval.prepare(
             repo,
@@ -686,6 +708,8 @@ def test_contract_acceptance_recovers_partial_publication(repo: Path) -> None:
         )
         write(state_path, render_task_state(recovered_state))
         assert parse_task_state(state_path).human_approval_ref == reference
+        write(state_path, render_task_state(legacy_state))
+        activate_task(repo, issue)
         original_history = accepted.read_bytes()
         accepted.write_bytes(original_history.replace(b"reviewerSummary: reviewer", b"reviewerSummary: changed"))
         assert_value_error(
@@ -706,7 +730,7 @@ def test_contract_acceptance_recovers_partial_publication(repo: Path) -> None:
 
 def test_contract_acceptance_history_names_include_approval_id(repo: Path) -> None:
     issue = "107"
-    write(repo / ".xflow" / "current-task.md", current_task(issue))
+    activate_legacy_current_task(repo, issue)
     contract = load_contract(repo, copied_contract(repo, "same-recorded-at.yaml"))
     recorded_at = "2099-01-02T03:04:05.000006Z"
     approval_ids: list[str] = []
@@ -753,7 +777,7 @@ def test_cli_contract_edges_and_historical_list(repo: Path) -> None:
     assert "AttributeError" not in bare.stderr
 
     issue = "104"
-    write(repo / ".xflow" / "current-task.md", current_task(issue))
+    activate_legacy_current_task(repo, issue)
     contract_path = copied_contract(repo, "cli.yaml")
     missing = run_devctl(
         repo, "approval", "prepare", "--issue", issue, "--action", "contract-acceptance",
