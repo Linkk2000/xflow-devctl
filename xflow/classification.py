@@ -139,7 +139,7 @@ def _read_bounded_posix(native: Any, descriptor: int, path: Path) -> bytes:
             raise ValueError(f"classification file exceeds {MAX_CLASSIFICATION_BYTES} bytes: {path}")
 
 
-def _read_stable_text_posix(repo_root: Path, path: Path, api: Any | None = None) -> str:
+def _read_stable_bytes_posix(repo_root: Path, path: Path, api: Any | None = None) -> bytes:
     native = api if api is not None else _PosixApi()
     descriptors: list[int] = []
     parts = _relative_classification_parts(repo_root, path)
@@ -197,7 +197,7 @@ def _read_stable_text_posix(repo_root: Path, path: Path, api: Any | None = None)
             raise ValueError(f"classification file changed while reading: {path}: {exc}") from exc
         if final_snapshot != initial_snapshot or second_content != first_content:
             raise ValueError(f"classification file changed while reading: {path}")
-        return _decode_classification_bytes(first_content, path)
+        return first_content
     finally:
         close_error: OSError | None = None
         for descriptor in reversed(descriptors):
@@ -207,6 +207,10 @@ def _read_stable_text_posix(repo_root: Path, path: Path, api: Any | None = None)
                 close_error = close_error or exc
         if close_error is not None:
             raise ValueError(f"cannot close classification file safely: {path}: {close_error}") from close_error
+
+
+def _read_stable_text_posix(repo_root: Path, path: Path, api: Any | None = None) -> str:
+    return _decode_classification_bytes(_read_stable_bytes_posix(repo_root, path, api), path)
 
 
 class _WindowsApi:
@@ -374,7 +378,12 @@ def _windows_path_key(path: Path) -> str:
     return os.path.normcase(os.path.normpath(str(path)))
 
 
-def _read_stable_text_windows(repo_root: Path, path: Path, issue_directory: Path, api: Any | None = None) -> str:
+def _read_stable_bytes_windows(
+    repo_root: Path,
+    path: Path,
+    issue_directory: Path,
+    api: Any | None = None,
+) -> bytes:
     native = api if api is not None else _WindowsApi()
     handles: list[int] = []
     parts = _relative_classification_parts(repo_root, path)
@@ -463,7 +472,7 @@ def _read_stable_text_windows(repo_root: Path, path: Path, issue_directory: Path
             raise ValueError(f"classification file changed while reading: {path}: {exc}") from exc
         if final_snapshot != initial_snapshot:
             raise ValueError(f"classification file changed while reading: {path}")
-        return _decode_classification_bytes(b"".join(chunks), path)
+        return b"".join(chunks)
     finally:
         close_error: OSError | None = None
         for handle in reversed(handles):
@@ -475,10 +484,21 @@ def _read_stable_text_windows(repo_root: Path, path: Path, issue_directory: Path
             raise ValueError(f"cannot close classification file safely: {path}: {close_error}") from close_error
 
 
-def _read_stable_text(repo_root: Path, path: Path, issue_directory: Path) -> str:
+def _read_stable_text_windows(repo_root: Path, path: Path, issue_directory: Path, api: Any | None = None) -> str:
+    return _decode_classification_bytes(
+        _read_stable_bytes_windows(repo_root, path, issue_directory, api),
+        path,
+    )
+
+
+def _read_stable_bytes(repo_root: Path, path: Path, issue_directory: Path) -> bytes:
     if os.name == "nt":
-        return _read_stable_text_windows(repo_root, path, issue_directory)
-    return _read_stable_text_posix(repo_root, path)
+        return _read_stable_bytes_windows(repo_root, path, issue_directory)
+    return _read_stable_bytes_posix(repo_root, path)
+
+
+def _read_stable_text(repo_root: Path, path: Path, issue_directory: Path) -> str:
+    return _decode_classification_bytes(_read_stable_bytes(repo_root, path, issue_directory), path)
 
 
 def _load_yaml(text: str) -> object:

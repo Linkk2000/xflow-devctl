@@ -150,7 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_sub.add_parser("migrate-current")
 
     contract = sub.add_parser("contract")
-    contract_sub = contract.add_subparsers(dest="contract_command")
+    contract_sub = contract.add_subparsers(dest="contract_command", required=True)
     contract_lint = contract_sub.add_parser("lint")
     contract_lint.add_argument("--file", required=True, type=Path)
     contract_accept = contract_sub.add_parser("accept")
@@ -254,6 +254,7 @@ def build_parser() -> argparse.ArgumentParser:
     approval_prepare.add_argument("--reviewer")
     approval_prepare.add_argument("--force", action="store_true")
     approval_prepare.add_argument("--attachments", type=Path)
+    approval_prepare.add_argument("--objects")
 
     attachment_parser = sub.add_parser("attachment")
     attachment_sub = attachment_parser.add_subparsers(dest="attachment_command")
@@ -420,7 +421,7 @@ def run_contract(args: argparse.Namespace) -> int:
         print(f"[INFO] contract lint passed: {contract.path}")
         return 0
     if args.contract_command == "accept":
-        object_ids = tuple(item.strip() for item in args.objects.split(",") if item.strip())
+        object_ids = tuple(args.objects.split(","))
         record = validate_contract_acceptance(ctx.repo_root, args.issue, contract, object_ids)
         print(f"[INFO] contract acceptance recorded: {record}")
         return 0
@@ -1160,6 +1161,17 @@ def run_approval(args: argparse.Namespace) -> int:
     ctx = context()
     if args.approval_command != "prepare":
         raise ValueError(f"unknown approval subcommand: {args.approval_command}")
+    accepted_objects: tuple[str, ...] | None = None
+    if args.action == "contract-acceptance":
+        if not args.objects:
+            raise ValueError("--objects is required for contract-acceptance")
+        accepted_objects = approval.normalize_accepted_objects(tuple(args.objects.split(",")))
+        contract = load_contract(ctx.repo_root, args.file)
+        missing = [identifier for identifier in accepted_objects if identifier not in contract.objects_by_id]
+        if missing:
+            raise ValueError(f"accepted contract object does not exist: {missing[0]}")
+    elif args.objects:
+        raise ValueError("--objects is only valid for contract-acceptance")
     path = approval.prepare(
         ctx.repo_root,
         args.issue,
@@ -1169,6 +1181,7 @@ def run_approval(args: argparse.Namespace) -> int:
         args.reviewer,
         args.force,
         args.attachments,
+        accepted_objects,
     )
     print(f"[INFO] local review prepared: {path}")
     return 0

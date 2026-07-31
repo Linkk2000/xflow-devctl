@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from . import approval
-from .classification import _load_yaml, _read_stable_text
+from .classification import _decode_classification_bytes, _load_yaml, _read_stable_bytes
 from .project_config import load_project_config, require_safe_repo_path
 
 
@@ -73,6 +74,11 @@ class ContractDocument:
     raw: Mapping[str, object]
     objects_by_id: Mapping[str, ContractObject]
     verification_by_id: Mapping[str, ContractObject]
+    raw_bytes: bytes
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.raw_bytes).hexdigest()
 
 
 def _mapping(value: object, label: str, required: set[str], optional: set[str] | None = None) -> dict[str, object]:
@@ -93,6 +99,8 @@ def _meaningful(value: object, label: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{label} must be a string")
     text = value.strip()
+    if value != text:
+        raise ValueError(f"{label} must not contain leading or trailing whitespace")
     if not text or text.casefold() in _PLACEHOLDERS:
         raise ValueError(f"{label} must be meaningful")
     return text
@@ -138,8 +146,15 @@ def _items(value: object, label: str, *, allow_empty: bool = False) -> list[obje
     return value
 
 
-def _object(value: object, label: str, kind: str, required: set[str]) -> ContractObject:
-    mapped = _mapping(value, label, required, _OPTIONAL_OBJECT_FIELDS)
+def _object(
+    value: object,
+    label: str,
+    kind: str,
+    required: set[str],
+    *,
+    allow_supersedes: bool = True,
+) -> ContractObject:
+    mapped = _mapping(value, label, required, _OPTIONAL_OBJECT_FIELDS if allow_supersedes else set())
     identifier = _identifier(mapped["id"], f"{label}.id")
     version = _semver(mapped["version"], f"{label}.version")
     if "supersedes" in mapped:
@@ -177,9 +192,9 @@ def _contract_path(repo_root: Path, file_path: Path) -> tuple[Path, Path]:
     return contract_root, safe_target
 
 
-def _stable_contract_text(repo_root: Path, contract_root: Path, path: Path) -> str:
+def _stable_contract_bytes(repo_root: Path, contract_root: Path, path: Path) -> bytes:
     try:
-        return _read_stable_text(repo_root, path, contract_root)
+        return _read_stable_bytes(repo_root, path, contract_root)
     except ValueError as exc:
         raise ValueError(str(exc).replace("classification", "contract")) from exc
 
@@ -189,10 +204,37 @@ def _parse_contract_yaml(text: str) -> dict[str, object]:
         raw = _load_yaml(text)
     except ValueError as exc:
         raise ValueError(str(exc).replace("classification", "contract")) from exc
-    document = _mapping(raw, "contract document", _ROOT_FIELDS)
-    if isinstance(document["created"], date):
+    if not isinstance(raw, dict) or any(not isinstance(key, str) for key in raw):
+        raise ValueError("contract document must be a mapping")
+    document = dict(raw)
+    if isinstance(document.get("created"), date):
         document["created"] = document["created"].isoformat()
     return document
+
+
+def _validate_contract_schema(document: dict[str, object]) -> None:
+    try:
+        import jsonschema
+    except ImportError as exc:
+        raise ValueError(
+            "contract checks require jsonschema; run: python -m pip install -r requirements.txt"
+        ) from exc
+
+    schema_path = Path(__file__).resolve().parents[1] / "schemas" / "capability-contract.schema.json"
+    try:
+        schema = json.loads(schema_path.read_text(encoding="utf-8", errors="strict"))
+        jsonschema.Draft202012Validator.check_schema(schema)
+    except (OSError, UnicodeError, json.JSONDecodeError, jsonschema.SchemaError) as exc:
+        raise ValueError(f"invalid canonical contract schema: {schema_path}: {exc}") from exc
+    validator = jsonschema.Draft202012Validator(schema, format_checker=jsonschema.FormatChecker())
+    errors = sorted(
+        validator.iter_errors(document),
+        key=lambda item: (tuple(str(part) for part in item.absolute_path), item.message),
+    )
+    if errors:
+        error = errors[0]
+        location = ".".join(str(part) for part in error.absolute_path) or "<root>"
+        raise ValueError(f"contract schema validation failed at {location}: {error.message}")
 
 
 def _require_reference(objects: Mapping[str, ContractObject], identifier: str, label: str) -> ContractObject:
@@ -224,7 +266,21 @@ def _validate_references(document: dict[str, object], objects: Mapping[str, Cont
         value = item.value
         if "supersedes" in value:
             for identifier in _id_refs(value["supersedes"], f"{item.kind}.supersedes"):
-                _require_reference(objects, identifier, f"{item.kind}.supersedes")
+                if identifier == item.id:
+                    raise ValueError(f"{item.kind} must not supersede itself: {identifier}")
+                target = objects.get(identifier)
+                if target is None:
+                    # An absent ID is a declared historical predecessor. Task 8 validates it
+                    # against the previous contract document during evolution checks.
+                    continue
+                if (item.kind == "future-capability") != (target.kind == "future-capability"):
+                    raise ValueError(
+                        f"{item.kind}.supersedes must not cross current and future objects: {identifier}"
+                    )
+                if target.kind != item.kind:
+                    raise ValueError(
+                        f"{item.kind}.supersedes target must have the same kind: {identifier}"
+                    )
         if item.kind == "context-role":
             _require_kind(objects, _identifier(value["context"], "contextRoles.context"), "contextRoles.context", {"context"})
         elif item.kind == "interaction":
@@ -285,9 +341,10 @@ def _validate_coverage(objects: Mapping[str, ContractObject]) -> None:
             raise ValueError(f"core constraint has no verification trace: {item.id}")
 
 
-def _build_document(path: Path, raw: dict[str, object]) -> ContractDocument:
-    root = _object(raw, "contract document", "contract", _ROOT_FIELDS)
-    if _meaningful(raw["status"], "status") not in _CONTRACT_STATUSES:
+def _build_document(path: Path, raw: dict[str, object], raw_bytes: bytes) -> ContractDocument:
+    root = _object(raw, "contract document", "contract", _ROOT_FIELDS, allow_supersedes=False)
+    status = _meaningful(raw["status"], "status")
+    if status not in _CONTRACT_STATUSES:
         raise ValueError(f"invalid contract status: {raw['status']}")
     _validate_date(raw["created"])
     for field in ("name", "note"):
@@ -390,7 +447,13 @@ def _build_document(path: Path, raw: dict[str, object]) -> ContractDocument:
     _validate_coverage(objects)
     _validate_stage_blockers(raw, objects)
     verifications = {item.id: item for item in objects.values() if item.kind == "verification"}
-    return ContractDocument(path=path, raw=raw, objects_by_id=objects, verification_by_id=verifications)
+    return ContractDocument(
+        path=path,
+        raw=raw,
+        objects_by_id=objects,
+        verification_by_id=verifications,
+        raw_bytes=raw_bytes,
+    )
 
 
 def load_contract(repo_root: Path, file_path: Path) -> ContractDocument:
@@ -403,29 +466,31 @@ def _load_contract_snapshot(repo_root: Path, file_path: Path) -> tuple[ContractD
     contract_root, path = _contract_path(root, file_path)
     if not path.is_file():
         raise ValueError(f"missing contract file: {path}")
-    text = _stable_contract_text(root, contract_root, path)
-    document = _build_document(path, _parse_contract_yaml(text))
-    return document, hashlib.sha256(text.encode("utf-8")).hexdigest()
+    raw_bytes = _stable_contract_bytes(root, contract_root, path)
+    try:
+        text = _decode_classification_bytes(raw_bytes, path)
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("classification", "contract")) from exc
+    raw = _parse_contract_yaml(text)
+    _validate_contract_schema(raw)
+    document = _build_document(path, raw, raw_bytes)
+    return document, document.sha256
 
 
 def validate_contract_acceptance(repo_root: Path, issue: str, contract: ContractDocument, object_ids: Sequence[str]) -> Path:
     root = repo_root.resolve()
     current, digest = _load_contract_snapshot(root, contract.path)
-    accepted_objects = tuple(_identifier(item, "accepted contract object") for item in object_ids)
-    if not accepted_objects:
-        raise ValueError("accepted contract objects must not be empty")
-    if len(accepted_objects) != len(set(accepted_objects)):
-        raise ValueError("accepted contract objects must not contain duplicates")
+    accepted_objects = approval.normalize_accepted_objects(object_ids)
     for identifier in accepted_objects:
         if identifier not in current.objects_by_id:
             raise ValueError(f"accepted contract object does not exist: {identifier}")
+    if current.raw["status"] != "accepted-design":
+        raise ValueError("candidate contract status must be accepted-design")
     _, path = _contract_path(root, current.path)
-    grant = approval.require_exact_remote(root, "contract-acceptance", path, issue)
-    if grant.source != "local-review" or grant.approved_sha256 != digest:
-        raise ValueError("contract acceptance review must bind the exact current contract bytes")
-    return approval.record_contract_acceptance(
+    return approval.consume_contract_acceptance(
         root,
-        grant,
+        issue,
+        path,
         contract_id=current.objects_by_id[_identifier(current.raw["id"], "id")].id,
         contract_version=_semver(current.raw["version"], "version"),
         contract_sha256=digest,
@@ -439,6 +504,10 @@ def validate_task_contract_acceptance(
     contract_name: str,
     contract_file: str,
     approval_reference: str,
+    semantic_phase: str,
+    *,
+    binding_mode: str = "current",
+    recorded_branch: str | None = None,
 ) -> None:
     root = repo_root.resolve()
     try:
@@ -447,6 +516,11 @@ def validate_task_contract_acceptance(
         raise ValueError(f"missing matching human contract acceptance: {exc}") from exc
     contract_id = _identifier(document.raw["id"], "id")
     contract_version = _semver(document.raw["version"], "version")
+    if document.raw["status"] != "accepted-design":
+        raise ValueError(
+            "missing matching human contract acceptance: contract status is incompatible "
+            f"with task semantic phase {semantic_phase}"
+        )
     if contract_name != f"{contract_id}@{contract_version}":
         raise ValueError("missing matching human contract acceptance: task-state Contract does not match contract file")
     _, path = _contract_path(root, document.path)
@@ -460,14 +534,12 @@ def validate_task_contract_acceptance(
     if not history_path.is_file():
         raise ValueError("missing matching human contract acceptance")
     try:
-        record = approval.parse_contract_acceptance_history(root, history_path)
+        record = approval.validate_contract_acceptance_history(root, history_path)
     except ValueError as exc:
         raise ValueError(f"missing matching human contract acceptance: {exc}") from exc
     bindings = approval.resolve_bindings(root)
     expected = {
         "repository": bindings.repository,
-        "worktree": bindings.worktree,
-        "branch": bindings.branch,
         "issue": issue,
         "approvalIssue": issue,
         "approvedFile": approval.display_path(root, path),
@@ -479,8 +551,20 @@ def validate_task_contract_acceptance(
         "source": "local-review",
         "action": "contract-acceptance",
     }
+    if binding_mode == "current":
+        expected.update({"worktree": bindings.worktree, "branch": bindings.branch})
+    elif binding_mode == "recorded":
+        if not recorded_branch:
+            raise ValueError("missing matching human contract acceptance: missing recorded task branch")
+        expected["branch"] = recorded_branch
+    else:
+        raise ValueError(f"invalid contract acceptance binding mode: {binding_mode}")
     if any(record.get(name) != value for name, value in expected.items()):
         raise ValueError("missing matching human contract acceptance")
     accepted = record.get("acceptedObjects")
-    if not isinstance(accepted, list) or not accepted or any(item not in document.objects_by_id for item in accepted):
+    if (
+        not isinstance(accepted, list)
+        or tuple(accepted) != approval.normalize_accepted_objects(accepted)
+        or any(item not in document.objects_by_id for item in accepted)
+    ):
         raise ValueError("missing matching human contract acceptance")

@@ -10,13 +10,15 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Sequence
 
 import yaml
 
 from .bindings import GitBindings, resolve_bindings
+from .classification import _decode_classification_bytes, _load_yaml, _read_stable_bytes
 from .io import read_text
 from .paths import default_approval_file, issue_dir, normalized_issue
+from .project_config import require_safe_repo_path
 from .unattended import require_active
 
 
@@ -55,7 +57,15 @@ HISTORY_COMMON_FIELDS = {
 HISTORY_EFFECT_FIELDS = HISTORY_COMMON_FIELDS | {"parentAction", "parentApprovalId"}
 HISTORY_CONTRACT_FIELDS = HISTORY_COMMON_FIELDS | {
     "contractId", "contractVersion", "contractSha256", "acceptedObjects", "semanticDecision",
+    "approvedReviewFile", "approvedReviewSha256", "approvalClaimFile", "approvalClaimSha256",
 }
+CONTRACT_CLAIM_FIELDS = {
+    "version", "reusable", "approvalId", "repository", "worktree", "branch", "issue", "action",
+    "approvedFile", "approvedSha256", "contractId", "contractVersion", "contractSha256",
+    "acceptedObjects", "semanticDecision", "approvedReviewSha256", "claimedAt",
+}
+CONTRACT_REVIEW_FIELDS = {"version", "acceptedObjects", "semanticDecision"}
+CONTRACT_REVIEW_HEADING = "## Contract Acceptance"
 EFFECT_ACTION = "git-state-backfill"
 EFFECT_PARENT_ACTION = "git-mr"
 EFFECT_REVIEWER_SUMMARY = "subordinate-effect"
@@ -81,6 +91,7 @@ class ApprovalGrant:
     approved_file: str
     approved_sha256: str
     reviewer_summary: str
+    accepted_objects: tuple[str, ...] = ()
 
 
 def validate_action(action: str, *, history: bool = False) -> str:
@@ -88,6 +99,21 @@ def validate_action(action: str, *, history: bool = False) -> str:
     if not isinstance(action, str) or action not in allowed:
         raise ValueError(f"invalid approval action: {action}")
     return action
+
+
+def normalize_accepted_objects(object_ids: Sequence[str] | None) -> tuple[str, ...]:
+    if object_ids is None or isinstance(object_ids, (str, bytes)):
+        raise ValueError("contract-acceptance requires accepted object IDs")
+    normalized: list[str] = []
+    for item in object_ids:
+        if not isinstance(item, str) or not item or item != item.strip() or any(char.isspace() for char in item):
+            raise ValueError("contract-acceptance requires valid accepted object IDs")
+        normalized.append(item)
+    if not normalized:
+        raise ValueError("contract-acceptance requires accepted object IDs")
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("contract-acceptance requires unique accepted object IDs")
+    return tuple(sorted(normalized))
 
 
 def reject_credentials(value: str) -> None:
@@ -116,9 +142,11 @@ def sha256_file(path: Path) -> str:
 
 def field(text: str, name: str) -> str:
     prefix = f"{name}:"
-    for line in text.splitlines():
-        if line.startswith(prefix):
-            return line[len(prefix) :].strip()
+    values = [line[len(prefix) :].strip() for line in text.splitlines() if line.startswith(prefix)]
+    if len(values) > 1:
+        raise ValueError(f"duplicate approval field: {name}")
+    if values:
+        return values[0]
     raise ValueError(f"missing required text '{prefix}'")
 
 
@@ -161,7 +189,13 @@ def display_path(repo_root: Path, path: Path) -> str:
         return resolved.as_posix()
 
 
-def suggested_command(action: str, approved_file: Path, issue: str, attachment_manifest: Path | None = None) -> str:
+def suggested_command(
+    action: str,
+    approved_file: Path,
+    issue: str,
+    attachment_manifest: Path | None = None,
+    accepted_objects: tuple[str, ...] = (),
+) -> str:
     path = approved_file.as_posix()
     attachments = f" --attachments {attachment_manifest.as_posix()}" if attachment_manifest else ""
     if action == "issue-create":
@@ -180,6 +214,8 @@ def suggested_command(action: str, approved_file: Path, issue: str, attachment_m
         return f"devctl git done --issue {issue} --file {path}"
     if action == "git-cleanup-force":
         return f"devctl git done --force --issue {issue} --file {path}"
+    if action == "contract-acceptance":
+        return f"devctl contract accept --issue {issue} --file {path} --objects {','.join(accepted_objects)}"
     return f"devctl <remote-write-command> --body-file {path}"
 
 
@@ -215,10 +251,17 @@ def prepare(
     reviewer: str | None = None,
     force: bool = False,
     attachment_manifest: Path | None = None,
+    accepted_objects: Sequence[str] | None = None,
 ) -> Path:
     repo_root = repo_root.resolve()
     issue = normalized_issue(issue)
     action = validate_action(action)
+    if action == "contract-acceptance":
+        normalized_objects = normalize_accepted_objects(accepted_objects)
+    else:
+        if accepted_objects:
+            raise ValueError("accepted object IDs are only valid for contract-acceptance")
+        normalized_objects = ()
     bindings = resolve_bindings(repo_root)
     approved_path = resolve_path(repo_root, approved_file)
     if not approved_path.is_file():
@@ -245,8 +288,32 @@ def prepare(
         )
     now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     approval_id = uuid.uuid4().hex
-    command = command or suggested_command(action, Path(relative_file), issue, Path(relative_manifest) if relative_manifest else None)
+    command = command or suggested_command(
+        action,
+        Path(relative_file),
+        issue,
+        Path(relative_manifest) if relative_manifest else None,
+        normalized_objects,
+    )
     reviewer = reviewer or default_reviewer(repo_root)
+    contract_review_text = ""
+    if normalized_objects:
+        contract_review_payload = {
+            "version": "0.1.0",
+            "acceptedObjects": list(normalized_objects),
+            "semanticDecision": "accepted-design",
+        }
+        contract_review_yaml = yaml.safe_dump(
+            contract_review_payload,
+            sort_keys=False,
+            allow_unicode=True,
+        )
+        contract_review_text = (
+            f"{CONTRACT_REVIEW_HEADING}\n"
+            "```yaml\n"
+            f"{contract_review_yaml}"
+            "```\n\n"
+        )
     text = (
         "# Local Review Approval\n\n"
         f"Issue: {issue}\n"
@@ -262,6 +329,7 @@ def prepare(
         f"{attachment_text}\n"
         "## Decision\n"
         "Approved: no\n\n"
+        f"{contract_review_text}"
         "## Human Gate\n"
         "Prepared by AI or tooling does not mean approved.\n"
         "Only the human reviewer may change Approved: no to Approved: yes.\n"
@@ -277,6 +345,32 @@ def prepare(
     return review_file
 
 
+def _contract_review_objects(text: str) -> tuple[str, ...]:
+    if text.count(CONTRACT_REVIEW_HEADING) != 1:
+        raise ValueError("contract-acceptance review must contain one Contract Acceptance block")
+    section = text.split(CONTRACT_REVIEW_HEADING, 1)[1]
+    if not section.startswith("\n```yaml\n") or "\n```" not in section[len("\n```yaml\n") :]:
+        raise ValueError("contract-acceptance review has an invalid YAML block")
+    yaml_text, remainder = section[len("\n```yaml\n") :].split("\n```", 1)
+    if remainder and not remainder.startswith("\n"):
+        raise ValueError("contract-acceptance review has an invalid YAML block terminator")
+    try:
+        payload = _load_yaml(yaml_text + "\n")
+    except ValueError as exc:
+        raise ValueError(f"invalid contract-acceptance review YAML: {exc}") from exc
+    if not isinstance(payload, dict) or set(payload) != CONTRACT_REVIEW_FIELDS:
+        raise ValueError("contract-acceptance review YAML has unexpected or missing fields")
+    if payload["version"] != "0.1.0" or payload["semanticDecision"] != "accepted-design":
+        raise ValueError("contract-acceptance review YAML has invalid fixed fields")
+    accepted = payload["acceptedObjects"]
+    if not isinstance(accepted, list):
+        raise ValueError("contract-acceptance review acceptedObjects must be a list")
+    normalized = normalize_accepted_objects(accepted)
+    if tuple(accepted) != normalized:
+        raise ValueError("contract-acceptance review acceptedObjects must be normalized")
+    return normalized
+
+
 def _validate_review_text(
     repo_root: Path,
     issue: str,
@@ -284,6 +378,7 @@ def _validate_review_text(
     attachment_manifest: Path | None,
     text: str,
     bindings: GitBindings,
+    expected_sha256: str | None = None,
 ) -> tuple[Path, str]:
     for needle in REQUIRED_TEXT:
         if needle not in text:
@@ -314,7 +409,7 @@ def _validate_review_text(
         raise ValueError(f"approved file mismatch: expected {display_path(repo_root, actual)}")
 
     expected = field(text, "Approved SHA256").lower()
-    actual_hash = sha256_file(actual).lower()
+    actual_hash = expected_sha256.lower() if expected_sha256 is not None else sha256_file(actual).lower()
     if expected != actual_hash:
         raise ValueError(f"hash mismatch for {approved_file}: expected {expected}, actual {actual_hash}")
 
@@ -331,6 +426,21 @@ def _validate_review_text(
                 f"expected {expected_manifest}, actual {actual_manifest_hash}"
             )
     return actual, actual_hash
+
+
+def _stable_approval_bytes(repo_root: Path, path: Path, owner: Path, label: str) -> bytes:
+    safe_path = require_safe_repo_path(repo_root, path, label)
+    try:
+        return _read_stable_bytes(repo_root, safe_path, owner)
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("classification", label)) from exc
+
+
+def _decode_approval_bytes(content: bytes, path: Path, label: str) -> str:
+    try:
+        return _decode_classification_bytes(content, path)
+    except ValueError as exc:
+        raise ValueError(str(exc).replace("classification", label)) from exc
 
 
 def check(repo_root: Path, issue: str, approved_file: Path, attachment_manifest: Path | None = None) -> None:
@@ -370,8 +480,10 @@ def _effect_identity(payload: dict[str, object]) -> str:
 
 def _parse_history(repo_root: Path, path: Path) -> dict[str, object]:
     try:
-        payload = yaml.safe_load(read_text(path))
-    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        issue_root = path.resolve().parents[2]
+        raw_bytes = _stable_approval_bytes(repo_root, path, issue_root, "approval history")
+        payload = _load_yaml(_decode_approval_bytes(raw_bytes, path, "approval history"))
+    except (OSError, UnicodeError, ValueError) as exc:
         raise ValueError(f"approval history integrity error in {path}: invalid YAML: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValueError(f"approval history integrity error in {path}: expected a mapping")
@@ -438,10 +550,22 @@ def _parse_history(repo_root: Path, path: Path) -> dict[str, object]:
                     or not accepted_objects
                     or any(not isinstance(item, str) or not item for item in accepted_objects)
                     or len(accepted_objects) != len(set(accepted_objects))
+                    or tuple(accepted_objects) != normalize_accepted_objects(accepted_objects)
                 ):
                     raise ValueError("invalid acceptedObjects")
                 if payload["semanticDecision"] != "accepted-design":
                     raise ValueError("invalid semanticDecision")
+                for name in (
+                    "approvedReviewFile",
+                    "approvedReviewSha256",
+                    "approvalClaimFile",
+                    "approvalClaimSha256",
+                ):
+                    if not isinstance(payload[name], str) or not payload[name]:
+                        raise ValueError(f"invalid {name}")
+                for name in ("approvedReviewSha256", "approvalClaimSha256"):
+                    if not FINGERPRINT_RE.fullmatch(str(payload[name])):
+                        raise ValueError(f"invalid {name}")
         expected_path = _history_path(
             repo_root,
             str(payload["issue"]),
@@ -534,7 +658,66 @@ def _validate_grant(grant: ApprovalGrant) -> None:
         EFFECT_REVIEWER_SUMMARY,
     }:
         raise ValueError("reserved local-review reviewer summary")
+    if grant.action == "contract-acceptance":
+        if grant.source != "local-review":
+            raise ValueError("contract acceptance requires local-review")
+        if grant.accepted_objects != normalize_accepted_objects(grant.accepted_objects):
+            raise ValueError("contract acceptance grant has invalid accepted object IDs")
+    elif grant.accepted_objects:
+        raise ValueError("accepted object IDs are only valid for contract-acceptance")
     reject_credentials(json.dumps(asdict(grant), ensure_ascii=True, sort_keys=True))
+
+
+def _contract_local_grant(
+    repo_root: Path,
+    approved_file: Path,
+    issue: str,
+    *,
+    expected_sha256: str | None = None,
+    expected_objects: tuple[str, ...] | None = None,
+) -> tuple[ApprovalGrant, Path, bytes]:
+    issue = normalized_issue(issue)
+    issue_root = issue_dir(repo_root, issue)
+    review_file = default_approval_file(repo_root, issue)
+    if not review_file.is_file():
+        raise ValueError(f"local review approval required: {review_file}")
+    review_bytes = _stable_approval_bytes(repo_root, review_file, issue_root, "approval review")
+    text = _decode_approval_bytes(review_bytes, review_file, "approval review")
+    approved_action = field(text, "Approved Action")
+    if approved_action != "contract-acceptance":
+        raise ValueError(f"action mismatch: expected exact contract-acceptance, got {approved_action}")
+    accepted_objects = _contract_review_objects(text)
+    if expected_objects is not None and accepted_objects != expected_objects:
+        raise ValueError(
+            "contract acceptance accepted object set mismatch: "
+            f"review has {','.join(accepted_objects)}"
+        )
+    bindings = resolve_bindings(repo_root)
+    approved_path, approved_hash = _validate_review_text(
+        repo_root,
+        issue,
+        approved_file,
+        None,
+        text,
+        bindings,
+        expected_sha256,
+    )
+    check_reviewed_task_binding(repo_root, issue, "contract-acceptance")
+    grant = ApprovalGrant(
+        source="local-review",
+        approval_id=field(text, "Approval ID"),
+        repository=bindings.repository,
+        worktree=bindings.worktree,
+        branch=bindings.branch,
+        approval_issue=issue,
+        action="contract-acceptance",
+        approved_file=display_path(repo_root, approved_path),
+        approved_sha256=approved_hash,
+        reviewer_summary=safe_reviewer_summary(field(text, "Reviewer")),
+        accepted_objects=accepted_objects,
+    )
+    _validate_grant(grant)
+    return grant, review_file, review_bytes
 
 
 def _local_grant(
@@ -546,6 +729,10 @@ def _local_grant(
 ) -> ApprovalGrant:
     action = validate_action(action)
     issue = normalized_issue(issue)
+    if action == "contract-acceptance":
+        grant, _, _ = _contract_local_grant(repo_root, approved_file, issue)
+        reject_consumed_approval(repo_root, grant.approval_id)
+        return grant
     review_file = default_approval_file(repo_root, issue)
     if not review_file.is_file():
         raise ValueError(f"local review approval required: {review_file}")
@@ -647,22 +834,30 @@ def require_remote_or_unattended(
     return grant
 
 
-def _write_history_atomic(path: Path, content: str) -> None:
+def _write_immutable_bytes(path: Path, content: bytes, collision_message: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+        with os.fdopen(descriptor, "wb") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         try:
             os.link(temporary, path)
         except FileExistsError:
-            raise ValueError(f"consumed approval history collision: {path}") from None
+            raise ValueError(f"{collision_message}: {path}") from None
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def _write_history_atomic(path: Path, content: str) -> None:
+    _write_immutable_bytes(
+        path,
+        content.encode("utf-8"),
+        "consumed approval history collision",
+    )
 
 
 def _history_path(repo_root: Path, issue: str, action: str, recorded_at: str) -> Path:
@@ -678,6 +873,18 @@ def _history_path(repo_root: Path, issue: str, action: str, recorded_at: str) ->
     target = (history_root / f"{timestamp}-{action}.yaml").resolve()
     if target.parent != history_root:
         raise ValueError("approval history path escapes history directory")
+    return target
+
+
+def _contract_artifact_path(repo_root: Path, issue: str, category: str, name: str) -> Path:
+    issue_root = issue_dir(repo_root.resolve(), normalized_issue(issue))
+    history_root = issue_root / "approvals" / "history"
+    if category not in {"claims", "consumed"}:
+        raise ValueError(f"invalid contract acceptance artifact category: {category}")
+    target = require_safe_repo_path(repo_root, history_root / category / name, "contract acceptance artifact")
+    expected_parent = history_root / category
+    if target.parent != expected_parent:
+        raise ValueError("contract acceptance artifact path escapes approval history")
     return target
 
 
@@ -758,29 +965,94 @@ def record_contract_acceptance(
     contract_sha256: str,
     accepted_objects: tuple[str, ...],
 ) -> Path:
+    del repo_root, grant, contract_id, contract_version, contract_sha256, accepted_objects
+    raise ValueError("contract acceptance must consume the prepared local review directly")
+
+
+def consume_contract_acceptance(
+    repo_root: Path,
+    issue: str,
+    approved_file: Path,
+    *,
+    contract_id: str,
+    contract_version: str,
+    contract_sha256: str,
+    accepted_objects: tuple[str, ...],
+) -> Path:
     repo_root = repo_root.resolve()
-    _validate_grant(grant)
-    if grant.source != "local-review" or grant.action != "contract-acceptance":
-        raise ValueError("contract acceptance requires exact local-review contract-acceptance grant")
-    if not FINGERPRINT_RE.fullmatch(contract_sha256) or contract_sha256 != grant.approved_sha256:
-        raise ValueError("contract acceptance SHA256 must match the approved file")
+    issue = normalized_issue(issue)
+    if not FINGERPRINT_RE.fullmatch(contract_sha256):
+        raise ValueError("contract acceptance requires a valid contract SHA256")
     if not isinstance(contract_id, str) or not contract_id or not isinstance(contract_version, str) or not contract_version:
         raise ValueError("contract acceptance requires contract ID and version")
-    if not accepted_objects or len(accepted_objects) != len(set(accepted_objects)):
-        raise ValueError("contract acceptance requires unique accepted objects")
-    if any(not isinstance(item, str) or not item for item in accepted_objects):
-        raise ValueError("contract acceptance requires valid accepted objects")
-    reject_consumed_approval(repo_root, grant.approval_id)
+    normalized_objects = normalize_accepted_objects(accepted_objects)
+    if normalized_objects != accepted_objects:
+        raise ValueError("contract acceptance requires a normalized accepted object set")
+    grant, _, review_bytes = _contract_local_grant(
+        repo_root,
+        approved_file,
+        issue,
+        expected_sha256=contract_sha256,
+        expected_objects=normalized_objects,
+    )
+    review_sha256 = hashlib.sha256(review_bytes).hexdigest()
+    claimed_at = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    claim_payload: dict[str, object] = {
+        "version": "0.1.0",
+        "reusable": False,
+        "approvalId": grant.approval_id,
+        "repository": grant.repository,
+        "worktree": grant.worktree,
+        "branch": grant.branch,
+        "issue": issue,
+        "action": grant.action,
+        "approvedFile": grant.approved_file,
+        "approvedSha256": grant.approved_sha256,
+        "contractId": contract_id,
+        "contractVersion": contract_version,
+        "contractSha256": contract_sha256,
+        "acceptedObjects": list(normalized_objects),
+        "semanticDecision": "accepted-design",
+        "approvedReviewSha256": review_sha256,
+        "claimedAt": claimed_at,
+    }
+    claim_content = yaml.safe_dump(claim_payload, sort_keys=False, allow_unicode=False).encode("utf-8")
+    claim_path = _contract_artifact_path(repo_root, issue, "claims", f"{grant.approval_id}.yaml")
+    try:
+        _write_immutable_bytes(claim_path, claim_content, "contract acceptance claim collision")
+    except ValueError as exc:
+        if "claim collision" in str(exc):
+            raise ValueError(
+                f"approval already consumed: {grant.approval_id} (approval already claimed)"
+            ) from None
+        raise
+
+    archived_review = _contract_artifact_path(
+        repo_root,
+        issue,
+        "consumed",
+        f"{grant.approval_id}-local-review.md",
+    )
+    _write_immutable_bytes(
+        archived_review,
+        review_bytes,
+        "archived contract approval collision",
+    )
     recorded_at = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
-    history_file = _history_path(repo_root, grant.approval_issue, grant.action, recorded_at)
-    payload = _record_payload(grant, grant.approval_issue, recorded_at)
+    history_file = _history_path(repo_root, issue, grant.action, recorded_at)
+    payload = _record_payload(grant, issue, recorded_at)
+    issue_root = issue_dir(repo_root, issue)
     payload.update(
         {
             "contractId": contract_id,
             "contractVersion": contract_version,
             "contractSha256": contract_sha256,
-            "acceptedObjects": list(accepted_objects),
+            "acceptedObjects": list(normalized_objects),
             "semanticDecision": "accepted-design",
+            "approvedReviewFile": archived_review.relative_to(issue_root).as_posix(),
+            "approvedReviewSha256": review_sha256,
+            "approvalClaimFile": claim_path.relative_to(issue_root).as_posix(),
+            "approvalClaimSha256": hashlib.sha256(claim_content).hexdigest(),
         }
     )
     content = yaml.safe_dump(payload, sort_keys=False, allow_unicode=False)
@@ -793,6 +1065,122 @@ def parse_contract_acceptance_history(repo_root: Path, path: Path) -> dict[str, 
     record = _parse_history(repo_root.resolve(), path)
     if record.get("action") != "contract-acceptance" or record.get("source") != "local-review":
         raise ValueError("record is not a local contract acceptance")
+    return record
+
+
+def _contract_history_artifact(
+    repo_root: Path,
+    issue_root: Path,
+    value: object,
+    category: str,
+    expected_name: str,
+) -> Path:
+    if not isinstance(value, str):
+        raise ValueError(f"invalid {category} artifact path")
+    relative = Path(value)
+    expected_relative = Path("approvals") / "history" / category / expected_name
+    if relative != expected_relative:
+        raise ValueError(f"invalid {category} artifact path")
+    target = require_safe_repo_path(repo_root, issue_root / relative, f"contract acceptance {category} artifact")
+    if target.parent != issue_root / "approvals" / "history" / category:
+        raise ValueError(f"contract acceptance {category} artifact escapes approval history")
+    return target
+
+
+def _parse_contract_claim(repo_root: Path, path: Path, issue_root: Path) -> tuple[dict[str, object], bytes]:
+    if not path.is_file():
+        raise ValueError("missing atomic contract acceptance claim")
+    raw_bytes = _stable_approval_bytes(repo_root, path, issue_root, "contract acceptance claim")
+    try:
+        payload = _load_yaml(_decode_approval_bytes(raw_bytes, path, "contract acceptance claim"))
+    except ValueError as exc:
+        raise ValueError(f"invalid contract acceptance claim YAML: {exc}") from exc
+    if not isinstance(payload, dict) or set(payload) != CONTRACT_CLAIM_FIELDS:
+        raise ValueError("contract acceptance claim has unexpected or missing fields")
+    if payload["version"] != "0.1.0" or payload["reusable"] is not False:
+        raise ValueError("contract acceptance claim has invalid fixed fields")
+    _timestamp(str(payload["claimedAt"]), "claimedAt")
+    accepted = payload["acceptedObjects"]
+    if not isinstance(accepted, list) or tuple(accepted) != normalize_accepted_objects(accepted):
+        raise ValueError("contract acceptance claim has invalid acceptedObjects")
+    return payload, raw_bytes
+
+
+def validate_contract_acceptance_history(repo_root: Path, path: Path) -> dict[str, object]:
+    repo_root = repo_root.resolve()
+    record = parse_contract_acceptance_history(repo_root, path)
+    issue = normalized_issue(str(record["issue"]))
+    issue_root = issue_dir(repo_root, issue)
+    approval_id = str(record["approvalId"])
+    review_path = _contract_history_artifact(
+        repo_root,
+        issue_root,
+        record["approvedReviewFile"],
+        "consumed",
+        f"{approval_id}-local-review.md",
+    )
+    if not review_path.is_file():
+        raise ValueError("missing archived approved review")
+    review_bytes = _stable_approval_bytes(repo_root, review_path, issue_root, "archived approved review")
+    review_sha256 = hashlib.sha256(review_bytes).hexdigest()
+    if review_sha256 != record["approvedReviewSha256"]:
+        raise ValueError("archived approved review SHA256 mismatch")
+    review_text = _decode_approval_bytes(review_bytes, review_path, "archived approved review")
+    if field(review_text, "Approved Action") != "contract-acceptance":
+        raise ValueError("archived approved review action mismatch")
+    if field(review_text, "Approval ID") != approval_id:
+        raise ValueError("archived approved review approval ID mismatch")
+    _timestamp(field(review_text, "Approved At"), "Approved At")
+    accepted_objects = _contract_review_objects(review_text)
+    if list(accepted_objects) != record["acceptedObjects"]:
+        raise ValueError("archived approved review accepted object set mismatch")
+    bindings = GitBindings(
+        repository=str(record["repository"]),
+        worktree=str(record["worktree"]),
+        branch=str(record["branch"]),
+    )
+    approved_path, approved_sha256 = _validate_review_text(
+        repo_root,
+        issue,
+        Path(str(record["approvedFile"])),
+        None,
+        review_text,
+        bindings,
+        str(record["approvedSha256"]),
+    )
+    if display_path(repo_root, approved_path) != record["approvedFile"] or approved_sha256 != record["approvedSha256"]:
+        raise ValueError("archived approved review file binding mismatch")
+    if safe_reviewer_summary(field(review_text, "Reviewer")) != record["reviewerSummary"]:
+        raise ValueError("archived approved review reviewer mismatch")
+
+    claim_path = _contract_history_artifact(
+        repo_root,
+        issue_root,
+        record["approvalClaimFile"],
+        "claims",
+        f"{approval_id}.yaml",
+    )
+    claim, claim_bytes = _parse_contract_claim(repo_root, claim_path, issue_root)
+    if hashlib.sha256(claim_bytes).hexdigest() != record["approvalClaimSha256"]:
+        raise ValueError("contract acceptance claim SHA256 mismatch")
+    inherited = {
+        "approvalId": record["approvalId"],
+        "repository": record["repository"],
+        "worktree": record["worktree"],
+        "branch": record["branch"],
+        "issue": record["issue"],
+        "action": record["action"],
+        "approvedFile": record["approvedFile"],
+        "approvedSha256": record["approvedSha256"],
+        "contractId": record["contractId"],
+        "contractVersion": record["contractVersion"],
+        "contractSha256": record["contractSha256"],
+        "acceptedObjects": record["acceptedObjects"],
+        "semanticDecision": record["semanticDecision"],
+        "approvedReviewSha256": record["approvedReviewSha256"],
+    }
+    if any(claim.get(name) != value for name, value in inherited.items()):
+        raise ValueError("contract acceptance claim does not match history")
     return record
 
 

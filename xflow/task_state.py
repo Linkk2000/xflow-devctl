@@ -193,7 +193,7 @@ def _validate_relative_approval(value: str) -> None:
         raise ValueError("Human Approval Ref must be an Issue-relative path under approvals/history/")
 
 
-def parse_task_state(path: Path) -> TaskState:
+def parse_task_state(path: Path, *, binding_mode: str = "current") -> TaskState:
     if not path.is_file():
         raise ValueError(f"missing task-state file: {path}")
     text = read_text(path)
@@ -252,6 +252,9 @@ def parse_task_state(path: Path) -> TaskState:
             state.contract,
             state.contract_file,
             state.human_approval_ref,
+            state.semantic_phase,
+            binding_mode=binding_mode,
+            recorded_branch=state.branch,
         )
     return state
 
@@ -415,7 +418,7 @@ def list_task_states(repo_root: Path) -> tuple[TaskState, ...]:
     states = []
     for path in issues.glob("issue-*/task-state.md"):
         if path.parent.parent == issues:
-            states.append(parse_task_state(path))
+            states.append(parse_task_state(path, binding_mode="recorded"))
     return tuple(sorted(states, key=lambda item: item.issue))
 
 

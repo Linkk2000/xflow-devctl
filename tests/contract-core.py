@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import builtins
+import hashlib
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
@@ -14,11 +19,16 @@ OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
 from xflow import approval
+from xflow import contracts as contracts_module
 from xflow.contracts import ContractDocument, load_contract, validate_contract_acceptance
-from xflow.task_state import TaskState, parse_task_state, render_task_state
+from xflow.task_state import TaskState, list_task_states, parse_task_state, render_task_state
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "contracts" / "valid.yaml"
+ACCEPTED_OBJECTS = (
+    "example.capability.capability-name",
+    "example.verify.case.operation-success",
+)
 
 
 def git(repo_root: Path, *args: str) -> None:
@@ -28,6 +38,34 @@ def git(repo_root: Path, *args: str) -> None:
 def write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def approve(path: Path) -> None:
+    write(path, path.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"))
+
+
+def run_devctl(repo_root: Path, *args: str, expect: int = 0) -> subprocess.CompletedProcess[str]:
+    env = {
+        **os.environ,
+        "DEVCTL_REPO_ROOT": str(repo_root),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONPATH": str(OPS_ROOT),
+    }
+    result = subprocess.run(
+        [sys.executable, "-m", "xflow", *args],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != expect:
+        raise AssertionError(
+            f"expected exit {expect}: {' '.join(args)}\nstdout={result.stdout}\nstderr={result.stderr}"
+        )
+    return result
 
 
 def assert_value_error(expected: str, callback: object) -> None:
@@ -105,6 +143,7 @@ def test_valid_contract_and_owned_object_locations(repo: Path) -> ContractDocume
     assert contract.path == path.resolve()
     assert contract.raw["id"] == "example.contract.capability-name"
     assert contract.raw["created"] == "2026-07-30"
+    assert contract.raw_bytes == path.read_bytes()
     assert len(contract.objects_by_id) == 15
     assert set(contract.verification_by_id) == {
         "example.verify.case.operation-success",
@@ -118,13 +157,13 @@ def test_schema_and_semantic_rejections(repo: Path) -> None:
     cases = (
         ("duplicate", "id: example.value.result", "id: example.value.request", "duplicate contract object id"),
         ("broken-ref", "participants: [example.role.operator]", "participants: [example.role.missing]", "missing referenced contract object"),
-        ("semver", "version: 0.1.0", "version: '0.1'", "invalid semantic version"),
-        ("interaction", "    constraints: [example.constraint.preserve-state-on-rejection]\n", "", "interactionContracts item missing required fields: constraints"),
+        ("semver", "version: 0.1.0", "version: '0.1'", "contract schema validation failed"),
+        ("interaction", "    constraints: [example.constraint.preserve-state-on-rejection]\n", "", "contract schema validation failed"),
         ("uncovered", "      - example.constraint.preserve-state-on-rejection\n", "", "core constraint has no verification trace"),
         ("blocker", "requiredBefore: never\n    status: deferred", "requiredBefore: accepted-design\n    status: open", "blocking precondition"),
         ("future", "traces: [example.interaction.perform-operation]", "traces: [example.future.optional-extension]", "future capability cannot be required by current verification"),
-        ("unknown", "note: 非规范性背景", "note: 非规范性背景\nunexpected: field", "contract document contains unexpected fields"),
-        ("placeholder", "purpose: 参与者可依赖的业务价值和边界", "purpose: TODO", "must be meaningful"),
+        ("unknown", "note: 非规范性背景", "note: 非规范性背景\nunexpected: field", "contract schema validation failed"),
+        ("placeholder", "purpose: 参与者可依赖的业务价值和边界", "purpose: TODO", "contract schema validation failed"),
     )
     for name, old, new, expected in cases:
         path = copied_contract(repo, f"{name}.yaml")
@@ -135,6 +174,84 @@ def test_schema_and_semantic_rejections(repo: Path) -> None:
     replace(implementation, "status: accepted-design", "status: active")
     replace(implementation, "requiredBefore: never\n    status: deferred", "requiredBefore: implementation\n    status: open")
     assert_value_error("blocking precondition", lambda: load_contract(repo, implementation))
+
+
+def test_schema_semantic_parity(repo: Path) -> None:
+    cases = (
+        ("padded-status", "status: accepted-design", "status: ' accepted-design '"),
+        ("padded-open", "    status: deferred", "    status: ' open '"),
+        ("invalid-date", "created: 2026-07-30", "created: '2026-02-30'"),
+        ("placeholder", "name: 能力名称", "name: ToDo"),
+        ("whitespace-id", "id: example.value.request", "id: 'example.value request'"),
+        ("unknown-root", "note: 非规范性背景", "note: 非规范性背景\nsurprise: field"),
+    )
+    for name, old, new in cases:
+        path = copied_contract(repo, f"parity-{name}.yaml")
+        replace(path, old, new)
+        raw = contracts_module._parse_contract_yaml(path.read_text(encoding="utf-8-sig"))
+        assert_value_error("contract schema validation failed", lambda raw=raw: contracts_module._validate_contract_schema(raw))
+        assert_value_error("", lambda raw=raw, path=path: contracts_module._build_document(path, raw, path.read_bytes()))
+
+    original_import = builtins.__import__
+
+    def without_jsonschema(name: str, *args: object, **kwargs: object) -> object:
+        if name == "jsonschema":
+            raise ImportError("blocked for dependency diagnostic")
+        return original_import(name, *args, **kwargs)
+
+    valid_raw = contracts_module._parse_contract_yaml(FIXTURE.read_text(encoding="utf-8"))
+    with patch("builtins.__import__", side_effect=without_jsonschema):
+        assert_value_error("contract checks require jsonschema", lambda: contracts_module._validate_contract_schema(valid_raw))
+
+
+def test_stage_blockers_reject_padded_open(repo: Path) -> None:
+    stages = (
+        ("accepted-design", "requiredBefore: never", "requiredBefore: accepted-design", None),
+        ("engineering-projection", "requiredBefore: never", "requiredBefore: engineering-projection", None),
+        ("implementation", "requiredBefore: never", "requiredBefore: implementation", ("status: accepted-design", "status: active")),
+    )
+    for name, old_stage, new_stage, status_change in stages:
+        path = copied_contract(repo, f"padded-open-{name}.yaml")
+        replace(path, old_stage, new_stage)
+        replace(path, "    status: deferred", "    status: ' open '")
+        if status_change is not None:
+            replace(path, *status_change)
+        assert_value_error("contract schema validation failed", lambda path=path: load_contract(repo, path))
+
+
+def test_supersedes_rules(repo: Path) -> None:
+    cases = (
+        (
+            "self",
+            "      rule: 请求被拒绝时既有业务状态保持不变",
+            "      rule: 请求被拒绝时既有业务状态保持不变\n      supersedes: [example.constraint.preserve-state-on-rejection]",
+            "must not supersede itself",
+        ),
+        (
+            "wrong-kind",
+            "      rule: 请求被拒绝时既有业务状态保持不变",
+            "      rule: 请求被拒绝时既有业务状态保持不变\n      supersedes: [example.context.operation]",
+            "must have the same kind",
+        ),
+        (
+            "current-future",
+            "    reason: 不属于当前承诺且不进入当前验证",
+            "    reason: 不属于当前承诺且不进入当前验证\n    supersedes: [example.interaction.perform-operation]",
+            "must not cross current and future objects",
+        ),
+    )
+    for name, old, new, expected in cases:
+        path = copied_contract(repo, f"supersedes-{name}.yaml")
+        replace(path, old, new)
+        assert_value_error(expected, lambda path=path: load_contract(repo, path))
+
+    historical = copied_contract(repo, "supersedes-historical.yaml")
+    replace(
+        historical,
+        "      rule: 请求被拒绝时既有业务状态保持不变",
+        "      rule: 请求被拒绝时既有业务状态保持不变\n      supersedes: [example.constraint.retired-predecessor]",
+    )
+    assert load_contract(repo, historical).objects_by_id["example.constraint.preserve-state-on-rejection"]
 
 
 def test_optional_contract_lists_may_be_empty(repo: Path) -> None:
@@ -169,18 +286,50 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
         lambda: validate_contract_acceptance(repo, issue, contract, ("example.capability.capability-name",)),
     )
 
-    review = approval.prepare(repo, issue, "contract-acceptance", contract.path, reviewer="reviewer", force=True)
-    review.write_text(review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"), encoding="utf-8", newline="\n")
+    assert_value_error(
+        "accepted object IDs",
+        lambda: approval.prepare(repo, issue, "contract-acceptance", contract.path, reviewer="reviewer", force=True),
+    )
+    review = approval.prepare(
+        repo,
+        issue,
+        "contract-acceptance",
+        contract.path,
+        reviewer="reviewer",
+        force=True,
+        accepted_objects=ACCEPTED_OBJECTS,
+    )
+    review_text = review.read_text(encoding="utf-8")
+    assert "acceptedObjects:" in review_text
+    for identifier in ACCEPTED_OBJECTS:
+        assert identifier in review_text
+    approve(review)
     grant = approval.require_exact_remote(repo, "contract-acceptance", contract.path, issue)
+    assert grant.accepted_objects == ACCEPTED_OBJECTS
     assert_value_error(
         "must use contract acceptance history",
         lambda: approval.record_consumed_approval(repo, grant, "success"),
+    )
+    assert_value_error(
+        "must consume the prepared local review",
+        lambda: approval.record_contract_acceptance(
+            repo,
+            dataclass_replace(grant, approval_id="a" * 32),
+            contract_id="example.contract.capability-name",
+            contract_version="0.1.0",
+            contract_sha256=contract.sha256,
+            accepted_objects=ACCEPTED_OBJECTS,
+        ),
+    )
+    assert_value_error(
+        "accepted object set mismatch",
+        lambda: validate_contract_acceptance(repo, issue, contract, (ACCEPTED_OBJECTS[0],)),
     )
     accepted = validate_contract_acceptance(
         repo,
         issue,
         contract,
-        ("example.capability.capability-name", "example.verify.case.operation-success"),
+        ACCEPTED_OBJECTS,
     )
     assert accepted.parent.name == "history"
     record = accepted.read_text(encoding="utf-8")
@@ -188,6 +337,10 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
     assert "source: local-review" in record
     assert "contractSha256:" in record
     assert "acceptedObjects:" in record
+    assert "approvedReviewFile:" in record
+    assert "approvedReviewSha256:" in record
+    assert "approvalClaimFile:" in record
+    assert "approvalClaimSha256:" in record
     assert contract.path.read_bytes() == FIXTURE.read_bytes()
     assert "Semantic Phase: accepted-design" in state_path.read_text(encoding="utf-8")
 
@@ -196,14 +349,168 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
     assert parse_task_state(state_path).human_approval_ref == reference
     assert_value_error(
         "approval already consumed",
-        lambda: validate_contract_acceptance(repo, issue, contract, ("example.capability.capability-name",)),
+        lambda: validate_contract_acceptance(repo, issue, contract, ACCEPTED_OBJECTS),
     )
     assert_value_error(
         "accepted contract object does not exist",
         lambda: validate_contract_acceptance(repo, issue, contract, ("example.missing",)),
     )
+
+    original_history = accepted.read_bytes()
+    accepted.write_bytes(original_history + b"contractId: forged.contract\n")
+    assert_value_error("duplicate YAML key", lambda: parse_task_state(state_path))
+    accepted.write_bytes(original_history)
+
+    payload = yaml.safe_load(original_history.decode("utf-8"))
+    issue_root = state_path.parent
+    archived_review = issue_root / payload["approvedReviewFile"]
+    original_review = archived_review.read_bytes()
+    archived_review.write_bytes(original_review + b"\nmutated: yes\n")
+    assert_value_error("archived approved review SHA256 mismatch", lambda: parse_task_state(state_path))
+    archived_review.write_bytes(original_review)
+
+    claim_path = issue_root / payload["approvalClaimFile"]
+    original_claim = claim_path.read_bytes()
+    rejected_review = original_review.replace(b"Approved: yes", b"Approved: no")
+    rejected_review_sha = hashlib.sha256(rejected_review).hexdigest()
+    claim_payload = yaml.safe_load(original_claim.decode("utf-8"))
+    claim_payload["approvedReviewSha256"] = rejected_review_sha
+    rewritten_claim = yaml.safe_dump(claim_payload, sort_keys=False).encode("utf-8")
+    rewritten_history = dict(payload)
+    rewritten_history["approvedReviewSha256"] = rejected_review_sha
+    rewritten_history["approvalClaimSha256"] = hashlib.sha256(rewritten_claim).hexdigest()
+    archived_review.write_bytes(rejected_review)
+    claim_path.write_bytes(rewritten_claim)
+    write(accepted, yaml.safe_dump(rewritten_history, sort_keys=False))
+    assert_value_error("local approval required: Approved: yes", lambda: parse_task_state(state_path))
+    archived_review.write_bytes(original_review)
+    claim_path.write_bytes(original_claim)
+    accepted.write_bytes(original_history)
+
+    forged_payload = dict(payload)
+    forged_payload["approvalId"] = "f" * 32
+    forged_payload["recordedAt"] = "2026-07-31T01:02:03.000004Z"
+    forged_payload["approvedReviewFile"] = "approvals/history/consumed/" + "f" * 32 + "-local-review.md"
+    forged_payload["approvedReviewSha256"] = "0" * 64
+    forged_payload["approvalClaimFile"] = "approvals/history/claims/" + "f" * 32 + ".yaml"
+    forged_payload["approvalClaimSha256"] = "0" * 64
+    forged = accepted.parent / "20260731T010203000004Z-contract-acceptance.yaml"
+    write(forged, yaml.safe_dump(forged_payload, sort_keys=False))
+    forged_ref = forged.relative_to(state_path.parent).as_posix()
+    write(state_path, render_task_state(task_state(issue, "feature/101-contract", forged_ref)))
+    assert_value_error("missing archived approved review", lambda: parse_task_state(state_path))
+    forged.unlink()
+
+    write(state_path, render_task_state(task_state(issue, "feature/101-contract", reference)))
     replace(contract.path, "note: 非规范性背景", "note: 合同内容已变更")
     assert_value_error("missing matching human contract acceptance", lambda: parse_task_state(state_path))
+    replace(contract.path, "note: 合同内容已变更", "note: 非规范性背景")
+
+
+def test_draft_rejection_and_bom_acceptance(repo: Path) -> None:
+    issue = "102"
+    write(repo / ".xflow" / "current-task.md", current_task(issue))
+    draft_path = copied_contract(repo, "draft.yaml")
+    replace(draft_path, "status: accepted-design", "status: draft")
+    draft = load_contract(repo, draft_path)
+    review = approval.prepare(
+        repo, issue, "contract-acceptance", draft.path, reviewer="reviewer", force=True,
+        accepted_objects=ACCEPTED_OBJECTS,
+    )
+    duplicated = review.read_text(encoding="utf-8").replace(
+        "semanticDecision: accepted-design\n",
+        "semanticDecision: accepted-design\nsemanticDecision: accepted-design\n",
+    )
+    write(review, duplicated.replace("Approved: no", "Approved: yes"))
+    assert_value_error(
+        "duplicate YAML key",
+        lambda: approval.require_exact_remote(repo, "contract-acceptance", draft.path, issue),
+    )
+    review = approval.prepare(
+        repo, issue, "contract-acceptance", draft.path, reviewer="reviewer", force=True,
+        accepted_objects=ACCEPTED_OBJECTS,
+    )
+    approve(review)
+    assert_value_error(
+        "candidate contract status must be accepted-design",
+        lambda: validate_contract_acceptance(repo, issue, draft, ACCEPTED_OBJECTS),
+    )
+    stale_state_path = repo / ".xflow" / "issues" / "issue-102" / "task-state.md"
+    stale_state = dataclass_replace(
+        task_state(issue, "feature/101-contract", "approvals/history/missing.yaml"),
+        contract_file="contracts/draft.yaml",
+    )
+    write(stale_state_path, render_task_state(stale_state))
+    assert_value_error("contract status is incompatible", lambda: parse_task_state(stale_state_path))
+    stale_state_path.unlink()
+
+    bom_path = repo / "contracts" / "bom.yaml"
+    bom_path.write_bytes(b"\xef\xbb\xbf" + FIXTURE.read_bytes())
+    bom = load_contract(repo, bom_path)
+    assert bom.raw_bytes == bom_path.read_bytes()
+    assert bom.sha256 == hashlib.sha256(bom_path.read_bytes()).hexdigest()
+    review = approval.prepare(
+        repo, issue, "contract-acceptance", bom.path, reviewer="reviewer", force=True,
+        accepted_objects=ACCEPTED_OBJECTS,
+    )
+    approve(review)
+    record = validate_contract_acceptance(repo, issue, bom, ACCEPTED_OBJECTS)
+    assert bom.sha256 in record.read_text(encoding="utf-8")
+
+
+def test_atomic_contract_acceptance_claim(repo: Path) -> None:
+    issue = "103"
+    write(repo / ".xflow" / "current-task.md", current_task(issue))
+    contract = load_contract(repo, copied_contract(repo, "concurrent.yaml"))
+    review = approval.prepare(
+        repo, issue, "contract-acceptance", contract.path, reviewer="reviewer", force=True,
+        accepted_objects=ACCEPTED_OBJECTS,
+    )
+    approve(review)
+
+    def accept() -> Path | ValueError:
+        try:
+            return validate_contract_acceptance(repo, issue, contract, ACCEPTED_OBJECTS)
+        except ValueError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(lambda _: accept(), range(2)))
+    assert sum(isinstance(result, Path) for result in results) == 1, results
+    failures = [str(result) for result in results if isinstance(result, ValueError)]
+    assert len(failures) == 1 and "approval already claimed" in failures[0], failures
+    claims = tuple((repo / ".xflow" / "issues" / "issue-103" / "approvals" / "history" / "claims").glob("*.yaml"))
+    history = tuple((repo / ".xflow" / "issues" / "issue-103" / "approvals" / "history").glob("*.yaml"))
+    assert len(claims) == 1
+    assert len(history) == 1
+
+
+def test_cli_contract_edges_and_historical_list(repo: Path) -> None:
+    bare = run_devctl(repo, "contract", expect=2)
+    assert "usage: devctl contract" in bare.stderr
+    assert "AttributeError" not in bare.stderr
+
+    issue = "104"
+    write(repo / ".xflow" / "current-task.md", current_task(issue))
+    contract_path = copied_contract(repo, "cli.yaml")
+    missing = run_devctl(
+        repo, "approval", "prepare", "--issue", issue, "--action", "contract-acceptance",
+        "--file", str(contract_path), "--force", expect=1,
+    )
+    assert "--objects is required for contract-acceptance" in missing.stderr
+    prepared = run_devctl(
+        repo, "approval", "prepare", "--issue", issue, "--action", "contract-acceptance",
+        "--file", str(contract_path), "--objects", ",".join(reversed(ACCEPTED_OBJECTS)), "--force",
+    )
+    assert "local review prepared" in prepared.stdout
+    review = repo / ".xflow" / "issues" / "issue-104" / "approvals" / "local-review.md"
+    text = review.read_text(encoding="utf-8")
+    assert text.index(ACCEPTED_OBJECTS[0]) < text.index(ACCEPTED_OBJECTS[1])
+
+    accepted_states = tuple((repo / ".xflow" / "issues").glob("issue-*/task-state.md"))
+    assert accepted_states
+    git(repo, "checkout", "main", "-q")
+    assert list_task_states(repo)
 
 
 def main() -> None:
@@ -211,9 +518,15 @@ def main() -> None:
         repo = init_repo(Path(raw))
         contract = test_valid_contract_and_owned_object_locations(repo)
         test_schema_and_semantic_rejections(repo)
+        test_schema_semantic_parity(repo)
+        test_stage_blockers_reject_padded_open(repo)
+        test_supersedes_rules(repo)
         test_optional_contract_lists_may_be_empty(repo)
         test_contract_root_containment(repo)
         test_exact_local_acceptance_and_task_state(repo, contract)
+        test_draft_rejection_and_bom_acceptance(repo)
+        test_atomic_contract_acceptance_claim(repo)
+        test_cli_contract_edges_and_historical_list(repo)
     print("contract core ok")
 
 
