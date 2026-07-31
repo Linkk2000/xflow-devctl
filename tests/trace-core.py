@@ -401,6 +401,10 @@ def test_strict_product_url_identity() -> None:
         "https://exa_mple.test/path",
         "https://xn--abc.example/path",
         "https:///missing-host",
+        "https://example.test/path%",
+        "https://example.test/path?value=%Z0",
+        "https://example.test/path#value=%0Z",
+        "https://example.test/%ZZ",
     )
     for value in invalid:
         assert_error(
@@ -416,6 +420,12 @@ def test_strict_product_url_identity() -> None:
     ) == (
         "https://EXAMPLE.TEST:443/path?mode=1#result",
         "https://example.test/path?mode=1#result",
+    )
+    assert traceability_module._normalize_http_url(
+        "https://EXAMPLE.TEST/a%20b?next=%2Fdone#value=%7E", "product target"
+    ) == (
+        "https://EXAMPLE.TEST/a%20b?next=%2Fdone#value=%7E",
+        "https://example.test/a%20b?next=%2Fdone#value=%7E",
     )
 
 

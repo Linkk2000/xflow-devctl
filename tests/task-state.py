@@ -17,7 +17,12 @@ from xflow.bindings import resolve_bindings
 from xflow.checks import check_current_task
 from xflow.cli import current_task_issue
 from xflow.bindings import git_path
-from xflow.collaboration import repository_lock
+from xflow.collaboration import (
+    git_child_environment,
+    inherited_lease_command,
+    repository_lock,
+    repository_mutation,
+)
 from xflow.paths import active_task_pointer_file, legacy_active_task_pointer_file
 from xflow.task_state import (
     TaskState,
@@ -73,7 +78,11 @@ def write_state(repo_root: Path, value: TaskState) -> Path:
     return path
 
 
-def run_devctl_result(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def run_devctl_result(
+    repo_root: Path,
+    *args: str,
+    env_overrides: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = {
         **os.environ,
         "DEVCTL_REPO_ROOT": str(repo_root),
@@ -82,6 +91,7 @@ def run_devctl_result(repo_root: Path, *args: str) -> subprocess.CompletedProces
         "PYTHONIOENCODING": "utf-8",
         "PYTHONPATH": str(OPS_ROOT),
         "XFLOW_COLLABORATION_LOCK_TIMEOUT": "0.2",
+        **(env_overrides or {}),
     }
     return subprocess.run(
         [sys.executable, "-m", "xflow", *args],
@@ -191,6 +201,75 @@ def test_official_git_start_respects_closure_lock(root: Path) -> None:
     assert result.returncode == 1, result.stdout
     assert "another devctl process holds the repository collaboration lock" in result.stderr
     assert resolve_bindings(repo).branch == "main"
+
+    git(repo, "config", "extensions.worktreeConfig", "true")
+    git(repo, "config", "--worktree", "devctl.issue", "77")
+    write(repo / "README.md", "# Git mutation lock\n\nstaging contention\n")
+    with repository_lock(repo):
+        result = run_devctl_result(repo, "git", "commit-msg", "-a", "验证暂存互斥")
+    assert result.returncode == 1, result.stdout
+    assert "another devctl process holds the repository collaboration lock" in result.stderr
+    assert subprocess.run(
+        ["git", "-C", str(repo), "diff", "--cached", "--quiet"],
+        check=False,
+    ).returncode == 0
+
+
+def test_inherited_mutation_lease_is_scoped_and_live(root: Path) -> None:
+    repo = initialized_repo(root, "lease-scope", "feature/504-lease")
+    write_state(repo, state("504", "feature/504-lease"))
+    activate_task(repo, "504")
+    other = initialized_repo(root, "lease-other", "feature/505-other")
+    write_state(other, state("505", "feature/505-other"))
+    activate_task(other, "505")
+
+    with repository_mutation(repo):
+        token = git_child_environment(repo)["XFLOW_DEVCTL_MUTATION_LEASE"]
+        child_env = {"XFLOW_DEVCTL_MUTATION_LEASE": token}
+        assert run_devctl_result(repo, "task", "status", env_overrides=child_env).returncode == 0
+
+        forbidden = (
+            ("task", "activate", "--issue", "504"),
+            ("task", "migrate-current"),
+            ("git", "start", "nested", "--issue", "504", "--base", "main"),
+            ("git", "done", "--force", "--issue", "504"),
+            ("trace", "check", "--issue", "504", "--contract", "missing", "--matrix", "missing"),
+            ("check", "resolution-report", "--issue", "504"),
+            ("git", "push", "--issue", "504"),
+        )
+        for command in forbidden:
+            result = run_devctl_result(repo, *command, env_overrides=child_env)
+            assert result.returncode == 1, (command, result.stdout, result.stderr)
+            assert "does not allow command" in result.stderr, (command, result.stderr)
+
+        wrong_repo = run_devctl_result(other, "task", "status", env_overrides=child_env)
+        assert wrong_repo.returncode == 1, wrong_repo.stdout
+        assert "invalid or inactive" in wrong_repo.stderr
+
+        forged_env = {"XFLOW_DEVCTL_MUTATION_LEASE": "0" * 64}
+        forged = run_devctl_result(repo, "task", "status", env_overrides=forged_env)
+        assert forged.returncode == 1, forged.stdout
+        assert "invalid or inactive" in forged.stderr
+
+        lease_path = (
+            git_path(repo, "--git-common-dir")
+            / "xflow"
+            / "locks"
+            / "mutations"
+            / f"{token}.json"
+        )
+
+        def remove_live_lease() -> None:
+            with patch.dict(os.environ, child_env):
+                with inherited_lease_command(repo, ("task", "status")):
+                    with repository_lock(repo):
+                        lease_path.unlink()
+
+        assert_value_error("invalid or inactive", remove_live_lease)
+
+    stale = run_devctl_result(repo, "task", "status", env_overrides=child_env)
+    assert stale.returncode == 1, stale.stdout
+    assert "invalid or inactive" in stale.stderr
 
 
 def initialized_repo(root: Path, name: str, branch: str) -> Path:
@@ -655,6 +734,7 @@ def main() -> None:
 
         test_official_git_start_respects_closure_lock(root)
         test_git_hook_devctl_reentry(root)
+        test_inherited_mutation_lease_is_scoped_and_live(root)
         test_modern_pointer_blocks_legacy_migration(root)
         test_legacy_authority_is_live_provenance(root)
         test_legacy_fallback_is_stable_and_authority_aware(root)

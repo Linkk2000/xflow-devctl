@@ -25,7 +25,13 @@ from .checks import (
 from .commit_message import check_commit_message
 from .bindings import resolve_bindings
 from .classification import check_classification
-from .collaboration import git_child_environment, repository_locked, repository_mutation
+from .collaboration import (
+    git_child_environment,
+    inherited_lease_command,
+    inherited_lease_present,
+    repository_locked,
+    repository_mutation,
+)
 from .env import RuntimeContext, load_env_files, python_version, token_status_lines
 from .dependencies import check_dependencies
 from .migration import apply_issue_workspace_migration, inspect, inspect_issue_workspace_migration, write_wrappers
@@ -1233,7 +1239,7 @@ def run_git(args: argparse.Namespace) -> int:
     ctx = context()
     mutates_local_git = (
         args.git_command in {"start", "done", "mr"}
-        or (args.git_command == "commit-msg" and args.commit)
+        or (args.git_command == "commit-msg" and (args.all or args.commit))
     )
     if mutates_local_git:
         with repository_mutation(ctx.repo_root):
@@ -1409,37 +1415,50 @@ def run_migrate(args: argparse.Namespace) -> int:
     raise ValueError(f"unknown migrate subcommand: {args.migrate_command}")
 
 
+def _command_scope(args: argparse.Namespace) -> tuple[str, ...]:
+    command = str(args.command or "")
+    subcommand = getattr(args, f"{command.replace('-', '_')}_command", None)
+    return (command, str(subcommand)) if subcommand else (command,)
+
+
+def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.command == "preflight":
+        return run_preflight()
+    if args.command == "check":
+        return run_check(args)
+    if args.command == "task":
+        return run_task(args)
+    if args.command == "contract":
+        return run_contract(args)
+    if args.command == "trace":
+        return run_trace(args)
+    if args.command == "issue":
+        return run_issue(args)
+    if args.command == "git":
+        return run_git(args)
+    if args.command == "approval":
+        return run_approval(args)
+    if args.command == "unattended":
+        return run_unattended(args)
+    if args.command == "attachment":
+        return run_attachment(args)
+    if args.command == "rules":
+        return run_rules(args)
+    if args.command == "migrate":
+        return run_migrate(args)
+    parser.print_help()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     load_env_files(os.environ)
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        if args.command == "preflight":
-            return run_preflight()
-        if args.command == "check":
-            return run_check(args)
-        if args.command == "task":
-            return run_task(args)
-        if args.command == "contract":
-            return run_contract(args)
-        if args.command == "trace":
-            return run_trace(args)
-        if args.command == "issue":
-            return run_issue(args)
-        if args.command == "git":
-            return run_git(args)
-        if args.command == "approval":
-            return run_approval(args)
-        if args.command == "unattended":
-            return run_unattended(args)
-        if args.command == "attachment":
-            return run_attachment(args)
-        if args.command == "rules":
-            return run_rules(args)
-        if args.command == "migrate":
-            return run_migrate(args)
-        parser.print_help()
-        return 0
+        if inherited_lease_present():
+            with inherited_lease_command(context().repo_root, _command_scope(args)):
+                return _dispatch(args, parser)
+        return _dispatch(args, parser)
     except ValueError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1

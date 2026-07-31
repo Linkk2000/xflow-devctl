@@ -26,10 +26,12 @@ class _LockState:
 _STATES_GUARD = threading.Lock()
 _STATES: dict[Path, _LockState] = {}
 _MUTATION_LOCAL = threading.local()
+_INHERITED_LOCAL = threading.local()
 _F = TypeVar("_F", bound=Callable[..., object])
 _LEASE_ENV = "XFLOW_DEVCTL_MUTATION_LEASE"
 _LEASE_TOKEN_RE = re.compile(r"[0-9a-f]{64}")
 _LEASE_FIELDS = {"version", "token", "repository", "worktree", "ownerPid"}
+_SAFE_INHERITED_COMMANDS = frozenset({("task", "status")})
 
 
 def _lock_path(repo_root: Path) -> Path:
@@ -54,13 +56,16 @@ def _lease_path(common_dir: Path, token: str) -> Path:
     return common_dir / "xflow" / "locks" / "mutations" / f"{token}.json"
 
 
-def _inherited_lease(repo_root: Path) -> str | None:
-    token = os.environ.get(_LEASE_ENV, "")
-    if not _LEASE_TOKEN_RE.fullmatch(token):
-        return None
+def _validate_inherited_lease(repo_root: Path, token: str) -> None:
     try:
-        from .local_artifacts import MAX_SMALL_ARTIFACT_BYTES, capture_stable_file
+        from .local_artifacts import (
+            MAX_SMALL_ARTIFACT_BYTES,
+            capture_stable_file,
+            revalidate_snapshots,
+        )
 
+        if not _LEASE_TOKEN_RE.fullmatch(token):
+            raise ValueError("invalid mutation lease token")
         common_dir, repository, worktree = _lease_identity(repo_root)
         path = _lease_path(common_dir, token)
         snapshot = capture_stable_file(
@@ -72,19 +77,62 @@ def _inherited_lease(repo_root: Path) -> str | None:
         )
         assert snapshot.content is not None
         payload = loads_unique_json(snapshot.content.decode("utf-8", errors="strict"))
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != _LEASE_FIELDS
+            or payload.get("version") != 1
+            or payload.get("token") != token
+            or payload.get("repository") != repository
+            or payload.get("worktree") != worktree
+            or type(payload.get("ownerPid")) is not int
+            or payload["ownerPid"] <= 0
+        ):
+            raise ValueError("mutation lease identity mismatch")
+        revalidate_snapshots(common_dir, (snapshot,), "repository mutation lease")
     except (UnicodeError, ValueError):
+        raise ValueError("inherited repository mutation lease is invalid or inactive") from None
+
+
+def inherited_lease_present() -> bool:
+    return bool(os.environ.get(_LEASE_ENV, ""))
+
+
+@contextmanager
+def inherited_lease_command(repo_root: Path, command: tuple[str, ...]) -> Iterator[None]:
+    token = os.environ.get(_LEASE_ENV, "")
+    if not token:
+        yield
+        return
+    if command not in _SAFE_INHERITED_COMMANDS:
+        raise ValueError(
+            "inherited repository mutation lease does not allow command: " + " ".join(command)
+        )
+    _validate_inherited_lease(repo_root, token)
+    previous = getattr(_INHERITED_LOCAL, "authorization", None)
+    _INHERITED_LOCAL.authorization = (token, command)
+    try:
+        yield
+        _validate_inherited_lease(repo_root, token)
+    finally:
+        if previous is None:
+            delattr(_INHERITED_LOCAL, "authorization")
+        else:
+            _INHERITED_LOCAL.authorization = previous
+
+
+def _authorized_inherited_lease(repo_root: Path) -> str | None:
+    token = os.environ.get(_LEASE_ENV, "")
+    if not token:
         return None
+    authorization = getattr(_INHERITED_LOCAL, "authorization", None)
     if (
-        not isinstance(payload, dict)
-        or set(payload) != _LEASE_FIELDS
-        or payload.get("version") != 1
-        or payload.get("token") != token
-        or payload.get("repository") != repository
-        or payload.get("worktree") != worktree
-        or type(payload.get("ownerPid")) is not int
-        or payload["ownerPid"] <= 0
+        not isinstance(authorization, tuple)
+        or len(authorization) != 2
+        or authorization[0] != token
+        or authorization[1] not in _SAFE_INHERITED_COMMANDS
     ):
-        return None
+        raise ValueError("inherited repository mutation lease was not authorized at CLI dispatch")
+    _validate_inherited_lease(repo_root, token)
     return token
 
 
@@ -93,7 +141,7 @@ def git_child_environment(repo_root: Path) -> dict[str, str]:
     token = getattr(_MUTATION_LOCAL, "token", None)
     if isinstance(token, str):
         env[_LEASE_ENV] = token
-    elif _inherited_lease(repo_root) is None:
+    elif _authorized_inherited_lease(repo_root) is None:
         env.pop(_LEASE_ENV, None)
     return env
 
@@ -131,8 +179,12 @@ def _unlock(stream: BinaryIO) -> None:
 
 @contextmanager
 def repository_lock(repo_root: Path, *, timeout_seconds: float | None = None) -> Iterator[None]:
-    if _inherited_lease(repo_root) is not None:
-        yield
+    inherited = _authorized_inherited_lease(repo_root)
+    if inherited is not None:
+        try:
+            yield
+        finally:
+            _validate_inherited_lease(repo_root, inherited)
         return
     path = _lock_path(repo_root)
     with _STATES_GUARD:
@@ -172,9 +224,9 @@ def repository_lock(repo_root: Path, *, timeout_seconds: float | None = None) ->
 
 @contextmanager
 def repository_mutation(repo_root: Path) -> Iterator[None]:
-    if _inherited_lease(repo_root) is not None:
-        yield
-        return
+    if inherited_lease_present():
+        _authorized_inherited_lease(repo_root)
+        raise ValueError("inherited repository mutation lease cannot authorize repository mutation")
     with repository_lock(repo_root):
         common_dir, repository, worktree = _lease_identity(repo_root)
         token = secrets.token_hex(32)

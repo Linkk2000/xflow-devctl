@@ -592,6 +592,11 @@ def _normalize_http_url(value: object, label: str) -> tuple[str, str]:
         port = parsed.port
     except ValueError as exc:
         raise ValueError(f"{label} must be a complete HTTP(S) URL") from exc
+    if any(
+        re.search(r"%(?![0-9A-Fa-f]{2})", component)
+        for component in (parsed.path, parsed.query, parsed.fragment)
+    ):
+        raise ValueError(f"{label} must be a complete HTTP(S) URL")
     scheme = parsed.scheme.casefold()
     if scheme not in {"http", "https"} or not parsed.hostname or not parsed.netloc or "@" in parsed.netloc:
         raise ValueError(f"{label} must be a complete HTTP(S) URL")
