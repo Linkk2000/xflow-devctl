@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -181,8 +182,20 @@ def test_schema_semantic_parity(repo: Path) -> None:
         ("padded-status", "status: accepted-design", "status: ' accepted-design '"),
         ("padded-open", "    status: deferred", "    status: ' open '"),
         ("invalid-date", "created: 2026-07-30", "created: '2026-02-30'"),
+        ("compact-date", "created: 2026-07-30", "created: '20260730'"),
+        ("terminal-lf-date", "created: 2026-07-30", 'created: "2026-07-30\\n"'),
+        ("terminal-cr-date", "created: 2026-07-30", 'created: "2026-07-30\\r"'),
         ("placeholder", "name: 能力名称", "name: ToDo"),
         ("whitespace-id", "id: example.value.request", "id: 'example.value request'"),
+        ("leading-id", "id: example.value.request", "id: ' example.value.request'"),
+        ("trailing-id", "id: example.value.request", "id: 'example.value.request '"),
+        ("leading-text", "name: 能力名称", "name: ' 能力名称'"),
+        ("trailing-text", "name: 能力名称", "name: '能力名称 '"),
+        ("terminal-lf-text", "name: 能力名称", 'name: "能力名称\\n"'),
+        ("terminal-cr-text", "name: 能力名称", 'name: "能力名称\\r"'),
+        ("terminal-lf-id", "id: example.value.request", 'id: "example.value.request\\n"'),
+        ("terminal-cr-id", "id: example.value.request", 'id: "example.value.request\\r"'),
+        ("terminal-lf-semver", "version: 0.1.0", 'version: "0.1.0\\n"'),
         ("unknown-root", "note: 非规范性背景", "note: 非规范性背景\nsurprise: field"),
     )
     for name, old, new in cases:
@@ -191,6 +204,12 @@ def test_schema_semantic_parity(repo: Path) -> None:
         raw = contracts_module._parse_contract_yaml(path.read_text(encoding="utf-8-sig"))
         assert_value_error("contract schema validation failed", lambda raw=raw: contracts_module._validate_contract_schema(raw))
         assert_value_error("", lambda raw=raw, path=path: contracts_module._build_document(path, raw, path.read_bytes()))
+
+    unicode_path = copied_contract(repo, "parity-valid-unicode.yaml")
+    replace(unicode_path, "name: 能力名称", "name: '能力 名称 Ω'")
+    unicode_raw = contracts_module._parse_contract_yaml(unicode_path.read_text(encoding="utf-8-sig"))
+    contracts_module._validate_contract_schema(unicode_raw)
+    assert contracts_module._build_document(unicode_path, unicode_raw, unicode_path.read_bytes()).raw["name"] == "能力 名称 Ω"
 
     original_import = builtins.__import__
 
@@ -340,7 +359,7 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
     assert "approvedReviewFile:" in record
     assert "approvedReviewSha256:" in record
     assert "approvalClaimFile:" in record
-    assert "approvalClaimSha256:" in record
+    assert "approvalClaimSha256:" not in record
     assert contract.path.read_bytes() == FIXTURE.read_bytes()
     assert "Semantic Phase: accepted-design" in state_path.read_text(encoding="utf-8")
 
@@ -363,29 +382,76 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
 
     payload = yaml.safe_load(original_history.decode("utf-8"))
     issue_root = state_path.parent
+    claim_path = issue_root / payload["approvalClaimFile"]
+    original_claim = claim_path.read_bytes()
+    claim_payload = yaml.safe_load(original_claim.decode("utf-8"))
+    history_reference = accepted.relative_to(issue_root).as_posix()
+    assert claim_payload["historyFile"] == history_reference
+    assert claim_payload["historySha256"] == hashlib.sha256(original_history).hexdigest()
+    assert claim_payload["recordedAt"] == payload["recordedAt"]
+    assert claim_payload["approvedReviewFile"] == payload["approvedReviewFile"]
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z", claim_payload["claimedAt"])
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z", claim_payload["recordedAt"])
     archived_review = issue_root / payload["approvedReviewFile"]
     original_review = archived_review.read_bytes()
+    approved_at = approval.field(original_review.decode("utf-8"), "Approved At")
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", approved_at)
     archived_review.write_bytes(original_review + b"\nmutated: yes\n")
     assert_value_error("archived approved review SHA256 mismatch", lambda: parse_task_state(state_path))
     archived_review.write_bytes(original_review)
 
-    claim_path = issue_root / payload["approvalClaimFile"]
-    original_claim = claim_path.read_bytes()
     rejected_review = original_review.replace(b"Approved: yes", b"Approved: no")
     rejected_review_sha = hashlib.sha256(rejected_review).hexdigest()
-    claim_payload = yaml.safe_load(original_claim.decode("utf-8"))
-    claim_payload["approvedReviewSha256"] = rejected_review_sha
-    rewritten_claim = yaml.safe_dump(claim_payload, sort_keys=False).encode("utf-8")
     rewritten_history = dict(payload)
     rewritten_history["approvedReviewSha256"] = rejected_review_sha
-    rewritten_history["approvalClaimSha256"] = hashlib.sha256(rewritten_claim).hexdigest()
+    rewritten_history_bytes = yaml.safe_dump(rewritten_history, sort_keys=False).encode("utf-8")
+    rewritten_claim_payload = dict(claim_payload)
+    rewritten_claim_payload["approvedReviewSha256"] = rejected_review_sha
+    rewritten_claim_payload["historySha256"] = hashlib.sha256(rewritten_history_bytes).hexdigest()
+    rewritten_claim = yaml.safe_dump(rewritten_claim_payload, sort_keys=False).encode("utf-8")
     archived_review.write_bytes(rejected_review)
     claim_path.write_bytes(rewritten_claim)
-    write(accepted, yaml.safe_dump(rewritten_history, sort_keys=False))
+    accepted.write_bytes(rewritten_history_bytes)
     assert_value_error("local approval required: Approved: yes", lambda: parse_task_state(state_path))
     archived_review.write_bytes(original_review)
     claim_path.write_bytes(original_claim)
     accepted.write_bytes(original_history)
+
+    noncanonical_claim = dict(claim_payload)
+    noncanonical_claim["claimedAt"] = str(noncanonical_claim["claimedAt"]).replace("Z", "+00:00")
+    claim_path.write_bytes(yaml.safe_dump(noncanonical_claim, sort_keys=False).encode("utf-8"))
+    assert_value_error("claimedAt must be canonical UTC", lambda: parse_task_state(state_path))
+    claim_path.write_bytes(original_claim)
+
+    future_review = original_review.replace(
+        f"Approved At: {approved_at}".encode("utf-8"),
+        b"Approved At: 2099-01-01T00:00:00Z",
+    )
+    future_review_sha = hashlib.sha256(future_review).hexdigest()
+    chronology_history = dict(payload)
+    chronology_history["approvedReviewSha256"] = future_review_sha
+    chronology_history_bytes = yaml.safe_dump(chronology_history, sort_keys=False).encode("utf-8")
+    chronology_claim = dict(claim_payload)
+    chronology_claim["approvedReviewSha256"] = future_review_sha
+    chronology_claim["historySha256"] = hashlib.sha256(chronology_history_bytes).hexdigest()
+    archived_review.write_bytes(future_review)
+    accepted.write_bytes(chronology_history_bytes)
+    claim_path.write_bytes(yaml.safe_dump(chronology_claim, sort_keys=False).encode("utf-8"))
+    assert_value_error("approval chronology must satisfy", lambda: parse_task_state(state_path))
+    archived_review.write_bytes(original_review)
+    accepted.write_bytes(original_history)
+    claim_path.write_bytes(original_claim)
+
+    changed_recorded_at = "2098-12-31T23:59:59.999999Z"
+    renamed_payload = dict(payload)
+    renamed_payload["recordedAt"] = changed_recorded_at
+    renamed_history = approval._history_path(repo, issue, "contract-acceptance", changed_recorded_at)
+    renamed_history.write_bytes(yaml.safe_dump(renamed_payload, sort_keys=False).encode("utf-8"))
+    renamed_ref = renamed_history.relative_to(issue_root).as_posix()
+    write(state_path, render_task_state(task_state(issue, "feature/101-contract", renamed_ref)))
+    assert_value_error("claim does not seal exact history", lambda: parse_task_state(state_path))
+    renamed_history.unlink()
+    write(state_path, render_task_state(task_state(issue, "feature/101-contract", reference)))
 
     forged_payload = dict(payload)
     forged_payload["approvalId"] = "f" * 32
@@ -393,7 +459,6 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
     forged_payload["approvedReviewFile"] = "approvals/history/consumed/" + "f" * 32 + "-local-review.md"
     forged_payload["approvedReviewSha256"] = "0" * 64
     forged_payload["approvalClaimFile"] = "approvals/history/claims/" + "f" * 32 + ".yaml"
-    forged_payload["approvalClaimSha256"] = "0" * 64
     forged = accepted.parent / "20260731T010203000004Z-contract-acceptance.yaml"
     write(forged, yaml.safe_dump(forged_payload, sort_keys=False))
     forged_ref = forged.relative_to(state_path.parent).as_posix()
@@ -485,6 +550,98 @@ def test_atomic_contract_acceptance_claim(repo: Path) -> None:
     assert len(history) == 1
 
 
+def test_contract_acceptance_recovers_partial_publication(repo: Path) -> None:
+    cases = (
+        ("105", "contract acceptance claim collision", False),
+        ("106", "archived contract approval collision", True),
+    )
+    for issue, failure_point, archive_expected in cases:
+        write(repo / ".xflow" / "current-task.md", current_task(issue))
+        contract = load_contract(repo, copied_contract(repo, f"recover-{issue}.yaml"))
+        review = approval.prepare(
+            repo,
+            issue,
+            "contract-acceptance",
+            contract.path,
+            reviewer="reviewer",
+            force=True,
+            accepted_objects=ACCEPTED_OBJECTS,
+        )
+        approve(review)
+        original_writer = approval._write_immutable_bytes
+        injected = False
+
+        def crash_after_write(path: Path, content: bytes, collision_message: str) -> None:
+            nonlocal injected
+            original_writer(path, content, collision_message)
+            if not injected and collision_message == failure_point:
+                injected = True
+                raise RuntimeError(f"injected failure after {failure_point}")
+
+        with patch.object(approval, "_write_immutable_bytes", side_effect=crash_after_write):
+            try:
+                validate_contract_acceptance(repo, issue, contract, ACCEPTED_OBJECTS)
+            except RuntimeError as exc:
+                assert "injected failure" in str(exc)
+            else:
+                raise AssertionError("expected injected acceptance publication failure")
+
+        history_root = repo / ".xflow" / "issues" / f"issue-{issue}" / "approvals" / "history"
+        assert len(tuple((history_root / "claims").glob("*.yaml"))) == 1
+        assert bool(tuple((history_root / "consumed").glob("*.md"))) is archive_expected
+        assert not tuple(history_root.glob("*.yaml"))
+
+        claim_file = next((history_root / "claims").glob("*.yaml"))
+        original_claim = claim_file.read_bytes()
+        if issue == "105":
+            mismatched_claim = yaml.safe_load(original_claim.decode("utf-8"))
+            mismatched_claim["contractSha256"] = "0" * 64
+            claim_file.write_bytes(yaml.safe_dump(mismatched_claim, sort_keys=False).encode("utf-8"))
+            assert_value_error(
+                "claim replay or tampering",
+                lambda: validate_contract_acceptance(repo, issue, contract, ACCEPTED_OBJECTS),
+            )
+            claim_file.write_bytes(original_claim)
+        else:
+            archive_file = next((history_root / "consumed").glob("*.md"))
+            original_archive = archive_file.read_bytes()
+            archive_file.write_bytes(original_archive + b"mutated\n")
+            assert_value_error(
+                "existing archived review differs",
+                lambda: validate_contract_acceptance(repo, issue, contract, ACCEPTED_OBJECTS),
+            )
+            archive_file.write_bytes(original_archive)
+
+        accepted = validate_contract_acceptance(repo, issue, contract, ACCEPTED_OBJECTS)
+        assert len(tuple((history_root / "claims").glob("*.yaml"))) == 1
+        assert len(tuple((history_root / "consumed").glob("*.md"))) == 1
+        assert tuple(history_root.glob("*.yaml")) == (accepted,)
+        state_path = repo / ".xflow" / "issues" / f"issue-{issue}" / "task-state.md"
+        reference = accepted.relative_to(state_path.parent).as_posix()
+        recovered_state = dataclass_replace(
+            task_state(issue, "feature/101-contract", reference),
+            contract_file=f"contracts/recover-{issue}.yaml",
+        )
+        write(state_path, render_task_state(recovered_state))
+        assert parse_task_state(state_path).human_approval_ref == reference
+        original_history = accepted.read_bytes()
+        accepted.write_bytes(original_history.replace(b"reviewerSummary: reviewer", b"reviewerSummary: changed"))
+        assert_value_error(
+            "existing acceptance history differs",
+            lambda: validate_contract_acceptance(repo, issue, contract, ACCEPTED_OBJECTS),
+        )
+        accepted.write_bytes(original_history)
+        assert_value_error(
+            "approval already consumed",
+            lambda: validate_contract_acceptance(repo, issue, contract, ACCEPTED_OBJECTS),
+        )
+        assert_value_error(
+            "accepted object set mismatch",
+            lambda: validate_contract_acceptance(repo, issue, contract, (ACCEPTED_OBJECTS[0],)),
+        )
+        assert len(tuple(history_root.glob("*.yaml"))) == 1
+
+
 def test_cli_contract_edges_and_historical_list(repo: Path) -> None:
     bare = run_devctl(repo, "contract", expect=2)
     assert "usage: devctl contract" in bare.stderr
@@ -526,6 +683,7 @@ def main() -> None:
         test_exact_local_acceptance_and_task_state(repo, contract)
         test_draft_rejection_and_bom_acceptance(repo)
         test_atomic_contract_acceptance_claim(repo)
+        test_contract_acceptance_recovers_partial_publication(repo)
         test_cli_contract_edges_and_historical_list(repo)
     print("contract core ok")
 

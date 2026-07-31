@@ -169,9 +169,9 @@ def _add_object(objects: dict[str, ContractObject], item: ContractObject) -> Non
 
 
 def _validate_date(value: object) -> None:
-    if isinstance(value, date):
-        return
     text = _meaningful(value, "created")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        raise ValueError("created must use YYYY-MM-DD")
     try:
         date.fromisoformat(text)
     except ValueError as exc:
