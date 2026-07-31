@@ -21,6 +21,7 @@ sys.path.insert(0, str(OPS_ROOT))
 
 from xflow import approval
 from xflow import contracts as contracts_module
+from xflow import project_config
 from xflow.contracts import ContractDocument, load_contract, validate_contract_acceptance
 from xflow.task_state import TaskState, list_task_states, parse_task_state, render_task_state
 
@@ -545,31 +546,63 @@ def test_draft_rejection_and_bom_acceptance(repo: Path) -> None:
     assert bom.sha256 in record.read_text(encoding="utf-8")
 
 
-def test_atomic_contract_acceptance_claim(repo: Path) -> None:
-    issue = "103"
-    write(repo / ".xflow" / "current-task.md", current_task(issue))
-    contract = load_contract(repo, copied_contract(repo, "concurrent.yaml"))
-    review = approval.prepare(
-        repo, issue, "contract-acceptance", contract.path, reviewer="reviewer", force=True,
-        accepted_objects=ACCEPTED_OBJECTS,
+def test_windows_final_path_normalization_keeps_lock_containment(repo: Path) -> None:
+    assert project_config._normalize_windows_final_path(r"\\?\C:\repo\.xflow\claim.lock") == r"C:\repo\.xflow\claim.lock"
+    assert project_config._normalize_windows_final_path(r"C:\repo\.xflow\claim.lock") == r"C:\repo\.xflow\claim.lock"
+    assert project_config._normalize_windows_final_path(r"\\?\UNC\server\share\repo\.xflow\claim.lock") == r"\\server\share\repo\.xflow\claim.lock"
+    assert project_config._normalize_windows_final_path(r"\\server\share\repo\.xflow\claim.lock") == r"\\server\share\repo\.xflow\claim.lock"
+
+    outside = repo.parent / "outside.lock"
+    assert_value_error(
+        "outside repository",
+        lambda: project_config.require_safe_repo_path(repo, outside, "contract acceptance finalizer lock"),
     )
-    approve(review)
 
-    def accept() -> Path | ValueError:
-        try:
-            return validate_contract_acceptance(repo, issue, contract, ACCEPTED_OBJECTS)
-        except ValueError as exc:
-            return exc
+    claim_path = repo / ".xflow" / "issues" / "issue-103" / "approvals" / "history" / "claims" / "lock.yaml"
+    lock_path = claim_path.with_suffix(".lock")
+    assert project_config.require_safe_repo_path(
+        repo.parent / repo.name.upper(),
+        lock_path,
+        "contract acceptance finalizer lock",
+    ) == lock_path
+    original_resolve = project_config.Path.resolve
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        results = tuple(executor.map(lambda _: accept(), range(2)))
-    assert sum(isinstance(result, Path) for result in results) == 1, results
-    failures = [str(result) for result in results if isinstance(result, ValueError)]
-    assert len(failures) == 1 and "approval already claimed" in failures[0], failures
-    claims = tuple((repo / ".xflow" / "issues" / "issue-103" / "approvals" / "history" / "claims").glob("*.yaml"))
-    history = tuple((repo / ".xflow" / "issues" / "issue-103" / "approvals" / "history").glob("*.yaml"))
-    assert len(claims) == 1
-    assert len(history) == 1
+    def resolve_with_final_path_prefix(path: Path, *, strict: bool = False) -> Path:
+        resolved = original_resolve(path, strict=strict)
+        if path == lock_path:
+            return project_config.Path("\\\\?\\" + str(resolved))
+        return resolved
+
+    with patch.object(project_config.Path, "resolve", new=resolve_with_final_path_prefix):
+        with approval._contract_claim_lock(repo, claim_path, "a" * 32):
+            pass
+
+
+def test_atomic_contract_acceptance_claim(repo: Path) -> None:
+    for run in range(5):
+        issue = f"15{run}"
+        write(repo / ".xflow" / "current-task.md", current_task(issue))
+        contract = load_contract(repo, copied_contract(repo, f"concurrent-{run}.yaml"))
+        review = approval.prepare(
+            repo, issue, "contract-acceptance", contract.path, reviewer="reviewer", force=True,
+            accepted_objects=ACCEPTED_OBJECTS,
+        )
+        approve(review)
+
+        def accept() -> Path | ValueError:
+            try:
+                return validate_contract_acceptance(repo, issue, contract, ACCEPTED_OBJECTS)
+            except ValueError as exc:
+                return exc
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = tuple(executor.map(lambda _: accept(), range(2)))
+        assert sum(isinstance(result, Path) for result in results) == 1, results
+        failures = [str(result) for result in results if isinstance(result, ValueError)]
+        assert len(failures) == 1 and "approval already claimed" in failures[0], failures
+        history_root = repo / ".xflow" / "issues" / f"issue-{issue}" / "approvals" / "history"
+        assert len(tuple((history_root / "claims").glob("*.yaml"))) == 1
+        assert len(tuple(history_root.glob("*.yaml"))) == 1
 
 
 def test_contract_acceptance_recovers_partial_publication(repo: Path) -> None:
@@ -747,6 +780,7 @@ def main() -> None:
         test_contract_root_containment(repo)
         test_exact_local_acceptance_and_task_state(repo, contract)
         test_draft_rejection_and_bom_acceptance(repo)
+        test_windows_final_path_normalization_keeps_lock_containment(repo)
         test_atomic_contract_acceptance_claim(repo)
         test_contract_acceptance_recovers_partial_publication(repo)
         test_contract_acceptance_history_names_include_approval_id(repo)

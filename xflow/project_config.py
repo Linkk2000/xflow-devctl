@@ -28,10 +28,22 @@ def _is_reparse_point(path_stat: os.stat_result) -> bool:
     return stat.S_ISLNK(path_stat.st_mode) or bool(attributes & reparse_attribute)
 
 
+def _normalize_windows_final_path(value: str) -> str:
+    if value.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + value[8:]
+    if value.startswith("\\\\?\\"):
+        return value[4:]
+    return value
+
+
+def _canonical_repo_path(path: Path) -> Path:
+    return Path(os.path.abspath(_normalize_windows_final_path(str(path))))
+
+
 def require_safe_repo_path(repo_root: Path, path: Path, label: str) -> Path:
-    root = repo_root.resolve(strict=False)
+    root = _canonical_repo_path(repo_root.resolve(strict=False))
     target = path if path.is_absolute() else root / path
-    target = Path(os.path.abspath(target))
+    target = _canonical_repo_path(target)
     try:
         relative = target.relative_to(root)
     except ValueError as exc:
@@ -49,7 +61,7 @@ def require_safe_repo_path(repo_root: Path, path: Path, label: str) -> Path:
         if _is_reparse_point(path_stat):
             raise ValueError(f"{label} must not traverse a symlink, junction, or reparse point: {current}")
 
-    resolved = target.resolve(strict=False)
+    resolved = _canonical_repo_path(target.resolve(strict=False))
     try:
         resolved.relative_to(root)
     except ValueError as exc:

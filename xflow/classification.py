@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .paths import normalized_issue
+from .project_config import _normalize_windows_final_path
 from .task_state import CLASSIFICATIONS
 
 
@@ -352,11 +353,7 @@ class _WindowsApi:
             length = self._get_final_path(handle, buffer, size, 0)
             if not length or length >= size:
                 raise OSError(self._ctypes.get_last_error(), "GetFinalPathNameByHandleW failed")
-        value = buffer.value
-        if value.startswith("\\\\?\\UNC\\"):
-            value = "\\\\" + value[8:]
-        elif value.startswith("\\\\?\\"):
-            value = value[4:]
+        value = _normalize_windows_final_path(buffer.value)
         return Path(os.path.abspath(value))
 
     def is_regular_file(self, handle: int) -> bool:
