@@ -543,6 +543,98 @@ def test_persisted_edges_warn_when_predecessor_is_removed(repo: Path) -> None:
     run_devctl(repo, "contract", "diff", "--old", str(old_path), "--new", str(candidate_path), expect=0)
 
 
+def test_rejects_same_kind_historical_id_resurrection(repo: Path) -> None:
+    old_path = copied_contract(repo, "valid.yaml", "same-kind-resurrection-old.yaml")
+    old_payload = yaml.safe_load(old_path.read_text(encoding="utf-8"))
+    old_payload["futureCapabilitiesOutOfScope"][0]["supersedes"] = [
+        "example.future.retired-extension"
+    ]
+    write(old_path, old_payload)
+
+    candidate_path = copied_contract(repo, "valid.yaml", "same-kind-resurrection-new.yaml")
+    candidate_payload = copy.deepcopy(old_payload)
+    candidate_payload["version"] = "0.2.0"
+    candidate_payload["futureCapabilitiesOutOfScope"].append(
+        {
+            "id": "example.future.retired-extension",
+            "version": "0.1.0",
+            "capability": "已退役标识对应的可选扩展能力",
+            "reason": "不属于当前承诺且不进入当前验证",
+        }
+    )
+    write(candidate_path, candidate_payload)
+
+    diff = diff_contracts(load_contract(repo, old_path), load_contract(repo, candidate_path))
+    impacts = "\n".join(diff.review_impacts)
+    assert diff.required_bump == "human-review"
+    assert "[ERROR] stable-ID resurrection: example.future.retired-extension" in impacts
+    run_devctl(repo, "contract", "diff", "--old", str(old_path), "--new", str(candidate_path), expect=1)
+
+
+def test_rejects_cross_kind_historical_id_resurrection(repo: Path) -> None:
+    old_path = copied_contract(repo, "valid.yaml", "cross-kind-resurrection-old.yaml")
+    old_payload = yaml.safe_load(old_path.read_text(encoding="utf-8"))
+    old_payload["futureCapabilitiesOutOfScope"][0]["supersedes"] = [
+        "example.value.retired-extension"
+    ]
+    write(old_path, old_payload)
+
+    candidate_path = copied_contract(repo, "valid.yaml", "cross-kind-resurrection-new.yaml")
+    candidate_payload = copy.deepcopy(old_payload)
+    candidate_payload["version"] = "0.2.0"
+    candidate_payload["futureCapabilitiesOutOfScope"] = []
+    candidate_payload["semanticValueContracts"].append(
+        {
+            "id": "example.value.retired-extension",
+            "version": "0.1.0",
+            "name": "已退役标识对应的语义值",
+            "meanings": ["不得以其他对象种类重新启用的历史标识"],
+        }
+    )
+    write(candidate_path, candidate_payload)
+
+    diff = diff_contracts(load_contract(repo, old_path), load_contract(repo, candidate_path))
+    impacts = "\n".join(diff.review_impacts)
+    assert diff.required_bump == "human-review"
+    assert "[ERROR] stable-ID resurrection: example.value.retired-extension" in impacts
+    run_devctl(repo, "contract", "diff", "--old", str(old_path), "--new", str(candidate_path), expect=1)
+
+
+def test_old_current_predecessor_remains_or_retires_without_resurrection(repo: Path) -> None:
+    old_path = copied_contract(repo, "valid.yaml", "current-predecessor-old.yaml")
+    old_payload = yaml.safe_load(old_path.read_text(encoding="utf-8"))
+    old_payload["futureCapabilitiesOutOfScope"].append(
+        {
+            "id": "example.future.optional-extension-successor",
+            "version": "0.1.0",
+            "capability": "已声明当前前任的可选扩展能力",
+            "reason": "不属于当前承诺且不进入当前验证",
+            "supersedes": ["example.future.optional-extension"],
+        }
+    )
+    write(old_path, old_payload)
+    old = load_contract(repo, old_path)
+
+    retained_path = copied_contract(repo, "valid.yaml", "current-predecessor-retained.yaml")
+    write(retained_path, copy.deepcopy(old_payload))
+    retained_diff = diff_contracts(old, load_contract(repo, retained_path))
+    assert retained_diff.required_bump == "none"
+    assert "stable-ID resurrection" not in "\n".join(retained_diff.review_impacts)
+    run_devctl(repo, "contract", "diff", "--old", str(old_path), "--new", str(retained_path), expect=0)
+
+    retired_path = copied_contract(repo, "valid.yaml", "current-predecessor-retired.yaml")
+    retired_payload = copy.deepcopy(old_payload)
+    retired_payload["version"] = "0.1.1"
+    retired_payload["futureCapabilitiesOutOfScope"] = retired_payload["futureCapabilitiesOutOfScope"][1:]
+    write(retired_path, retired_payload)
+    retired_diff = diff_contracts(old, load_contract(repo, retired_path))
+    retired_impacts = "\n".join(retired_diff.review_impacts)
+    assert retired_diff.required_bump == "human-review"
+    assert "stable-ID resurrection" not in retired_impacts
+    assert "invalid historical supersedes" not in retired_impacts
+    run_devctl(repo, "contract", "diff", "--old", str(old_path), "--new", str(retired_path), expect=0)
+
+
 def test_persisted_supersedes_edges_are_canonical_sets(repo: Path) -> None:
     old_path = copied_contract(repo, "valid.yaml", "lineage-order-old.yaml")
     old_payload = yaml.safe_load(old_path.read_text(encoding="utf-8"))
@@ -909,6 +1001,12 @@ def main() -> None:
         test_exact_merge_warns_without_false_missing_lineage_error(init_repo(Path(raw)))
     with tempfile.TemporaryDirectory() as raw:
         test_persisted_edges_warn_when_predecessor_is_removed(init_repo(Path(raw)))
+    with tempfile.TemporaryDirectory() as raw:
+        test_rejects_same_kind_historical_id_resurrection(init_repo(Path(raw)))
+    with tempfile.TemporaryDirectory() as raw:
+        test_rejects_cross_kind_historical_id_resurrection(init_repo(Path(raw)))
+    with tempfile.TemporaryDirectory() as raw:
+        test_old_current_predecessor_remains_or_retires_without_resurrection(init_repo(Path(raw)))
     with tempfile.TemporaryDirectory() as raw:
         test_persisted_supersedes_edges_are_canonical_sets(init_repo(Path(raw)))
     with tempfile.TemporaryDirectory() as raw:

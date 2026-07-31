@@ -697,6 +697,17 @@ def diff_contracts(old: ContractDocument, new: ContractDocument) -> ContractDiff
     errors: list[str] = []
     under_bumped: list[str] = []
     object_version_errors: list[str] = []
+    old_by_id = old.objects_by_id
+    added_ids = set(added)
+    retired_historical_ids = {
+        predecessor
+        for item in old_by_id.values()
+        for predecessor in item.value.get("supersedes", ())
+        if predecessor not in old_by_id
+    }
+    for identifier in sorted(retired_historical_ids & added_ids):
+        errors.append(f"stable-ID resurrection: {identifier}")
+
     for key in shared_keys:
         previous = before[key]
         current = after[key]
@@ -719,7 +730,6 @@ def diff_contracts(old: ContractDocument, new: ContractDocument) -> ContractDiff
         if not _is_major_change(current, fields) and not fields <= {"name", "note"}:
             ambiguous.append(_ambiguous_change_impact(current, fields))
 
-    added_ids = set(added)
     for key in added_keys:
         item = after[key]
         optional = _is_optional_addition(item, new, added_ids)
@@ -739,7 +749,6 @@ def diff_contracts(old: ContractDocument, new: ContractDocument) -> ContractDiff
             mechanical_floor = "major"
 
     removed_by_id = {item.id: item for key, item in before.items() if key in removed_keys}
-    old_by_id = old.objects_by_id
     transition_supersedes: dict[str, set[str]] = {}
     lineage_keys = set(added_keys) | shared_keys
     for key in lineage_keys:
