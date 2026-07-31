@@ -186,6 +186,8 @@ def test_schema_semantic_parity(repo: Path) -> None:
         ("terminal-lf-date", "created: 2026-07-30", 'created: "2026-07-30\\n"'),
         ("terminal-cr-date", "created: 2026-07-30", 'created: "2026-07-30\\r"'),
         ("placeholder", "name: 能力名称", "name: ToDo"),
+        ("ascii-folded-placeholder", "name: 能力名称", "name: UnKnOwN"),
+        ("chinese-placeholder", "name: 能力名称", "name: 待定"),
         ("whitespace-id", "id: example.value.request", "id: 'example.value request'"),
         ("leading-id", "id: example.value.request", "id: ' example.value.request'"),
         ("trailing-id", "id: example.value.request", "id: 'example.value.request '"),
@@ -205,11 +207,25 @@ def test_schema_semantic_parity(repo: Path) -> None:
         assert_value_error("contract schema validation failed", lambda raw=raw: contracts_module._validate_contract_schema(raw))
         assert_value_error("", lambda raw=raw, path=path: contracts_module._build_document(path, raw, path.read_bytes()))
 
-    unicode_path = copied_contract(repo, "parity-valid-unicode.yaml")
-    replace(unicode_path, "name: 能力名称", "name: '能力 名称 Ω'")
-    unicode_raw = contracts_module._parse_contract_yaml(unicode_path.read_text(encoding="utf-8-sig"))
-    contracts_module._validate_contract_schema(unicode_raw)
-    assert contracts_module._build_document(unicode_path, unicode_raw, unicode_path.read_bytes()).raw["name"] == "能力 名称 Ω"
+    valid_unicode_cases = (
+        ("unicode-text", "name: 能力名称", "name: '能力 名称 Ω'", "name", "能力 名称 Ω"),
+        ("kelvin-text", "name: 能力名称", "name: unKnown", "name", "unKnown"),
+        (
+            "kelvin-id",
+            "id: example.contract.capability-name",
+            "id: unKnown",
+            "id",
+            "unKnown",
+        ),
+        ("long-s-text", "name: 能力名称", "name: 'ſcope boundary'", "name", "ſcope boundary"),
+    )
+    for name, old, new, field_name, expected in valid_unicode_cases:
+        unicode_path = copied_contract(repo, f"parity-valid-{name}.yaml")
+        replace(unicode_path, old, new)
+        unicode_raw = contracts_module._parse_contract_yaml(unicode_path.read_text(encoding="utf-8-sig"))
+        contracts_module._validate_contract_schema(unicode_raw)
+        document = contracts_module._build_document(unicode_path, unicode_raw, unicode_path.read_bytes())
+        assert document.raw[field_name] == expected
 
     original_import = builtins.__import__
 
@@ -445,7 +461,13 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
     changed_recorded_at = "2098-12-31T23:59:59.999999Z"
     renamed_payload = dict(payload)
     renamed_payload["recordedAt"] = changed_recorded_at
-    renamed_history = approval._history_path(repo, issue, "contract-acceptance", changed_recorded_at)
+    renamed_history = approval._history_path(
+        repo,
+        issue,
+        "contract-acceptance",
+        changed_recorded_at,
+        str(payload["approvalId"]),
+    )
     renamed_history.write_bytes(yaml.safe_dump(renamed_payload, sort_keys=False).encode("utf-8"))
     renamed_ref = renamed_history.relative_to(issue_root).as_posix()
     write(state_path, render_task_state(task_state(issue, "feature/101-contract", renamed_ref)))
@@ -459,7 +481,7 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
     forged_payload["approvedReviewFile"] = "approvals/history/consumed/" + "f" * 32 + "-local-review.md"
     forged_payload["approvedReviewSha256"] = "0" * 64
     forged_payload["approvalClaimFile"] = "approvals/history/claims/" + "f" * 32 + ".yaml"
-    forged = accepted.parent / "20260731T010203000004Z-contract-acceptance.yaml"
+    forged = accepted.parent / ("20260731T010203000004Z-contract-acceptance-" + "f" * 32 + ".yaml")
     write(forged, yaml.safe_dump(forged_payload, sort_keys=False))
     forged_ref = forged.relative_to(state_path.parent).as_posix()
     write(state_path, render_task_state(task_state(issue, "feature/101-contract", forged_ref)))
@@ -642,6 +664,49 @@ def test_contract_acceptance_recovers_partial_publication(repo: Path) -> None:
         assert len(tuple(history_root.glob("*.yaml"))) == 1
 
 
+def test_contract_acceptance_history_names_include_approval_id(repo: Path) -> None:
+    issue = "107"
+    write(repo / ".xflow" / "current-task.md", current_task(issue))
+    contract = load_contract(repo, copied_contract(repo, "same-recorded-at.yaml"))
+    recorded_at = "2099-01-02T03:04:05.000006Z"
+    approval_ids: list[str] = []
+    records: list[Path] = []
+
+    with patch.object(approval, "_canonical_utc_now", return_value=recorded_at):
+        for reviewer in ("first-reviewer", "second-reviewer"):
+            review = approval.prepare(
+                repo,
+                issue,
+                "contract-acceptance",
+                contract.path,
+                reviewer=reviewer,
+                force=True,
+                accepted_objects=ACCEPTED_OBJECTS,
+            )
+            approval_ids.append(approval.field(review.read_text(encoding="utf-8"), "Approval ID"))
+            approve(review)
+            records.append(validate_contract_acceptance(repo, issue, contract, ACCEPTED_OBJECTS))
+
+    assert records[0] != records[1]
+    for record, approval_id in zip(records, approval_ids, strict=True):
+        assert record.name == f"20990102T030405000006Z-contract-acceptance-{approval_id}.yaml"
+        payload = approval.validate_contract_acceptance_history(repo, record)
+        assert payload["approvalId"] == approval_id
+        claim = yaml.safe_load(
+            (
+                repo
+                / ".xflow"
+                / "issues"
+                / "issue-107"
+                / "approvals"
+                / "history"
+                / "claims"
+                / f"{approval_id}.yaml"
+            ).read_text(encoding="utf-8")
+        )
+        assert claim["historyFile"] == record.relative_to(record.parents[2]).as_posix()
+
+
 def test_cli_contract_edges_and_historical_list(repo: Path) -> None:
     bare = run_devctl(repo, "contract", expect=2)
     assert "usage: devctl contract" in bare.stderr
@@ -684,6 +749,7 @@ def main() -> None:
         test_draft_rejection_and_bom_acceptance(repo)
         test_atomic_contract_acceptance_claim(repo)
         test_contract_acceptance_recovers_partial_publication(repo)
+        test_contract_acceptance_history_names_include_approval_id(repo)
         test_cli_contract_edges_and_historical_list(repo)
     print("contract core ok")
 

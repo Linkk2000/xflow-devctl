@@ -590,6 +590,7 @@ def _parse_history_snapshot(repo_root: Path, path: Path) -> tuple[dict[str, obje
             str(payload["issue"]),
             str(payload["action"]),
             str(payload["recordedAt"]),
+            str(payload["approvalId"]) if payload["action"] == "contract-acceptance" else None,
         )
         if path.resolve() != expected_path:
             raise ValueError("history path does not match record Issue, action, and timestamp")
@@ -883,9 +884,23 @@ def _write_history_atomic(path: Path, content: str) -> None:
     )
 
 
-def _history_path(repo_root: Path, issue: str, action: str, recorded_at: str) -> Path:
+def _history_path(
+    repo_root: Path,
+    issue: str,
+    action: str,
+    recorded_at: str,
+    approval_id: str | None = None,
+) -> Path:
     issue = normalized_issue(issue)
     action = validate_action(action, history=True)
+    if action == "contract-acceptance":
+        if not isinstance(approval_id, str) or not APPROVAL_ID_RE.fullmatch(approval_id):
+            raise ValueError("contract acceptance history requires a valid approval ID")
+        approval_suffix = f"-{approval_id}"
+    else:
+        if approval_id is not None:
+            raise ValueError("approval ID filename suffix is reserved for contract acceptance history")
+        approval_suffix = ""
     issue_root = issue_dir(repo_root.resolve(), issue).resolve()
     history_root = (issue_root / "approvals" / "history").resolve()
     try:
@@ -893,7 +908,7 @@ def _history_path(repo_root: Path, issue: str, action: str, recorded_at: str) ->
     except ValueError as exc:
         raise ValueError("approval history path escapes Issue directory") from exc
     timestamp = recorded_at.replace("-", "").replace(":", "").replace(".", "")
-    target = (history_root / f"{timestamp}-{action}.yaml").resolve()
+    target = (history_root / f"{timestamp}-{action}{approval_suffix}.yaml").resolve()
     if target.parent != history_root:
         raise ValueError("approval history path escapes history directory")
     return target
@@ -1189,7 +1204,7 @@ def _finalize_contract_acceptance(
         if any(claim.get(name) != value for name, value in expected_claim.items()):
             raise ValueError("contract acceptance claim replay or tampering")
         recorded_at = str(claim["recordedAt"])
-        history_file = _history_path(repo_root, issue, grant.action, recorded_at)
+        history_file = _history_path(repo_root, issue, grant.action, recorded_at, grant.approval_id)
         history_relative = history_file.relative_to(issue_root).as_posix()
         if claim["historyFile"] != history_relative:
             raise ValueError("contract acceptance claim replay or tampering")
@@ -1212,7 +1227,7 @@ def _finalize_contract_acceptance(
     else:
         claimed_at = _canonical_utc_now()
         recorded_at = claimed_at
-        history_file = _history_path(repo_root, issue, grant.action, recorded_at)
+        history_file = _history_path(repo_root, issue, grant.action, recorded_at, grant.approval_id)
         history_relative = history_file.relative_to(issue_root).as_posix()
         history_payload = _contract_history_payload(
             grant,

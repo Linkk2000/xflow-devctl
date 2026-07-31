@@ -28,6 +28,7 @@ _PLACEHOLDERS = {
     "待补充",
     "占位",
 }
+_ASCII_CASEFOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 _ROOT_FIELDS = {
     "id",
     "version",
@@ -101,7 +102,7 @@ def _meaningful(value: object, label: str) -> str:
     text = value.strip()
     if value != text:
         raise ValueError(f"{label} must not contain leading or trailing whitespace")
-    if not text or text.casefold() in _PLACEHOLDERS:
+    if not text or text.translate(_ASCII_CASEFOLD) in _PLACEHOLDERS:
         raise ValueError(f"{label} must be meaningful")
     return text
 
