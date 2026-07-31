@@ -5,14 +5,17 @@ import os
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch
 from pathlib import Path
 
 
 OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
+from xflow import local_artifacts as local_artifacts_module
 from xflow.bindings import resolve_bindings
 from xflow.checks import check_current_task
+from xflow.cli import current_task_issue
 from xflow.bindings import git_path
 from xflow.collaboration import repository_lock
 from xflow.paths import active_task_pointer_file, legacy_active_task_pointer_file
@@ -189,6 +192,169 @@ def test_official_git_start_respects_closure_lock(root: Path) -> None:
     assert "another devctl process holds the repository collaboration lock" in result.stderr
     assert resolve_bindings(repo).branch == "main"
 
+
+def initialized_repo(root: Path, name: str, branch: str) -> Path:
+    repo = root / name
+    git(root, "init", "-q", str(repo))
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test User")
+    git(repo, "checkout", "-b", branch, "-q")
+    write(repo / "README.md", f"# {name}\n")
+    git(repo, "add", "README.md")
+    git(repo, "commit", "-m", "test: initialize fixture", "-q")
+    return repo
+
+
+def legacy_source(issue: str, *, action: str = "clarify-contract") -> str:
+    return (
+        f"# XFlow Current Task\n\nIssue: {issue}\nState: S2_REMOTE_ISSUE_CREATED\n\n"
+        f"## Allowed Actions\n- {action}\n\n## Forbidden Actions\n- push\n"
+    )
+
+
+def test_modern_pointer_blocks_legacy_migration(root: Path) -> None:
+    repo = initialized_repo(root, "modern-migration", "feature/501-modern")
+    write_state(repo, state("501", "feature/501-modern"))
+    activate_task(repo, "501")
+    bindings = resolve_bindings(repo)
+    pointer = active_task_pointer_file(repo, bindings.worktree)
+    original_pointer = pointer.read_bytes()
+    authority = authority_file(repo, "501")
+    authority.unlink()
+    current_task = repo / ".xflow" / "current-task.md"
+    write(current_task, legacy_source("501"))
+    migrated_state = TaskState(
+        issue="501",
+        execution_state="S2_REMOTE_ISSUE_CREATED",
+        semantic_phase="none",
+        classification="implementation-gap",
+        contract="legacy.current-task@0.1.0",
+        contract_file=".xflow/current-task.md",
+        contract_change_required=False,
+        branch="feature/501-modern",
+        base="main",
+        allowed_actions=("clarify-contract",),
+        forbidden_actions=("push",),
+        human_gate="legacy task state requires human gate confirmation",
+        human_approval_ref="none",
+    )
+    write_state(repo, migrated_state)
+
+    assert_value_error("modern task authority cannot downgrade to legacy", lambda: migrate_legacy_current_task(repo))
+    assert pointer.read_bytes() == original_pointer
+    assert not authority.exists()
+
+    mismatching = {
+        **json.loads(original_pointer.decode("utf-8")),
+        "issue": "999",
+        "taskMode": "legacy",
+        "contractId": "legacy.current-task",
+        "contractVersion": "0.1.0",
+        "contractFile": ".xflow/current-task.md",
+    }
+    write(pointer, json.dumps(mismatching, ensure_ascii=True, indent=2) + "\n")
+    assert_value_error("active task pointer Issue mismatch", lambda: migrate_legacy_current_task(repo))
+
+    write_state(repo, state("501", "feature/501-modern"))
+    write(pointer, original_pointer.decode("utf-8"))
+    assert load_active_task(repo).issue == "501"
+    old_pointer = legacy_active_task_pointer_file(repo, bindings.worktree)
+    write(old_pointer, pointer.read_text(encoding="utf-8"))
+    assert load_active_task(repo).issue == "501"
+    assert not old_pointer.exists()
+
+
+def test_legacy_authority_is_live_provenance(root: Path) -> None:
+    repo = initialized_repo(root, "legacy-provenance", "feature/502-legacy")
+    current_task = repo / ".xflow" / "current-task.md"
+    original_source = legacy_source("502")
+    write(current_task, original_source)
+    migrated = migrate_legacy_current_task(repo)
+    task_path = repo / ".xflow" / "issues" / "issue-502" / "task-state.md"
+    original_state = task_path.read_text(encoding="utf-8")
+    assert load_active_task(repo) == migrated
+
+    current_task.unlink()
+    assert_value_error("missing current task state file", lambda: load_active_task(repo))
+    assert_value_error("missing current task state file", lambda: check_current_task(repo, "502"))
+    write(current_task, original_source)
+    write(current_task, legacy_source("502", action="verify"))
+    assert_value_error("legacy task authority source provenance mismatch", lambda: load_active_task(repo))
+    assert_value_error("legacy task authority source provenance mismatch", lambda: check_current_task(repo, "502"))
+    assert_value_error("legacy task authority source provenance mismatch", lambda: current_task_issue(repo))
+    write(current_task, original_source)
+
+    write(task_path, original_state.replace("Base: main", "Base: develop"))
+    assert_value_error("canonical migrated task-state", lambda: load_active_task(repo))
+    assert_value_error("canonical migrated task-state", lambda: check_current_task(repo, "502"))
+    assert_value_error("canonical migrated task-state", lambda: current_task_issue(repo))
+    write(task_path, original_state)
+
+    original_reader = local_artifacts_module._read_stable_bytes
+
+    def mutate_source(*args: object, **kwargs: object) -> bytes:
+        content = original_reader(*args, **kwargs)
+        target = Path(args[1])
+        if target == current_task.resolve():
+            write(current_task, legacy_source("502", action="race"))
+        return content
+
+    try:
+        with patch.object(local_artifacts_module, "_read_stable_bytes", side_effect=mutate_source):
+            assert_value_error("changed while reading", lambda: load_active_task(repo))
+    finally:
+        write(current_task, original_source)
+
+
+def test_legacy_fallback_is_stable_and_authority_aware(root: Path) -> None:
+    repo = initialized_repo(root, "legacy-fallback", "feature/503-fallback")
+    current_task = repo / ".xflow" / "current-task.md"
+    write(current_task, legacy_source("STALE"))
+    write_state(repo, state("503", "feature/503-fallback"))
+    activate_task(repo, "503")
+    bindings = resolve_bindings(repo)
+    active_task_pointer_file(repo, bindings.worktree).unlink()
+    (repo / ".xflow" / "issues" / "issue-503" / "task-state.md").unlink()
+
+    assert_value_error("missing active task pointer", lambda: check_current_task(repo))
+    assert_value_error("missing active task pointer", lambda: current_task_issue(repo))
+
+    authority_file(repo, "503").unlink()
+    hardlink = current_task.with_name("current-task-hardlink.md")
+    os.link(current_task, hardlink)
+    assert_value_error("exactly one filesystem link", lambda: check_current_task(repo))
+    assert_value_error("exactly one filesystem link", lambda: current_task_issue(repo))
+    hardlink.unlink()
+
+    real_source = current_task.with_name("current-task-real.md")
+    current_task.replace(real_source)
+    try:
+        os.symlink(real_source.name, current_task)
+    except OSError:
+        real_source.replace(current_task)
+        with patch.object(local_artifacts_module, "_is_reparse_point", return_value=True):
+            assert_value_error("symlink, junction, or reparse point", lambda: check_current_task(repo))
+            assert_value_error("symlink, junction, or reparse point", lambda: current_task_issue(repo))
+    else:
+        assert_value_error("symlink, junction, or reparse point", lambda: check_current_task(repo))
+        assert_value_error("symlink, junction, or reparse point", lambda: current_task_issue(repo))
+        current_task.unlink()
+        real_source.replace(current_task)
+
+    original_reader = local_artifacts_module._read_stable_bytes
+
+    def mutate_fallback(*args: object, **kwargs: object) -> bytes:
+        content = original_reader(*args, **kwargs)
+        target = Path(args[1])
+        if target == current_task.resolve():
+            write(current_task, legacy_source("RACE"))
+        return content
+
+    with patch.object(local_artifacts_module, "_read_stable_bytes", side_effect=mutate_fallback):
+        assert_value_error("changed while reading", lambda: check_current_task(repo))
+    write(current_task, legacy_source("STALE"))
+    with patch.object(local_artifacts_module, "_read_stable_bytes", side_effect=mutate_fallback):
+        assert_value_error("changed while reading", lambda: current_task_issue(repo))
 
 def main() -> None:
     with tempfile.TemporaryDirectory() as raw:
@@ -431,6 +597,8 @@ def main() -> None:
         os.link(legacy, legacy_link)
         assert_value_error("exactly one filesystem link", lambda: migrate_legacy_current_task(worktree_a))
         legacy_link.unlink()
+        assert_value_error("active task pointer Issue mismatch", lambda: migrate_legacy_current_task(worktree_a))
+        active_task_pointer_file(worktree_a, resolve_bindings(worktree_a).worktree).unlink()
         migrated = migrate_legacy_current_task(worktree_a)
         assert migrated.issue == "LEGACY7"
         assert load_active_task(worktree_a).issue == "LEGACY7"
@@ -466,24 +634,30 @@ def main() -> None:
         assert migrated_path.is_file()
         migrated_bytes = migrated_path.read_bytes()
         write(legacy, "# XFlow Current Task\n\nIssue: LEGACY7\nState: S5_LOCAL_VERIFICATION\n\n## Allowed Actions\n- verify\n\n## Forbidden Actions\n- push\n")
-        assert_value_error("task-state already exists", lambda: migrate_legacy_current_task(worktree_a))
+        assert_value_error("legacy task authority source provenance mismatch", lambda: migrate_legacy_current_task(worktree_a))
         assert migrated_path.read_bytes() == migrated_bytes
         legacy.write_text("# XFlow Current Task\n\nIssue: ../invalid\n", encoding="utf-8", newline="\n")
         assert_value_error("current task Issue", lambda: migrate_legacy_current_task(worktree_a))
         assert not (worktree_a / ".xflow" / "issues" / "issue-invalid" / "task-state.md").exists()
-        write(legacy, "# XFlow Current Task\n\nIssue: CLI7\nState: S2_REMOTE_ISSUE_CREATED\n\n## Allowed Actions\n- clarify-contract\n\n## Forbidden Actions\n- push\n")
+        write(legacy, "# XFlow Current Task\n\nIssue: LEGACY7\nState: S2_REMOTE_ISSUE_CREATED\n\n## Allowed Actions\n- clarify-contract\n\n## Forbidden Actions\n- push\n")
 
         status = run_devctl(worktree_a, "task", "status")
         for field in ("repository", "worktree", "branch", "Issue", "Execution State", "Semantic Phase", "Classification", "Contract"):
             assert field in status.stdout
         listed = run_devctl(worktree_a, "task", "list")
         assert "#101" in listed.stdout
+        write(legacy, "# XFlow Current Task\n\nIssue: CLI7\nState: S2_REMOTE_ISSUE_CREATED\n\n## Allowed Actions\n- clarify-contract\n\n## Forbidden Actions\n- push\n")
+        assert_value_error("active task pointer Issue mismatch", lambda: migrate_legacy_current_task(worktree_a))
+        active_task_pointer_file(worktree_a, resolve_bindings(worktree_a).worktree).unlink()
         migrated_output = run_devctl(worktree_a, "task", "migrate-current")
         assert "CLI7" in migrated_output.stdout
         assert load_active_task(worktree_a).issue == "CLI7"
 
         test_official_git_start_respects_closure_lock(root)
         test_git_hook_devctl_reentry(root)
+        test_modern_pointer_blocks_legacy_migration(root)
+        test_legacy_authority_is_live_provenance(root)
+        test_legacy_fallback_is_stable_and_authority_aware(root)
 
     print("task state ok")
 

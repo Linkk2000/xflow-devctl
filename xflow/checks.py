@@ -15,6 +15,7 @@ from .local_artifacts import (
     contains_forbidden_object_storage_reference,
     contains_forbidden_remote_reference,
     safe_relative_reference,
+    revalidate_snapshots,
 )
 from .collaboration import repository_locked
 from .contracts import normalize_verification_type
@@ -181,18 +182,22 @@ def git_config(repo_root: Path, key: str) -> str:
 
 @repository_locked
 def check_current_task(repo_root: Path, issue: str | None = None, *, check_stale_pr: bool = True) -> None:
-    from .task_state import check_task_binding, task_authority_exists
-    from .bindings import fingerprint, git_path
-    from .paths import active_task_pointer_file, legacy_active_task_pointer_file
+    from .task_state import (
+        _legacy_migration_source,
+        _pointer_snapshots,
+        check_task_binding,
+        task_authority_issues,
+    )
+    from .bindings import resolve_bindings
+    from .paths import active_task_pointer_file
 
-    worktree = git_path(repo_root, "--show-toplevel")
-    worktree_fingerprint = fingerprint("worktree", worktree)
-    pointer = active_task_pointer_file(repo_root, worktree_fingerprint)
-    legacy_pointer = legacy_active_task_pointer_file(repo_root, worktree_fingerprint)
-    if pointer.exists() or legacy_pointer.exists():
+    bindings = resolve_bindings(repo_root)
+    pointer = active_task_pointer_file(repo_root, bindings.worktree)
+    pointer_snapshot, legacy_pointer_snapshot = _pointer_snapshots(repo_root, bindings)
+    if pointer_snapshot.exists or legacy_pointer_snapshot.exists:
         check_task_binding(repo_root, issue)
         return
-    if issue is not None and task_authority_exists(repo_root, normalized_issue(issue)):
+    if task_authority_issues(repo_root):
         raise ValueError(f"missing active task pointer: {pointer}")
     issues = repo_root.resolve() / ".xflow" / "issues"
     modern_authority = any(
@@ -202,18 +207,16 @@ def check_current_task(repo_root: Path, issue: str | None = None, *, check_stale
     ) if issues.is_dir() else False
     if modern_authority:
         raise ValueError(f"missing active task pointer: {pointer}")
-    path = repo_root / ".xflow" / "current-task.md"
-    if not path.is_file():
-        raise ValueError(f"missing current task state file: {path}")
-
-    text = read_text(path)
+    source_snapshot, legacy_state, _ = _legacy_migration_source(repo_root, bindings)
+    path = source_snapshot.path
+    text = source_snapshot.content.decode("utf-8-sig")
     state = markdown_field(text, "State")
     if not state:
         raise ValueError("missing required field in .xflow/current-task.md: State")
     if state not in MAIN_STATES:
         raise ValueError(f"unknown current task State: {state}")
 
-    task_issue = markdown_field(text, "Issue")
+    task_issue = legacy_state.issue
     if issue and normalized_issue(task_issue) != normalized_issue(issue):
         raise ValueError(f"current task Issue mismatch: expected {issue}, found {task_issue or '<missing>'}")
 
@@ -227,6 +230,7 @@ def check_current_task(repo_root: Path, issue: str | None = None, *, check_stale
             "stale current task state: local git config already records "
             f"devctl.pr={pr_number}, but State is still {state}; update to S9_REMOTE_REVIEW_AND_CI or later"
         )
+    revalidate_snapshots(repo_root, (source_snapshot,), "current task state file")
 
 
 def issue_dir(repo_root: Path, issue: str) -> Path:

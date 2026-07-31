@@ -25,12 +25,22 @@ from .checks import (
 from .commit_message import check_commit_message
 from .bindings import resolve_bindings
 from .classification import check_classification
-from .collaboration import git_child_environment, repository_mutation
+from .collaboration import git_child_environment, repository_locked, repository_mutation
 from .env import RuntimeContext, load_env_files, python_version, token_status_lines
 from .dependencies import check_dependencies
 from .migration import apply_issue_workspace_migration, inspect, inspect_issue_workspace_migration, write_wrappers
 from .paths import default_issue_file, normalized_issue
-from .task_state import activate_task, list_task_states, load_active_task, migrate_legacy_current_task
+from .task_state import (
+    _capture_file,
+    _legacy_field,
+    _pointer_snapshots,
+    _snapshot_text,
+    activate_task,
+    list_task_states,
+    load_active_task,
+    migrate_legacy_current_task,
+    task_authority_issues,
+)
 
 
 ISSUE_CREATE_EPILOG = """AI call recipes:
@@ -496,12 +506,32 @@ def require_requested_unattended(repo_root: Path, issue: str, requested: bool) -
         raise ValueError("--no-local-review requires active task-scoped unattended mode") from None
 
 
+@repository_locked
 def current_task_issue(repo_root: Path) -> str:
-    path = repo_root / ".xflow" / "current-task.md"
-    if not path.is_file():
+    from .local_artifacts import revalidate_snapshots
+
+    bindings = resolve_bindings(repo_root)
+    pointer_snapshot, legacy_pointer_snapshot = _pointer_snapshots(repo_root, bindings)
+    if pointer_snapshot.exists or legacy_pointer_snapshot.exists:
+        return load_active_task(repo_root).issue
+    if task_authority_issues(repo_root):
+        raise ValueError("missing active task pointer for retained task authority")
+    root = repo_root.resolve()
+    source_snapshot = _capture_file(
+        root,
+        root / ".xflow" / "current-task.md",
+        root,
+        "current task state file",
+        required=False,
+    )
+    if not source_snapshot.exists:
+        revalidate_snapshots(root, (source_snapshot,), "current task state file")
         return ""
-    value = markdown_field(path.read_text(encoding="utf-8-sig"), "Issue")
-    return normalized_issue(value) if value else ""
+    text = _snapshot_text(source_snapshot, "current task state file")
+    value = _legacy_field(text, "Issue")
+    issue = normalized_issue(value) if value else ""
+    revalidate_snapshots(root, (source_snapshot,), "current task state file")
+    return issue
 
 
 def resolve_action_issue(

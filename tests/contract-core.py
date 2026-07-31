@@ -22,7 +22,9 @@ sys.path.insert(0, str(OPS_ROOT))
 from xflow import approval
 from xflow import contracts as contracts_module
 from xflow import project_config
+from xflow.bindings import resolve_bindings
 from xflow.contracts import ContractDocument, load_contract, validate_contract_acceptance
+from xflow.paths import active_task_pointer_file, legacy_active_task_pointer_file
 from xflow.task_state import (
     TaskState,
     activate_task,
@@ -129,6 +131,9 @@ def current_task(issue: str) -> str:
 
 def activate_legacy_current_task(repo: Path, issue: str) -> TaskState:
     write(repo / ".xflow" / "current-task.md", current_task(issue))
+    bindings = resolve_bindings(repo)
+    active_task_pointer_file(repo, bindings.worktree).unlink(missing_ok=True)
+    legacy_active_task_pointer_file(repo, bindings.worktree).unlink(missing_ok=True)
     return migrate_legacy_current_task(repo)
 
 

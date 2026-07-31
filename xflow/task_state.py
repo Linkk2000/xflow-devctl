@@ -146,7 +146,7 @@ class TaskAuthority:
 
 
 def _field(text: str, name: str) -> str:
-    match = re.search(rf"(?im)^[ \t]*{re.escape(name)}[ \t]*:[ \t]*([^\r\n]*)[ \t]*$", text)
+    match = re.search(rf"(?im)^[ \t]*{re.escape(name)}[ \t]*:[ \t]*([^\r\n]*)[ \t]*\r?$", text)
     return match.group(1).strip() if match else ""
 
 
@@ -630,6 +630,35 @@ def _validate_authority_state(authority: TaskAuthority, state: TaskState) -> Non
         raise ValueError("task authority contract binding mismatch")
 
 
+def _validate_legacy_authority_provenance(
+    repo_root: Path,
+    bindings: GitBindings,
+    authority: TaskAuthority,
+    state: TaskState,
+    *,
+    task_snapshot: object | None = None,
+) -> tuple[object, object]:
+    if authority.taskMode != "legacy":
+        raise ValueError("legacy provenance validation requires legacy task authority")
+    source_snapshot, canonical_state, rendered = _legacy_migration_source(repo_root, bindings)
+    source_digest = hashlib.sha256(getattr(source_snapshot, "content") or b"").hexdigest()
+    if source_digest != authority.legacySourceDigest:
+        raise ValueError("legacy task authority source provenance mismatch")
+    if canonical_state != state:
+        raise ValueError("legacy task-state does not match canonical migrated task-state")
+    if task_snapshot is None:
+        task_snapshot = _task_state_snapshot(task_state_file(repo_root, state.issue))
+    if getattr(task_snapshot, "content") != rendered.encode("utf-8"):
+        raise ValueError("legacy task-state does not match canonical migrated task-state")
+    return source_snapshot, task_snapshot
+
+
+def _revalidate_legacy_provenance(repo_root: Path, snapshots: tuple[object, ...]) -> None:
+    from .local_artifacts import revalidate_snapshots
+
+    revalidate_snapshots(repo_root, snapshots, "legacy task provenance")
+
+
 def _validate_authority_pointer(authority: TaskAuthority, pointer: ActiveTaskPointer) -> None:
     expected = (
         authority.repository,
@@ -657,6 +686,40 @@ def task_authority_exists(repo_root: Path, issue: str) -> bool:
     bindings = resolve_bindings(repo_root)
     snapshot, _ = _load_authority(repo_root, bindings, issue, required=False)
     return bool(getattr(snapshot, "exists"))
+
+
+def task_authority_issues(repo_root: Path) -> tuple[str, ...]:
+    from .local_artifacts import revalidate_snapshots
+
+    bindings = resolve_bindings(repo_root)
+    common_dir = git_path(repo_root, "--git-common-dir")
+    authority_root = task_authority_file(repo_root, bindings.worktree, "inventory").parent.parent
+
+    def candidates() -> tuple[Path, ...]:
+        if not authority_root.exists():
+            return ()
+        return tuple(sorted(authority_root.glob("issue-*/authority.json")))
+
+    before = candidates()
+    snapshots = []
+    issues = []
+    for path in before:
+        issue = path.parent.name.removeprefix("issue-")
+        normalized = _normalized_issue(issue)
+        snapshot = _capture_file(common_dir, path, common_dir, "task authority")
+        authority = _authority(_json_snapshot(snapshot, "task authority"))
+        if authority.repository != bindings.repository:
+            raise ValueError("task authority repository mismatch")
+        if authority.worktree != bindings.worktree:
+            raise ValueError("task authority worktree mismatch")
+        if authority.issue != normalized:
+            raise ValueError(f"task authority Issue mismatch: expected {normalized}, found {authority.issue}")
+        snapshots.append(snapshot)
+        issues.append(normalized)
+    if candidates() != before:
+        raise ValueError("task authority inventory changed while reading")
+    revalidate_snapshots(common_dir, tuple(snapshots), "task authority inventory")
+    return tuple(issues)
 
 
 def _validate_pointer_bindings(pointer: ActiveTaskPointer, bindings: GitBindings) -> None:
@@ -723,7 +786,24 @@ def _pointer_snapshots(repo_root: Path, bindings: GitBindings) -> tuple[object, 
     current = _capture_file(common_dir, path, common_dir, "active task pointer", required=False)
     legacy = _capture_file(repo_root.resolve(), legacy_path, repo_root.resolve(), "legacy active task pointer", required=False)
     if getattr(current, "exists") and getattr(legacy, "exists"):
-        raise ValueError("conflicting active task pointers in git common-dir and legacy worktree location")
+        if getattr(current, "content") != getattr(legacy, "content"):
+            raise ValueError("conflicting active task pointers in git common-dir and legacy worktree location")
+        current_pointer = _read_pointer_snapshot(current)
+        legacy_pointer = _read_pointer_snapshot(legacy)
+        _validate_pointer_bindings(current_pointer, bindings)
+        _validate_pointer_bindings(legacy_pointer, bindings)
+        from .local_artifacts import revalidate_snapshots
+
+        revalidate_snapshots(common_dir, (current,), "active task pointer")
+        revalidate_snapshots(repo_root.resolve(), (legacy,), "legacy active task pointer")
+        legacy_path.unlink()
+        legacy = _capture_file(
+            repo_root.resolve(),
+            legacy_path,
+            repo_root.resolve(),
+            "legacy active task pointer",
+            required=False,
+        )
     return current, legacy
 
 
@@ -782,12 +862,12 @@ def _load_pointer(repo_root: Path, bindings: GitBindings) -> ActiveTaskPointer:
     path = active_task_pointer_file(repo_root, bindings.worktree)
     legacy_path = legacy_active_task_pointer_file(repo_root, bindings.worktree)
     current_snapshot, legacy_snapshot = _pointer_snapshots(repo_root, bindings)
-    source_snapshot = current_snapshot if getattr(current_snapshot, "exists") else legacy_snapshot
-    if not getattr(source_snapshot, "exists"):
+    pointer_source_snapshot = current_snapshot if getattr(current_snapshot, "exists") else legacy_snapshot
+    if not getattr(pointer_source_snapshot, "exists"):
         raise ValueError(f"missing active task pointer: {path}")
-    pointer = _read_pointer_snapshot(source_snapshot)
+    pointer = _read_pointer_snapshot(pointer_source_snapshot)
     _validate_pointer_bindings(pointer, bindings)
-    _, state = _load_task_state(
+    state_snapshot, state = _load_task_state(
         task_state_file(repo_root, pointer.issue),
         binding_mode="recorded",
         validate_acceptance=False,
@@ -801,7 +881,7 @@ def _load_pointer(repo_root: Path, bindings: GitBindings) -> ActiveTaskPointer:
     else:
         _validate_pointer_state(pointer, state, bindings)
 
-    _, authority = _load_authority(repo_root, bindings, pointer.issue, required=False)
+    authority_snapshot, authority = _load_authority(repo_root, bindings, pointer.issue, required=False)
     if authority is None:
         if pointer.taskMode == "legacy":
             source, migrated_state, rendered = _legacy_migration_source(repo_root, bindings)
@@ -815,27 +895,56 @@ def _load_pointer(repo_root: Path, bindings: GitBindings) -> ActiveTaskPointer:
         else:
             authority = _authority_from_state(bindings, state)
         _write_authority(task_authority_file(repo_root, bindings.worktree, state.issue), authority)
+        authority_snapshot, recovered_authority = _load_authority(
+            repo_root,
+            bindings,
+            pointer.issue,
+            required=True,
+        )
+        assert recovered_authority is not None
+        authority = recovered_authority
     _validate_authority_state(authority, state)
     _validate_authority_pointer(authority, pointer)
+    legacy_snapshots: tuple[object, ...] = ()
+    if authority.taskMode == "legacy":
+        source_snapshot, validated_task_snapshot = _validate_legacy_authority_provenance(
+            repo_root,
+            bindings,
+            authority,
+            state,
+            task_snapshot=state_snapshot,
+        )
+        legacy_snapshots = (source_snapshot, validated_task_snapshot, authority_snapshot)
 
     if pointer.version == POINTER_VERSION and (
-        getattr(source_snapshot, "path") == legacy_path or getattr(current_snapshot, "content") != (
+        getattr(pointer_source_snapshot, "path") == legacy_path or getattr(current_snapshot, "content") != (
             json.dumps(asdict(pointer), ensure_ascii=True, indent=2) + "\n"
         ).encode("utf-8")
     ):
         _write_pointer(path, pointer)
     if getattr(legacy_snapshot, "exists"):
         legacy_path.unlink()
+    if legacy_snapshots:
+        _revalidate_legacy_provenance(repo_root, legacy_snapshots)
     return pointer
 
 
 def _state_for_pointer(repo_root: Path, pointer: ActiveTaskPointer, bindings: GitBindings) -> TaskState:
-    _, state = _load_task_state(task_state_file(repo_root, pointer.issue))
+    task_snapshot, state = _load_task_state(task_state_file(repo_root, pointer.issue))
     _validate_pointer_state(pointer, state, bindings)
-    _, authority = _load_authority(repo_root, bindings, pointer.issue, required=True)
+    authority_snapshot, authority = _load_authority(repo_root, bindings, pointer.issue, required=True)
     assert authority is not None
     _validate_authority_state(authority, state)
     _validate_authority_pointer(authority, pointer)
+    if authority.taskMode == "legacy":
+        source_snapshot, task_snapshot = _validate_legacy_authority_provenance(
+            repo_root,
+            bindings,
+            authority,
+            state,
+            task_snapshot=task_snapshot,
+        )
+        _revalidate_legacy_provenance(repo_root, (source_snapshot, task_snapshot, authority_snapshot))
     return state
 
 
@@ -914,7 +1023,6 @@ def _legacy_field(text: str, name: str) -> str:
 def migrate_legacy_current_task(repo_root: Path) -> TaskState:
     bindings = resolve_bindings(repo_root)
     source, state, rendered = _legacy_migration_source(repo_root, bindings)
-    state = _require_exact_migration_state(repo_root, state, rendered)
     digest = hashlib.sha256(getattr(source, "content") or b"").hexdigest()
     authority = _authority_from_state(bindings, state, legacy_source_digest=digest)
     _, existing_authority = _load_authority(repo_root, bindings, state.issue, required=False)
@@ -931,6 +1039,26 @@ def migrate_legacy_current_task(repo_root: Path) -> TaskState:
     if getattr(source_pointer, "exists"):
         existing_pointer = _read_pointer_snapshot(source_pointer)
         _validate_pointer_bindings(existing_pointer, bindings)
+        if existing_pointer.issue != state.issue:
+            raise ValueError(
+                f"active task pointer Issue mismatch: expected {state.issue}, found {existing_pointer.issue}"
+            )
+        if existing_pointer.version != POINTER_VERSION:
+            if existing_authority is None or existing_authority.taskMode != "legacy":
+                raise ValueError("existing active task pointer cannot be migrated safely")
+        else:
+            existing_binding = (
+                existing_pointer.taskMode,
+                existing_pointer.contractId,
+                existing_pointer.contractVersion,
+                existing_pointer.contractFile,
+            )
+            if existing_pointer.taskMode == "modern-contract":
+                raise ValueError("modern task authority cannot downgrade to legacy")
+            expected_binding = ("legacy", LEGACY_CONTRACT_ID, LEGACY_CONTRACT_VERSION, LEGACY_CONTRACT_FILE)
+            if existing_binding != expected_binding:
+                raise ValueError("existing active task pointer conflicts with legacy migration")
+    state = _require_exact_migration_state(repo_root, state, rendered)
     expected_binding = ("legacy", LEGACY_CONTRACT_ID, LEGACY_CONTRACT_VERSION, LEGACY_CONTRACT_FILE)
     if (
         existing_pointer is not None

@@ -38,7 +38,7 @@ from xflow.providers import (
     list_issues,
     show_issue,
 )
-from xflow.paths import active_task_pointer_file, default_approval_file, default_issue_file, issue_dir
+from xflow.paths import active_task_pointer_file, default_approval_file, default_issue_file, issue_dir, task_authority_file
 from xflow.cli import branch_name_from_slug, commit_and_push_pr_backfill, summarize_commit_message
 from xflow.task_state import TaskState, activate_task, render_task_state
 from xflow.unattended import disable, enable, load, migrate_issue, require_active
@@ -2832,6 +2832,10 @@ State: S6_PREPARE_COMMIT_AND_MR_DRAFT
 - Create PR before local human approval.
 """,
         )
+        bindings = resolve_bindings(repo)
+        authority_root = task_authority_file(repo, bindings.worktree, "1").parent.parent
+        for candidate in authority_root.glob("issue-*/authority.json"):
+            candidate.unlink()
         run_devctl(repo, "check", "current-task", "--issue", "1")
         git(repo, "config", "--local", "devctl.pr", "9")
         run_devctl(repo, "check", "current-task", "--issue", "1", expect=1)

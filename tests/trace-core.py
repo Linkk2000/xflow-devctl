@@ -24,7 +24,7 @@ from xflow.checks import check_resolution_report
 from xflow.collaboration import repository_lock
 from xflow.contracts import load_contract, validate_contract_acceptance
 from xflow.paths import active_task_pointer_file, legacy_active_task_pointer_file, task_authority_file
-from xflow.task_state import TaskState, activate_task, render_task_state
+from xflow.task_state import TaskState, activate_task, migrate_legacy_current_task, render_task_state
 from xflow.traceability import check_traceability, check_traceability_resolution
 
 
@@ -1126,6 +1126,21 @@ def test_final_authority_and_git_revalidation(repo: Path) -> None:
     with patch.object(traceability_module, "_verify_closure", side_effect=advance_head):
         assert_error("Git HEAD changed during closure validation", lambda: check_resolution_report(repo, "101", report))
 
+    real_run = subprocess.run
+
+    def fail_head(command: object, *args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if isinstance(command, list) and command[-3:] == ["rev-parse", "--verify", "HEAD"]:
+            return subprocess.CompletedProcess(command, 128, "", "fatal: corrupt HEAD")
+        return real_run(command, *args, **kwargs)  # type: ignore[arg-type]
+
+    with patch.object(subprocess, "run", side_effect=fail_head):
+        assert_error("cannot determine current Git HEAD", lambda: check_resolution_report(repo, "101", report))
+
+    unborn = repo.parent / "unborn-head"
+    git(repo.parent, "init", "-q", str(unborn))
+    git(unborn, "checkout", "-b", "feature/unborn", "-q")
+    assert traceability_module._git_head(unborn) is None
+
 
 def test_legacy_resolution_still_binds_current_issue(repo: Path) -> None:
     pointer = active_task_pointer_file(repo, resolve_bindings(repo).worktree)
@@ -1179,7 +1194,11 @@ Reason: The legacy behavior is verified.
 """,
     )
     current_task = repo / ".xflow" / "current-task.md"
-    write(current_task, "# XFlow Current Task\n\nIssue: legacy\nState: S5_LOCAL_VERIFICATION\n")
+    source = (
+        "# XFlow Current Task\n\nIssue: legacy\nState: S5_LOCAL_VERIFICATION\n\n"
+        "## Allowed Actions\n- verify\n\n## Forbidden Actions\n- push\n"
+    )
+    write(current_task, source)
     check_resolution_report(repo, "legacy")
 
     write(current_task, "# XFlow Current Task\n\nIssue: other\nState: S5_LOCAL_VERIFICATION\n")
@@ -1187,6 +1206,33 @@ Reason: The legacy behavior is verified.
 
     current_task.unlink()
     assert_error("missing legacy current task", lambda: check_resolution_report(repo, "legacy"))
+
+    write(current_task, source)
+    migrate_legacy_current_task(repo)
+    check_resolution_report(repo, "legacy")
+    task_path = issue_root / "task-state.md"
+    original_state = task_path.read_text(encoding="utf-8")
+
+    current_task.unlink()
+    assert_error("missing current task state file", lambda: check_resolution_report(repo, "legacy"))
+    write(current_task, source.replace("- verify", "- inspect"))
+    assert_error("legacy task authority source provenance mismatch", lambda: check_resolution_report(repo, "legacy"))
+    write(current_task, source)
+    write(task_path, original_state.replace("Base: main", "Base: develop"))
+    assert_error("canonical migrated task-state", lambda: check_resolution_report(repo, "legacy"))
+    write(task_path, original_state)
+
+    original_revalidate = traceability_module._revalidate
+
+    def mutate_legacy_source(*args: object, **kwargs: object) -> object:
+        write(current_task, source.replace("- verify", "- race"))
+        return original_revalidate(*args, **kwargs)
+
+    try:
+        with patch.object(traceability_module, "_revalidate", side_effect=mutate_legacy_source):
+            assert_error("legacy current task changed during closure validation", lambda: check_resolution_report(repo, "legacy"))
+    finally:
+        write(current_task, source)
 
 
 def test_provider_endpoint_families(repo: Path) -> None:

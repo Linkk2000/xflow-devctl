@@ -5,6 +5,7 @@ import hashlib
 import ipaddress
 import os
 import re
+import subprocess
 import unicodedata
 import warnings
 from io import BytesIO
@@ -16,7 +17,7 @@ from urllib.parse import urlsplit, urlunsplit
 from PIL import Image, UnidentifiedImageError
 
 from . import approval
-from .bindings import GitBindings, git_output, resolve_bindings
+from .bindings import GitBindings, resolve_bindings
 from .classification import (
     _decode_classification_bytes,
     _load_yaml,
@@ -53,6 +54,7 @@ from .task_state import (
     _read_pointer_snapshot,
     _validate_authority_pointer,
     _validate_authority_state,
+    _validate_legacy_authority_provenance,
     _validate_pointer_bindings,
     _validate_pointer_state,
     load_active_pointer,
@@ -240,9 +242,42 @@ def _optional_snapshot(
 
 
 def _git_head(root: Path) -> str | None:
-    head = git_output(root, "rev-parse", "--verify", "HEAD")
+    result = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
+        check=False,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    head = result.stdout.strip()
+    if result.returncode != 0:
+        symbolic = subprocess.run(
+            ["git", "-C", str(root), "symbolic-ref", "--quiet", "HEAD"],
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        reference = symbolic.stdout.strip()
+        absent = subprocess.run(
+            ["git", "-C", str(root), "show-ref", "--verify", "--quiet", reference],
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) if symbolic.returncode == 0 and reference.startswith("refs/heads/") else None
+        if symbolic.returncode == 0 and absent is not None and absent.returncode == 1 and not absent.stderr.strip():
+            return None
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise ValueError(f"cannot determine current Git HEAD: {detail or 'unknown Git error'}")
     if not head:
-        return None
+        raise ValueError("cannot determine current Git HEAD: empty revision")
     if not re.fullmatch(r"[0-9a-fA-F]{40,64}", head):
         raise ValueError("cannot determine current Git HEAD")
     return head
@@ -357,6 +392,16 @@ def _load_context(
     if pointer.taskMode == "legacy":
         if classification_snapshot.exists or matrix_snapshot.exists:
             raise ValueError("legacy active task pointer conflicts with modern contract authority")
+        legacy_source_snapshot, validated_task_snapshot = _validate_legacy_authority_provenance(
+            root,
+            bindings,
+            authority,
+            state,
+            task_snapshot=task_snapshot,
+        )
+        tracked.append((legacy_source_snapshot, "legacy current task"))
+        if validated_task_snapshot != task_snapshot:
+            raise ValueError("task-state changed between legacy provenance snapshots")
         return _ClosureContext(
             root,
             issue_directory,
