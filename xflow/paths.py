@@ -52,3 +52,19 @@ def legacy_active_task_pointer_file(repo_root: Path, worktree_fingerprint: str) 
         / worktree_fingerprint
         / "active-task.json"
     )
+
+
+def task_authority_file(repo_root: Path, worktree_fingerprint: str, issue: str) -> Path:
+    from .bindings import git_path
+
+    common_dir = git_path(repo_root, "--git-common-dir")
+    return (
+        common_dir
+        / "xflow"
+        / "local"
+        / "worktrees"
+        / worktree_fingerprint
+        / "issues"
+        / f"issue-{normalized_issue(issue)}"
+        / "authority.json"
+    )

@@ -181,7 +181,7 @@ def git_config(repo_root: Path, key: str) -> str:
 
 @repository_locked
 def check_current_task(repo_root: Path, issue: str | None = None, *, check_stale_pr: bool = True) -> None:
-    from .task_state import check_task_binding
+    from .task_state import check_task_binding, task_authority_exists
     from .bindings import fingerprint, git_path
     from .paths import active_task_pointer_file, legacy_active_task_pointer_file
 
@@ -192,6 +192,8 @@ def check_current_task(repo_root: Path, issue: str | None = None, *, check_stale
     if pointer.exists() or legacy_pointer.exists():
         check_task_binding(repo_root, issue)
         return
+    if issue is not None and task_authority_exists(repo_root, normalized_issue(issue)):
+        raise ValueError(f"missing active task pointer: {pointer}")
     issues = repo_root.resolve() / ".xflow" / "issues"
     modern_authority = any(
         candidate.is_file()

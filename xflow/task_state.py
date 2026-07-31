@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -8,10 +9,15 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .bindings import GitBindings, resolve_bindings
+from .bindings import GitBindings, git_path, resolve_bindings
 from .collaboration import repository_locked
-from .io import read_text
-from .paths import active_task_pointer_file, legacy_active_task_pointer_file, task_state_file
+from .json_safety import loads_unique_json
+from .paths import (
+    active_task_pointer_file,
+    legacy_active_task_pointer_file,
+    task_authority_file,
+    task_state_file,
+)
 
 
 EXECUTION_STATES = (
@@ -50,6 +56,19 @@ POINTER_VERSION = 2
 POINTER_V1_FIELDS = {"version", "repository", "worktree", "branch", "issue", "activatedAt"}
 POINTER_FIELDS = POINTER_V1_FIELDS | {"taskMode", "contractId", "contractVersion", "contractFile"}
 TASK_MODES = {"modern-contract", "legacy"}
+AUTHORITY_VERSION = 1
+AUTHORITY_FIELDS = {
+    "version",
+    "repository",
+    "worktree",
+    "issue",
+    "taskMode",
+    "contractId",
+    "contractVersion",
+    "contractFile",
+    "legacySourceFile",
+    "legacySourceDigest",
+}
 LEGACY_CONTRACT_ID = "legacy.current-task"
 LEGACY_CONTRACT_VERSION = "0.1.0"
 LEGACY_CONTRACT_REF = f"{LEGACY_CONTRACT_ID}@{LEGACY_CONTRACT_VERSION}"
@@ -110,6 +129,20 @@ class ActiveTaskPointer:
     contractVersion: str
     contractFile: str
     activatedAt: str
+
+
+@dataclass(frozen=True)
+class TaskAuthority:
+    version: int
+    repository: str
+    worktree: str
+    issue: str
+    taskMode: str
+    contractId: str
+    contractVersion: str
+    contractFile: str
+    legacySourceFile: str | None
+    legacySourceDigest: str | None
 
 
 def _field(text: str, name: str) -> str:
@@ -204,10 +237,55 @@ def _validate_relative_approval(value: str) -> None:
         raise ValueError("Human Approval Ref must be an Issue-relative path under approvals/history/")
 
 
+def _task_state_snapshot(path: Path) -> object:
+    absolute = Path(os.path.abspath(path))
+    if (
+        absolute.name != "task-state.md"
+        or not absolute.parent.name.startswith("issue-")
+        or absolute.parent.parent.name != "issues"
+        or absolute.parent.parent.parent.name != ".xflow"
+    ):
+        raise ValueError("task-state file must be inside the matching Issue directory")
+    from .local_artifacts import MAX_SMALL_ARTIFACT_BYTES, capture_stable_file
+
+    root = absolute.parents[3]
+    snapshot = capture_stable_file(
+        root,
+        absolute,
+        absolute.parent,
+        "task-state",
+        max_bytes=MAX_SMALL_ARTIFACT_BYTES,
+    )
+    return snapshot
+
+
+def _snapshot_text(snapshot: object, label: str) -> str:
+    content = getattr(snapshot, "content", None)
+    path = getattr(snapshot, "path", "<unknown>")
+    try:
+        return (content or b"").decode("utf-8-sig", errors="strict")
+    except UnicodeError as exc:
+        raise ValueError(f"{label} must be valid UTF-8: {path}") from exc
+
+
+def _load_task_state(
+    path: Path,
+    *,
+    binding_mode: str = "current",
+    validate_acceptance: bool = True,
+) -> tuple[object, TaskState]:
+    snapshot = _task_state_snapshot(path)
+    state = parse_task_state_text(
+        getattr(snapshot, "path"),
+        _snapshot_text(snapshot, "task-state"),
+        binding_mode=binding_mode,
+        validate_acceptance=validate_acceptance,
+    )
+    return snapshot, state
+
+
 def parse_task_state(path: Path, *, binding_mode: str = "current") -> TaskState:
-    if not path.is_file():
-        raise ValueError(f"missing task-state file: {path}")
-    return parse_task_state_text(path, read_text(path), binding_mode=binding_mode)
+    return _load_task_state(path, binding_mode=binding_mode)[1]
 
 
 def parse_task_state_text(
@@ -219,7 +297,7 @@ def parse_task_state_text(
 ) -> TaskState:
     fields, allowed_actions, forbidden_actions = _parse_task_state_markdown(text)
     issue = _normalized_issue(_required(fields["Issue"], "Issue"))
-    resolved = path.resolve()
+    resolved = Path(os.path.abspath(path))
     expected_parent = f"issue-{issue}"
     if (
         resolved.parent.name != expected_parent
@@ -411,12 +489,174 @@ def _pointer(payload: object) -> ActiveTaskPointer:
     )
 
 
-def _read_pointer(path: Path) -> ActiveTaskPointer:
+def _capture_file(
+    read_root: Path,
+    path: Path,
+    allowed_root: Path,
+    label: str,
+    *,
+    required: bool = True,
+) -> object:
+    from .local_artifacts import MAX_SMALL_ARTIFACT_BYTES, capture_stable_file
+
+    return capture_stable_file(
+        read_root,
+        path,
+        allowed_root,
+        label,
+        required=required,
+        max_bytes=MAX_SMALL_ARTIFACT_BYTES,
+    )
+
+
+def _json_snapshot(snapshot: object, label: str) -> object:
     try:
-        pointer = _pointer(json.loads(read_text(path)))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"invalid active task pointer: cannot read {path}: {exc}") from exc
-    return pointer
+        return loads_unique_json(_snapshot_text(snapshot, label))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid {label} JSON") from exc
+
+
+def _read_pointer_snapshot(snapshot: object) -> ActiveTaskPointer:
+    return _pointer(_json_snapshot(snapshot, "active task pointer"))
+
+
+def _fingerprint(value: object, label: str) -> str:
+    if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError(f"invalid task authority: {label} fingerprint is malformed")
+    return value
+
+
+def _authority(payload: object) -> TaskAuthority:
+    if not isinstance(payload, dict) or set(payload) != AUTHORITY_FIELDS:
+        raise ValueError("invalid task authority: unexpected JSON fields")
+    if type(payload["version"]) is not int or payload["version"] != AUTHORITY_VERSION:
+        raise ValueError("invalid task authority: unsupported version")
+    repository = _fingerprint(payload["repository"], "repository")
+    worktree = _fingerprint(payload["worktree"], "worktree")
+    issue = _normalized_issue(payload["issue"])
+    for name in ("taskMode", "contractId", "contractVersion", "contractFile"):
+        if not isinstance(payload[name], str) or not payload[name]:
+            raise ValueError(f"invalid task authority: {name} must be a non-empty string")
+    task_mode = payload["taskMode"]
+    binding = (payload["contractId"], payload["contractVersion"], payload["contractFile"])
+    legacy_binding = (LEGACY_CONTRACT_ID, LEGACY_CONTRACT_VERSION, LEGACY_CONTRACT_FILE)
+    if task_mode not in TASK_MODES or (task_mode == "legacy") != (binding == legacy_binding):
+        raise ValueError("invalid task authority: taskMode and contract binding disagree")
+    source_file = payload["legacySourceFile"]
+    source_digest = payload["legacySourceDigest"]
+    if task_mode == "modern-contract":
+        if source_file is not None or source_digest is not None:
+            raise ValueError("invalid task authority: modern authority must not carry legacy provenance")
+    else:
+        if source_file != LEGACY_CONTRACT_FILE:
+            raise ValueError("invalid task authority: legacy source provenance is malformed")
+        if (
+            not isinstance(source_digest, str)
+            or len(source_digest) != 64
+            or any(char not in "0123456789abcdef" for char in source_digest)
+        ):
+            raise ValueError("invalid task authority: legacy source digest is malformed")
+    return TaskAuthority(
+        version=AUTHORITY_VERSION,
+        repository=repository,
+        worktree=worktree,
+        issue=issue,
+        taskMode=task_mode,
+        contractId=payload["contractId"],
+        contractVersion=payload["contractVersion"],
+        contractFile=payload["contractFile"],
+        legacySourceFile=source_file,
+        legacySourceDigest=source_digest,
+    )
+
+
+def _authority_from_state(
+    bindings: GitBindings,
+    state: TaskState,
+    *,
+    legacy_source_digest: str | None = None,
+) -> TaskAuthority:
+    task_mode, contract_id, contract_version, contract_file = _task_contract_binding(state)
+    return TaskAuthority(
+        version=AUTHORITY_VERSION,
+        repository=bindings.repository,
+        worktree=bindings.worktree,
+        issue=state.issue,
+        taskMode=task_mode,
+        contractId=contract_id,
+        contractVersion=contract_version,
+        contractFile=contract_file,
+        legacySourceFile=LEGACY_CONTRACT_FILE if task_mode == "legacy" else None,
+        legacySourceDigest=legacy_source_digest if task_mode == "legacy" else None,
+    )
+
+
+def _authority_snapshot(repo_root: Path, bindings: GitBindings, issue: str, *, required: bool) -> object:
+    common_dir = git_path(repo_root, "--git-common-dir")
+    path = task_authority_file(repo_root, bindings.worktree, issue)
+    return _capture_file(common_dir, path, common_dir, "task authority", required=required)
+
+
+def _load_authority(
+    repo_root: Path,
+    bindings: GitBindings,
+    issue: str,
+    *,
+    required: bool,
+) -> tuple[object, TaskAuthority | None]:
+    snapshot = _authority_snapshot(repo_root, bindings, issue, required=required)
+    if not getattr(snapshot, "exists"):
+        return snapshot, None
+    authority = _authority(_json_snapshot(snapshot, "task authority"))
+    if authority.repository != bindings.repository:
+        raise ValueError("task authority repository mismatch")
+    if authority.worktree != bindings.worktree:
+        raise ValueError("task authority worktree mismatch")
+    if authority.issue != _normalized_issue(issue):
+        raise ValueError(f"task authority Issue mismatch: expected {issue}, found {authority.issue}")
+    return snapshot, authority
+
+
+def _write_authority(path: Path, authority: TaskAuthority) -> None:
+    _write_atomic(path, json.dumps(asdict(authority), ensure_ascii=True, indent=2) + "\n")
+
+
+def _validate_authority_state(authority: TaskAuthority, state: TaskState) -> None:
+    binding = _task_contract_binding(state)
+    expected = (authority.taskMode, authority.contractId, authority.contractVersion, authority.contractFile)
+    if authority.taskMode == "modern-contract" and binding[0] == "legacy":
+        raise ValueError("modern task authority cannot downgrade to legacy")
+    if binding != expected:
+        raise ValueError("task authority contract binding mismatch")
+
+
+def _validate_authority_pointer(authority: TaskAuthority, pointer: ActiveTaskPointer) -> None:
+    expected = (
+        authority.repository,
+        authority.worktree,
+        authority.issue,
+        authority.taskMode,
+        authority.contractId,
+        authority.contractVersion,
+        authority.contractFile,
+    )
+    actual = (
+        pointer.repository,
+        pointer.worktree,
+        pointer.issue,
+        pointer.taskMode,
+        pointer.contractId,
+        pointer.contractVersion,
+        pointer.contractFile,
+    )
+    if actual != expected:
+        raise ValueError("active task pointer and task authority disagree")
+
+
+def task_authority_exists(repo_root: Path, issue: str) -> bool:
+    bindings = resolve_bindings(repo_root)
+    snapshot, _ = _load_authority(repo_root, bindings, issue, required=False)
+    return bool(getattr(snapshot, "exists"))
 
 
 def _validate_pointer_bindings(pointer: ActiveTaskPointer, bindings: GitBindings) -> None:
@@ -476,48 +716,146 @@ def _write_pointer(path: Path, pointer: ActiveTaskPointer) -> None:
     _write_atomic(path, json.dumps(asdict(pointer), ensure_ascii=True, indent=2) + "\n")
 
 
+def _pointer_snapshots(repo_root: Path, bindings: GitBindings) -> tuple[object, object]:
+    common_dir = git_path(repo_root, "--git-common-dir")
+    path = active_task_pointer_file(repo_root, bindings.worktree)
+    legacy_path = legacy_active_task_pointer_file(repo_root, bindings.worktree)
+    current = _capture_file(common_dir, path, common_dir, "active task pointer", required=False)
+    legacy = _capture_file(repo_root.resolve(), legacy_path, repo_root.resolve(), "legacy active task pointer", required=False)
+    if getattr(current, "exists") and getattr(legacy, "exists"):
+        raise ValueError("conflicting active task pointers in git common-dir and legacy worktree location")
+    return current, legacy
+
+
+def _legacy_migration_source(
+    repo_root: Path,
+    bindings: GitBindings,
+) -> tuple[object, TaskState, str]:
+    root = repo_root.resolve()
+    legacy = root / LEGACY_CONTRACT_FILE
+    snapshot = _capture_file(root, legacy, root, "current task state file")
+    text = _snapshot_text(snapshot, "current task state file")
+    raw_issue = _required(_legacy_field(text, "Issue"), "current task Issue")
+    try:
+        issue = _normalized_issue(raw_issue)
+    except ValueError as exc:
+        raise ValueError(f"current task Issue is invalid: {exc}") from exc
+    raw_state = _required(_legacy_field(text, "State"), "current task State")
+    execution_state = LEGACY_GATE_STATES.get(raw_state, raw_state)
+    if execution_state not in EXECUTION_STATES:
+        raise ValueError(f"unknown current task State: {raw_state}")
+    state = TaskState(
+        issue=issue,
+        execution_state=execution_state,
+        semantic_phase="none",
+        classification="implementation-gap",
+        contract=LEGACY_CONTRACT_REF,
+        contract_file=LEGACY_CONTRACT_FILE,
+        contract_change_required=False,
+        branch=bindings.branch,
+        base="main",
+        allowed_actions=_actions(text, "## Allowed Actions"),
+        forbidden_actions=_actions(text, "## Forbidden Actions"),
+        human_gate="legacy task state requires human gate confirmation",
+        human_approval_ref="none",
+    )
+    return snapshot, state, render_task_state(state)
+
+
+def _require_exact_migration_state(repo_root: Path, state: TaskState, rendered: str) -> TaskState:
+    target = task_state_file(repo_root, state.issue)
+    root = repo_root.resolve()
+    snapshot = _capture_file(root, target, target.parent, "task-state", required=False)
+    expected = rendered.encode("utf-8")
+    if getattr(snapshot, "exists"):
+        if getattr(snapshot, "content") != expected:
+            raise ValueError(f"conflicting task-state already exists: {target}")
+    else:
+        _write_atomic(target, rendered)
+    loaded_snapshot, loaded = _load_task_state(target, binding_mode="recorded")
+    if getattr(loaded_snapshot, "content") != expected or loaded != state:
+        raise ValueError(f"conflicting task-state already exists: {target}")
+    return loaded
+
+
 def _load_pointer(repo_root: Path, bindings: GitBindings) -> ActiveTaskPointer:
     path = active_task_pointer_file(repo_root, bindings.worktree)
     legacy_path = legacy_active_task_pointer_file(repo_root, bindings.worktree)
-    if path.is_file() and legacy_path.is_file():
-        raise ValueError("conflicting active task pointers in git common-dir and legacy worktree location")
-    source = path if path.is_file() else legacy_path
-    if not source.is_file():
+    current_snapshot, legacy_snapshot = _pointer_snapshots(repo_root, bindings)
+    source_snapshot = current_snapshot if getattr(current_snapshot, "exists") else legacy_snapshot
+    if not getattr(source_snapshot, "exists"):
         raise ValueError(f"missing active task pointer: {path}")
-    pointer = _read_pointer(source)
+    pointer = _read_pointer_snapshot(source_snapshot)
     _validate_pointer_bindings(pointer, bindings)
-    if pointer.version == 1 or source == legacy_path:
-        state = parse_task_state(
-            task_state_file(repo_root, pointer.issue),
-            binding_mode="recorded",
-        )
-        if state.issue != pointer.issue:
-            raise ValueError(f"active task Issue mismatch: expected {pointer.issue}, found {state.issue}")
-        if state.branch != pointer.branch or state.branch != bindings.branch:
-            raise ValueError(f"task-state branch mismatch: expected {bindings.branch}, found {state.branch}")
-        if pointer.version == 1:
-            pointer = _v2_pointer(pointer, state)
+    _, state = _load_task_state(
+        task_state_file(repo_root, pointer.issue),
+        binding_mode="recorded",
+        validate_acceptance=False,
+    )
+    if state.issue != pointer.issue:
+        raise ValueError(f"active task Issue mismatch: expected {pointer.issue}, found {state.issue}")
+    if state.branch != pointer.branch or state.branch != bindings.branch:
+        raise ValueError(f"task-state branch mismatch: expected {bindings.branch}, found {state.branch}")
+    if pointer.version == 1:
+        pointer = _v2_pointer(pointer, state)
+    else:
+        _validate_pointer_state(pointer, state, bindings)
+
+    _, authority = _load_authority(repo_root, bindings, pointer.issue, required=False)
+    if authority is None:
+        if pointer.taskMode == "legacy":
+            source, migrated_state, rendered = _legacy_migration_source(repo_root, bindings)
+            if migrated_state != state or getattr(_task_state_snapshot(task_state_file(repo_root, state.issue)), "content") != rendered.encode("utf-8"):
+                raise ValueError("legacy task authority requires validated current-task migration")
+            authority = _authority_from_state(
+                bindings,
+                state,
+                legacy_source_digest=hashlib.sha256(getattr(source, "content") or b"").hexdigest(),
+            )
         else:
-            _validate_pointer_state(pointer, state, bindings)
+            authority = _authority_from_state(bindings, state)
+        _write_authority(task_authority_file(repo_root, bindings.worktree, state.issue), authority)
+    _validate_authority_state(authority, state)
+    _validate_authority_pointer(authority, pointer)
+
+    if pointer.version == POINTER_VERSION and (
+        getattr(source_snapshot, "path") == legacy_path or getattr(current_snapshot, "content") != (
+            json.dumps(asdict(pointer), ensure_ascii=True, indent=2) + "\n"
+        ).encode("utf-8")
+    ):
         _write_pointer(path, pointer)
-        if source == legacy_path:
-            legacy_path.unlink()
+    if getattr(legacy_snapshot, "exists"):
+        legacy_path.unlink()
     return pointer
 
 
 def _state_for_pointer(repo_root: Path, pointer: ActiveTaskPointer, bindings: GitBindings) -> TaskState:
-    state = parse_task_state(task_state_file(repo_root, pointer.issue))
+    _, state = _load_task_state(task_state_file(repo_root, pointer.issue))
     _validate_pointer_state(pointer, state, bindings)
+    _, authority = _load_authority(repo_root, bindings, pointer.issue, required=True)
+    assert authority is not None
+    _validate_authority_state(authority, state)
+    _validate_authority_pointer(authority, pointer)
     return state
 
 
 @repository_locked
 def activate_task(repo_root: Path, issue: str) -> TaskState:
     bindings = resolve_bindings(repo_root)
-    state = parse_task_state(task_state_file(repo_root, issue))
+    _, state = _load_task_state(task_state_file(repo_root, issue))
     if state.branch != bindings.branch:
         raise ValueError(f"task-state branch mismatch: expected {bindings.branch}, found {state.branch}")
     task_mode, contract_id, contract_version, contract_file = _task_contract_binding(state)
+    _, existing_authority = _load_authority(repo_root, bindings, state.issue, required=False)
+    if task_mode == "legacy":
+        if existing_authority is not None and existing_authority.taskMode == "modern-contract":
+            raise ValueError("modern task authority cannot downgrade to legacy")
+        raise ValueError("legacy task mode requires validated current-task migration")
+    authority = _authority_from_state(bindings, state)
+    if existing_authority is not None and existing_authority.taskMode == "modern-contract":
+        _validate_authority_state(existing_authority, state)
+        authority = existing_authority
+    _pointer_snapshots(repo_root, bindings)
     pointer = ActiveTaskPointer(
         version=POINTER_VERSION,
         repository=bindings.repository,
@@ -530,6 +868,7 @@ def activate_task(repo_root: Path, issue: str) -> TaskState:
         contractFile=contract_file,
         activatedAt=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
     )
+    _write_authority(task_authority_file(repo_root, bindings.worktree, state.issue), authority)
     _write_pointer(active_task_pointer_file(repo_root, bindings.worktree), pointer)
     legacy_active_task_pointer_file(repo_root, bindings.worktree).unlink(missing_ok=True)
     return state
@@ -573,31 +912,57 @@ def _legacy_field(text: str, name: str) -> str:
 
 @repository_locked
 def migrate_legacy_current_task(repo_root: Path) -> TaskState:
-    legacy = repo_root.resolve() / ".xflow" / "current-task.md"
-    if not legacy.is_file():
-        raise ValueError(f"missing current task state file: {legacy}")
-    text = read_text(legacy)
-    raw_issue = _required(_legacy_field(text, "Issue"), "current task Issue")
-    try:
-        issue = _normalized_issue(raw_issue)
-    except ValueError as exc:
-        raise ValueError(f"current task Issue is invalid: {exc}") from exc
-    raw_state = _required(_legacy_field(text, "State"), "current task State")
-    execution_state = LEGACY_GATE_STATES.get(raw_state, raw_state)
-    if execution_state not in EXECUTION_STATES:
-        raise ValueError(f"unknown current task State: {raw_state}")
-    allowed = _actions(text, "## Allowed Actions")
-    forbidden = _actions(text, "## Forbidden Actions")
     bindings = resolve_bindings(repo_root)
-    state = TaskState(
-        issue=issue, execution_state=execution_state, semantic_phase="none", classification="implementation-gap",
-        contract="legacy.current-task@0.1.0", contract_file=".xflow/current-task.md", contract_change_required=False,
-        branch=bindings.branch, base="main", allowed_actions=allowed, forbidden_actions=forbidden,
-        human_gate="legacy task state requires human gate confirmation", human_approval_ref="none",
-    )
-    target = task_state_file(repo_root, issue)
-    rendered = render_task_state(state)
-    if target.exists():
-        raise ValueError(f"task-state already exists: {target}")
-    _write_atomic(target, rendered)
-    return activate_task(repo_root, issue)
+    source, state, rendered = _legacy_migration_source(repo_root, bindings)
+    state = _require_exact_migration_state(repo_root, state, rendered)
+    digest = hashlib.sha256(getattr(source, "content") or b"").hexdigest()
+    authority = _authority_from_state(bindings, state, legacy_source_digest=digest)
+    _, existing_authority = _load_authority(repo_root, bindings, state.issue, required=False)
+    if existing_authority is not None:
+        if existing_authority.taskMode == "modern-contract":
+            raise ValueError("modern task authority cannot downgrade to legacy")
+        if existing_authority != authority:
+            raise ValueError("legacy task authority source provenance mismatch")
+        authority = existing_authority
+
+    current_snapshot, legacy_snapshot = _pointer_snapshots(repo_root, bindings)
+    existing_pointer: ActiveTaskPointer | None = None
+    source_pointer = current_snapshot if getattr(current_snapshot, "exists") else legacy_snapshot
+    if getattr(source_pointer, "exists"):
+        existing_pointer = _read_pointer_snapshot(source_pointer)
+        _validate_pointer_bindings(existing_pointer, bindings)
+    expected_binding = ("legacy", LEGACY_CONTRACT_ID, LEGACY_CONTRACT_VERSION, LEGACY_CONTRACT_FILE)
+    if (
+        existing_pointer is not None
+        and existing_pointer.version == POINTER_VERSION
+        and existing_pointer.issue == state.issue
+        and (
+            existing_pointer.taskMode,
+            existing_pointer.contractId,
+            existing_pointer.contractVersion,
+            existing_pointer.contractFile,
+        ) == expected_binding
+    ):
+        pointer = existing_pointer
+    else:
+        pointer = ActiveTaskPointer(
+            version=POINTER_VERSION,
+            repository=bindings.repository,
+            worktree=bindings.worktree,
+            branch=bindings.branch,
+            issue=state.issue,
+            taskMode="legacy",
+            contractId=LEGACY_CONTRACT_ID,
+            contractVersion=LEGACY_CONTRACT_VERSION,
+            contractFile=LEGACY_CONTRACT_FILE,
+            activatedAt=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        )
+
+    _write_authority(task_authority_file(repo_root, bindings.worktree, state.issue), authority)
+    pointer_path = active_task_pointer_file(repo_root, bindings.worktree)
+    encoded_pointer = (json.dumps(asdict(pointer), ensure_ascii=True, indent=2) + "\n").encode("utf-8")
+    if not getattr(current_snapshot, "exists") or getattr(current_snapshot, "content") != encoded_pointer:
+        _write_pointer(pointer_path, pointer)
+    if getattr(legacy_snapshot, "exists"):
+        legacy_active_task_pointer_file(repo_root, bindings.worktree).unlink()
+    return state

@@ -13,6 +13,7 @@ sys.path.insert(0, str(OPS_ROOT))
 
 from xflow.bindings import resolve_bindings
 from xflow.checks import check_current_task
+from xflow.bindings import git_path
 from xflow.paths import active_task_pointer_file, legacy_active_task_pointer_file
 from xflow.task_state import (
     TaskState,
@@ -91,6 +92,20 @@ def run_devctl(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return result
 
 
+def authority_file(repo_root: Path, issue: str) -> Path:
+    bindings = resolve_bindings(repo_root)
+    return (
+        git_path(repo_root, "--git-common-dir")
+        / "xflow"
+        / "local"
+        / "worktrees"
+        / bindings.worktree
+        / "issues"
+        / f"issue-{issue}"
+        / "authority.json"
+    )
+
+
 def v1_pointer(payload: dict[str, object]) -> dict[str, object]:
     return {
         "version": 1,
@@ -150,6 +165,7 @@ def main() -> None:
         git(worktree_a, "worktree", "add", "-b", "feature/IK3RR6-b", str(worktree_b), "main")
 
         write_state(worktree_a, state("101", "feature/101-a"))
+        write_state(worktree_a, state("102", "feature/101-a"))
         write_state(worktree_a, state("IK3RR6", "feature/IK3RR6-b"))
         write_state(worktree_a, state("202", "feature/202-dependency"))
         write_state(worktree_b, state("IK3RR6", "feature/IK3RR6-b"))
@@ -161,7 +177,7 @@ def main() -> None:
         assert load_active_task(worktree_b).issue == "IK3RR6"
         check_current_task(worktree_a, "101")
         assert_value_error("active task Issue mismatch", lambda: check_task_binding(worktree_b, "101"))
-        assert [item.issue for item in list_task_states(worktree_a)] == ["101", "202", "IK3RR6"]
+        assert [item.issue for item in list_task_states(worktree_a)] == ["101", "102", "202", "IK3RR6"]
 
         pointer = active_task_pointer_file(worktree_a, resolve_bindings(worktree_a).worktree)
         payload = json.loads(pointer.read_text(encoding="utf-8"))
@@ -175,6 +191,72 @@ def main() -> None:
         assert payload["contractId"] == "example.contract.capability-name"
         assert payload["contractVersion"] == "0.1.0"
         assert payload["contractFile"] == "docs/requirements/example/contract.yaml"
+        authority = authority_file(worktree_a, "101")
+        authority_payload = json.loads(authority.read_text(encoding="utf-8"))
+        assert authority_payload["taskMode"] == "modern-contract"
+        assert authority_payload["contractId"] == "example.contract.capability-name"
+        authority_bytes = authority.read_text(encoding="utf-8")
+        authority_link = authority.with_name("authority-hardlink.json")
+        os.link(authority, authority_link)
+        assert_value_error("exactly one filesystem link", lambda: activate_task(worktree_a, "101"))
+        authority_link.unlink()
+        write(authority, authority_bytes.replace("\n}", ',\n  "unexpected": true\n}'))
+        assert_value_error("unexpected JSON fields", lambda: activate_task(worktree_a, "101"))
+        write(authority, authority_bytes)
+        write(
+            authority,
+            authority_bytes.replace(
+                '  "taskMode": "modern-contract",',
+                '  "taskMode": "legacy",\n  "taskMode": "modern-contract",',
+            ),
+        )
+        assert_value_error("duplicate JSON key: taskMode", lambda: activate_task(worktree_a, "101"))
+        write(authority, authority_bytes)
+
+        sentinel = TaskState(
+            **{
+                **state("SENTINEL", "feature/101-a").__dict__,
+                "contract": "legacy.current-task@0.1.0",
+                "contract_file": ".xflow/current-task.md",
+            }
+        )
+        write_state(worktree_a, sentinel)
+        assert_value_error(
+            "legacy task mode requires validated current-task migration",
+            lambda: activate_task(worktree_a, "SENTINEL"),
+        )
+
+        activate_task(worktree_a, "102")
+        downgraded = state("101", "feature/101-a")
+        downgraded = TaskState(
+            **{
+                **downgraded.__dict__,
+                "contract": "legacy.current-task@0.1.0",
+                "contract_file": ".xflow/current-task.md",
+            }
+        )
+        write_state(worktree_a, downgraded)
+        assert_value_error("modern task authority cannot downgrade to legacy", lambda: activate_task(worktree_a, "101"))
+        write_state(worktree_a, state("101", "feature/101-a"))
+        activate_task(worktree_a, "101")
+
+        pointer.unlink()
+        state_101 = worktree_a / ".xflow" / "issues" / "issue-101" / "task-state.md"
+        write_state(worktree_a, downgraded)
+        assert_value_error("modern task authority cannot downgrade to legacy", lambda: activate_task(worktree_a, "101"))
+        write_state(worktree_a, state("101", "feature/101-a"))
+        assert_value_error("missing active task pointer", lambda: check_current_task(worktree_a, "101"))
+        activate_task(worktree_a, "101")
+
+        pointer_link = pointer.with_name("active-task-hardlink.json")
+        os.link(pointer, pointer_link)
+        assert_value_error("exactly one filesystem link", lambda: load_active_task(worktree_a))
+        pointer_link.unlink()
+
+        state_link = state_101.with_name("task-state-hardlink.md")
+        os.link(state_101, state_link)
+        assert_value_error("exactly one filesystem link", lambda: parse_task_state(state_101))
+        state_link.unlink()
 
         old_payload = v1_pointer(payload)
         write(pointer, json.dumps(old_payload, ensure_ascii=True, indent=2) + "\n")
@@ -281,6 +363,10 @@ def main() -> None:
 
         legacy = worktree_a / ".xflow" / "current-task.md"
         write(legacy, "# XFlow Current Task\n\nIssue: LEGACY7\nState: S2_REMOTE_ISSUE_CREATED\n\n## Allowed Actions\n- clarify-contract\n\n## Forbidden Actions\n- push\n")
+        legacy_link = legacy.with_name("current-task-hardlink.md")
+        os.link(legacy, legacy_link)
+        assert_value_error("exactly one filesystem link", lambda: migrate_legacy_current_task(worktree_a))
+        legacy_link.unlink()
         migrated = migrate_legacy_current_task(worktree_a)
         assert migrated.issue == "LEGACY7"
         assert load_active_task(worktree_a).issue == "LEGACY7"
@@ -289,12 +375,28 @@ def main() -> None:
         assert legacy_payload["contractId"] == "legacy.current-task"
         assert legacy_payload["contractVersion"] == "0.1.0"
         assert legacy_payload["contractFile"] == ".xflow/current-task.md"
+        legacy_authority = authority_file(worktree_a, "LEGACY7")
+        legacy_authority_payload = json.loads(legacy_authority.read_text(encoding="utf-8"))
+        assert legacy_authority_payload["legacySourceDigest"]
+        assert legacy_authority_payload["legacySourceFile"] == ".xflow/current-task.md"
+
+        legacy_pointer_path = active_task_pointer_file(worktree_a, resolve_bindings(worktree_a).worktree)
+        legacy_pointer_path.unlink()
+        legacy_authority.unlink()
+        recovered = migrate_legacy_current_task(worktree_a)
+        assert recovered == migrated
+        recovered_pointer = legacy_pointer_path.read_bytes()
+        recovered_authority = legacy_authority.read_bytes()
+        assert migrate_legacy_current_task(worktree_a) == migrated
+        assert legacy_pointer_path.read_bytes() == recovered_pointer
+        assert legacy_authority.read_bytes() == recovered_authority
         write(
             active_task_pointer_file(worktree_a, resolve_bindings(worktree_a).worktree),
             json.dumps(v1_pointer(legacy_payload), ensure_ascii=True, indent=2) + "\n",
         )
         assert_value_error("cannot be migrated safely", lambda: load_active_task(worktree_a))
-        activate_task(worktree_a, "LEGACY7")
+        assert_value_error("legacy task mode requires validated current-task migration", lambda: activate_task(worktree_a, "LEGACY7"))
+        migrate_legacy_current_task(worktree_a)
         assert legacy.is_file()
         migrated_path = worktree_a / ".xflow" / "issues" / "issue-LEGACY7" / "task-state.md"
         assert migrated_path.is_file()

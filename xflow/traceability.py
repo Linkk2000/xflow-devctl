@@ -49,6 +49,7 @@ from .task_state import (
     _validate_pointer_state,
     load_active_pointer,
     parse_task_state_text,
+    task_authority_exists,
 )
 
 
@@ -272,7 +273,12 @@ def _load_context(
         )
     )
 
-    local_contract_signal = task_snapshot.exists or classification_snapshot.exists or matrix_snapshot.exists
+    local_contract_signal = (
+        task_snapshot.exists
+        or classification_snapshot.exists
+        or matrix_snapshot.exists
+        or task_authority_exists(root, normalized_issue(issue))
+    )
     if not pointer_snapshot.exists:
         if local_contract_signal or require_task_state:
             raise ValueError("contract closure requires the git common-dir active task pointer")
