@@ -698,6 +698,13 @@ def diff_contracts(old: ContractDocument, new: ContractDocument) -> ContractDiff
     under_bumped: list[str] = []
     object_version_errors: list[str] = []
     old_by_id = old.objects_by_id
+    new_by_id = new.objects_by_id
+    for identifier in sorted(old_by_id.keys() & new_by_id.keys()):
+        previous_kind = old_by_id[identifier].kind
+        current_kind = new_by_id[identifier].kind
+        if previous_kind != current_kind:
+            errors.append(f"stable-ID kind change: {identifier} {previous_kind} -> {current_kind}")
+
     added_ids = set(added)
     retired_historical_ids = {
         predecessor

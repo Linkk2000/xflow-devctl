@@ -635,6 +635,90 @@ def test_old_current_predecessor_remains_or_retires_without_resurrection(repo: P
     run_devctl(repo, "contract", "diff", "--old", str(old_path), "--new", str(retired_path), expect=0)
 
 
+def test_rejects_scalar_list_stable_id_kind_change(repo: Path) -> None:
+    old_path = copied_contract(repo, "valid.yaml", "scalar-kind-change-old.yaml")
+    old_payload = yaml.safe_load(old_path.read_text(encoding="utf-8"))
+    old_payload["semanticValueContracts"].append(
+        {
+            "id": "example.shared.scalar-kind",
+            "version": "0.1.0",
+            "name": "额外语义值",
+            "meanings": ["用于验证全局稳定标识种类不变性"],
+        }
+    )
+    write(old_path, old_payload)
+
+    candidate_path = copied_contract(repo, "valid.yaml", "scalar-kind-change-new.yaml")
+    candidate_payload = copy.deepcopy(old_payload)
+    candidate_payload["version"] = "1.0.0"
+    candidate_payload["semanticValueContracts"] = candidate_payload["semanticValueContracts"][:-1]
+    candidate_payload["failureReasonContracts"].append(
+        {
+            "id": "example.shared.scalar-kind",
+            "version": "1.0.0",
+            "code": "reused_scalar_kind",
+            "meaning": "不得复用其他对象种类的稳定标识",
+            "preserves": ["既有业务状态"],
+        }
+    )
+    write(candidate_path, candidate_payload)
+
+    diff = diff_contracts(load_contract(repo, old_path), load_contract(repo, candidate_path))
+    impacts = "\n".join(diff.review_impacts)
+    assert diff.required_bump == "human-review"
+    assert (
+        "[ERROR] stable-ID kind change: example.shared.scalar-kind "
+        "semantic-value -> failure-reason"
+        in impacts
+    )
+    run_devctl(repo, "contract", "diff", "--old", str(old_path), "--new", str(candidate_path), expect=1)
+
+
+def test_rejects_singleton_stable_id_kind_change(repo: Path) -> None:
+    old_path = copied_contract(repo, "valid.yaml", "singleton-kind-change-old.yaml")
+    old_payload = yaml.safe_load(old_path.read_text(encoding="utf-8"))
+    write(old_path, old_payload)
+
+    candidate_path = copied_contract(repo, "valid.yaml", "singleton-kind-change-new.yaml")
+    candidate_payload = copy.deepcopy(old_payload)
+    candidate_payload["version"] = "1.0.0"
+    candidate_payload["capabilityContract"]["id"] = "example.context.operation"
+    candidate_payload["capabilityContract"]["version"] = "1.0.0"
+    candidate_payload["capabilityContract"]["purpose"] = "参与者可依赖且不可混淆标识种类的业务价值和边界"
+    candidate_payload["context"]["id"] = "example.capability.capability-name"
+    candidate_payload["context"]["version"] = "1.0.0"
+    candidate_payload["context"]["name"] = "稳定标识种类隔离上下文"
+    candidate_payload["contextRoles"][0]["version"] = "1.0.0"
+    candidate_payload["contextRoles"][0]["context"] = "example.capability.capability-name"
+    candidate_payload["interactionContracts"][0]["version"] = "1.0.0"
+    candidate_payload["interactionContracts"][0]["context"] = "example.capability.capability-name"
+    write(candidate_path, candidate_payload)
+
+    diff = diff_contracts(load_contract(repo, old_path), load_contract(repo, candidate_path))
+    impacts = "\n".join(diff.review_impacts)
+    assert diff.required_bump == "human-review"
+    assert (
+        "[ERROR] stable-ID kind change: example.capability.capability-name "
+        "capability -> context"
+        in impacts
+    )
+    assert (
+        "[ERROR] stable-ID kind change: example.context.operation "
+        "context -> capability"
+        in impacts
+    )
+    run_devctl(repo, "contract", "diff", "--old", str(old_path), "--new", str(candidate_path), expect=1)
+
+
+def test_same_kind_semantic_change_does_not_trigger_kind_error(repo: Path) -> None:
+    old_path = copied_contract(repo, "valid.yaml")
+    candidate_path = copied_contract(repo, "major.yaml")
+    diff = diff_contracts(load_contract(repo, old_path), load_contract(repo, candidate_path))
+    assert diff.required_bump == "major"
+    assert "stable-ID kind change" not in "\n".join(diff.review_impacts)
+    run_devctl(repo, "contract", "diff", "--old", str(old_path), "--new", str(candidate_path), expect=0)
+
+
 def test_persisted_supersedes_edges_are_canonical_sets(repo: Path) -> None:
     old_path = copied_contract(repo, "valid.yaml", "lineage-order-old.yaml")
     old_payload = yaml.safe_load(old_path.read_text(encoding="utf-8"))
@@ -1007,6 +1091,12 @@ def main() -> None:
         test_rejects_cross_kind_historical_id_resurrection(init_repo(Path(raw)))
     with tempfile.TemporaryDirectory() as raw:
         test_old_current_predecessor_remains_or_retires_without_resurrection(init_repo(Path(raw)))
+    with tempfile.TemporaryDirectory() as raw:
+        test_rejects_scalar_list_stable_id_kind_change(init_repo(Path(raw)))
+    with tempfile.TemporaryDirectory() as raw:
+        test_rejects_singleton_stable_id_kind_change(init_repo(Path(raw)))
+    with tempfile.TemporaryDirectory() as raw:
+        test_same_kind_semantic_change_does_not_trigger_kind_error(init_repo(Path(raw)))
     with tempfile.TemporaryDirectory() as raw:
         test_persisted_supersedes_edges_are_canonical_sets(init_repo(Path(raw)))
     with tempfile.TemporaryDirectory() as raw:
