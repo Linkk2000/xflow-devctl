@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import approval, attachment, providers, rules, unattended
-from .contracts import load_contract, validate_contract_acceptance
+from .contracts import contract_diff_exit_code, diff_contracts, load_contract, render_contract_diff, validate_contract_acceptance
 from .checks import (
     check_current_task,
     check_gap_analysis,
@@ -157,6 +157,9 @@ def build_parser() -> argparse.ArgumentParser:
     contract_accept.add_argument("--issue", required=True)
     contract_accept.add_argument("--file", required=True, type=Path)
     contract_accept.add_argument("--objects", required=True)
+    contract_diff = contract_sub.add_parser("diff")
+    contract_diff.add_argument("--old", required=True, type=Path)
+    contract_diff.add_argument("--new", required=True, type=Path)
 
     unattended_parser = sub.add_parser("unattended")
     unattended_sub = unattended_parser.add_subparsers(dest="unattended_command")
@@ -416,6 +419,12 @@ def run_task(args: argparse.Namespace) -> int:
 
 def run_contract(args: argparse.Namespace) -> int:
     ctx = context()
+    if args.contract_command == "diff":
+        old = load_contract(ctx.repo_root, args.old)
+        new = load_contract(ctx.repo_root, args.new)
+        diff = diff_contracts(old, new)
+        print(render_contract_diff(diff))
+        return contract_diff_exit_code(diff)
     contract = load_contract(ctx.repo_root, args.file)
     if args.contract_command == "lint":
         print(f"[INFO] contract lint passed: {contract.path}")

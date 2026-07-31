@@ -1,0 +1,107 @@
+id: example.contract.capability-name
+version: 0.1.0
+name: 能力名称
+status: accepted-design
+created: 2026-07-30
+note: 非规范性背景
+capabilityContract:
+  id: example.capability.capability-name
+  version: 0.1.0
+  purpose: 参与者可依赖的业务价值和边界
+  participants: [example.role.operator]
+  inputs: [example.value.request]
+  outputs: [example.value.result]
+  constraints:
+    - id: example.constraint.preserve-state-on-rejection
+      version: 0.1.0
+      rule: 请求被拒绝时既有业务状态保持不变
+semanticValueContracts:
+  - id: example.value.request
+    version: 0.1.0
+    name: 请求意图
+    meanings: [表达参与者希望系统承担的业务动作]
+  - id: example.value.result
+    version: 0.1.0
+    name: 可观察结果
+    meanings: [成功后可由参与者观察并继续依赖的结果]
+failureReasonContracts:
+  - id: example.failure-reason.invalid-state
+    version: 0.1.0
+    code: invalid_state
+    meaning: 当前前态不允许执行请求
+    preserves: [既有业务状态]
+context:
+  id: example.context.operation
+  version: 0.1.0
+  name: 业务操作上下文
+  entryConditions: [参与者已进入可操作上下文]
+  completionConditions: [产生成功结果或稳定拒绝结果]
+  responsibilities: [判定请求并保持上下文一致性]
+contextRoles:
+  - id: example.role.operator
+    version: 0.1.0
+    context: example.context.operation
+    responsibility: 发起并确认业务请求
+    doesNotOwn: [系统内部存储和协议选择]
+interactionContracts:
+  - id: example.interaction.perform-operation
+    version: 0.1.0
+    context: example.context.operation
+    participants: [example.role.operator]
+    accepts: [example.value.request]
+    produces: [example.value.result]
+    constraints: [example.constraint.preserve-state-on-rejection]
+    failureExpectations:
+      - reason: example.failure-reason.invalid-state
+        preserves: [既有业务状态]
+verificationMatrix:
+  - id: example.verify.case.operation-success
+    version: 0.1.0
+    traces: [example.interaction.perform-operation]
+    given: 请求满足当前合法前态
+    when: 参与者发起业务操作
+    then: 产生可观察结果且约束保持成立
+    verifyBy:
+      - type: automated
+        target: contract-test
+  - id: example.verify.case.operation-rejection
+    version: 0.1.0
+    traces:
+      - example.interaction.perform-operation
+      - example.constraint.preserve-state-on-rejection
+    given: 请求不满足当前合法前态
+    when: 参与者发起业务操作
+    then: 返回稳定失败原因且既有业务状态保持不变
+    verifyBy:
+      - type: automated
+        target: contract-test
+engineeringProjections:
+  - id: example.projection.primary-implementation
+    version: 0.1.0
+    traces: [example.interaction.perform-operation]
+    authorityRepresentation: 领域模型中的业务状态
+    derivedRepresentations: [界面状态, API 响应]
+    transformationBoundary: 适配层只转换表示，不新增业务语义
+    preservedInvariants: [example.constraint.preserve-state-on-rejection]
+dependsOn:
+  - id: example.dependency.shared-foundation
+    version: 0.1.0
+    contract: foundation.contract.shared-capability
+    requiredFor: [example.interaction.perform-operation]
+    ownerRepository: foundation-repository
+preconditionsToResolve:
+  - id: example.question.non-blocking-follow-up
+    version: 0.1.0
+    question: 后续可选扩展由哪个仓库承接
+    requiredBefore: never
+    status: deferred
+    decision: 不阻塞当前能力
+futureCapabilitiesOutOfScope:
+  - id: example.future.optional-extension
+    version: 0.1.0
+    capability: 可选扩展能力
+    reason: 不属于当前承诺且不进入当前验证
+references:
+  - kind: issue
+    target: issue-101
+    note: 能力来源记录

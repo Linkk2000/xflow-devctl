@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Literal, Mapping, Sequence
 
 from . import approval
 from .classification import _decode_classification_bytes, _load_yaml, _read_stable_bytes
@@ -80,6 +80,17 @@ class ContractDocument:
     @property
     def sha256(self) -> str:
         return hashlib.sha256(self.raw_bytes).hexdigest()
+
+
+@dataclass(frozen=True)
+class ContractDiff:
+    added: tuple[str, ...]
+    removed: tuple[str, ...]
+    changed: tuple[str, ...]
+    unchanged: tuple[str, ...]
+    required_bump: Literal["none", "patch", "minor", "major", "human-review"]
+    actual_bump: Literal["none", "patch", "minor", "major", "invalid"]
+    review_impacts: tuple[str, ...]
 
 
 def _mapping(value: object, label: str, required: set[str], optional: set[str] | None = None) -> dict[str, object]:
@@ -455,6 +466,253 @@ def _build_document(path: Path, raw: dict[str, object], raw_bytes: bytes) -> Con
         verification_by_id=verifications,
         raw_bytes=raw_bytes,
     )
+
+
+_ROOT_SEMANTIC_FIELDS = {"id", "name", "status", "created", "note"}
+_BUMP_ORDER = {"none": 0, "patch": 1, "minor": 2, "major": 3}
+
+
+def _objects_by_kind_and_id(document: ContractDocument) -> dict[tuple[str, str], ContractObject]:
+    return {(item.kind, item.id): item for item in document.objects_by_id.values()}
+
+
+def _semantic_object_value(item: ContractObject) -> dict[str, object]:
+    if item.kind == "contract":
+        return {field: item.value[field] for field in _ROOT_SEMANTIC_FIELDS}
+    return {field: value for field, value in item.value.items() if field != "version"}
+
+
+def _replacement_value(item: ContractObject) -> dict[str, object]:
+    return {
+        field: value
+        for field, value in _semantic_object_value(item).items()
+        if field not in {"id", "supersedes"}
+    }
+
+
+def _semver_parts(value: str) -> tuple[int, int, int]:
+    return tuple(int(part) for part in value.split("."))  # type: ignore[return-value]
+
+
+def _actual_bump(old: str, new: str) -> Literal["none", "patch", "minor", "major", "invalid"]:
+    before = _semver_parts(old)
+    after = _semver_parts(new)
+    if after == before:
+        return "none"
+    if after[0] == before[0] and after[1] == before[1] and after[2] == before[2] + 1:
+        return "patch"
+    if after[0] == before[0] and after[1] == before[1] + 1 and after[2] == 0:
+        return "minor"
+    if after[0] == before[0] + 1 and after[1:] == (0, 0):
+        return "major"
+    return "invalid"
+
+
+def _changed_fields(old: ContractObject, new: ContractObject) -> set[str]:
+    before = _semantic_object_value(old)
+    after = _semantic_object_value(new)
+    return {field for field in set(before) | set(after) if before.get(field) != after.get(field)}
+
+
+def _is_optional_addition(item: ContractObject, document: ContractDocument) -> bool:
+    if item.kind in {"future-capability", "verification", "projection"}:
+        return True
+    if item.kind == "precondition":
+        return item.value["requiredBefore"] == "never"
+    if item.kind == "semantic-value":
+        for candidate in document.objects_by_id.values():
+            if candidate.kind == "capability" and item.id in (
+                *candidate.value["inputs"],  # type: ignore[arg-type]
+                *candidate.value["outputs"],  # type: ignore[arg-type]
+            ):
+                return False
+            if candidate.kind == "interaction" and item.id in (
+                *candidate.value["accepts"],  # type: ignore[arg-type]
+                *candidate.value["produces"],  # type: ignore[arg-type]
+            ):
+                return False
+        return True
+    if item.kind == "failure-reason":
+        return not any(
+            item.id == expectation["reason"]
+            for candidate in document.objects_by_id.values()
+            if candidate.kind == "interaction"
+            for expectation in candidate.value["failureExpectations"]  # type: ignore[union-attr]
+        )
+    if item.kind == "context-role":
+        for candidate in document.objects_by_id.values():
+            if candidate.kind == "capability" and item.id in candidate.value["participants"]:  # type: ignore[operator]
+                return False
+            if candidate.kind == "interaction" and item.id in candidate.value["participants"]:  # type: ignore[operator]
+                return False
+        return True
+    return False
+
+
+def _is_major_change(item: ContractObject, fields: set[str]) -> bool:
+    if fields <= {"name", "note"}:
+        return False
+    if item.kind in {"constraint", "capability", "failure-reason", "context-role", "interaction"}:
+        return True
+    if item.kind == "semantic-value":
+        return "meanings" in fields
+    if item.kind == "context":
+        return bool(fields & {"entryConditions", "completionConditions", "responsibilities"})
+    return False
+
+
+def _referenced_object_ids(item: ContractObject) -> tuple[str, ...]:
+    value = item.value
+    if item.kind == "capability":
+        return tuple(value["participants"]) + tuple(value["inputs"]) + tuple(value["outputs"]) + tuple(  # type: ignore[arg-type]
+            constraint["id"] for constraint in value["constraints"]  # type: ignore[union-attr]
+        )
+    if item.kind == "context-role":
+        return (value["context"],)  # type: ignore[return-value]
+    if item.kind == "interaction":
+        return (
+            tuple(value["participants"])  # type: ignore[arg-type]
+            + tuple(value["accepts"])  # type: ignore[arg-type]
+            + tuple(value["produces"])  # type: ignore[arg-type]
+            + tuple(value["constraints"])  # type: ignore[arg-type]
+            + (value["context"],)  # type: ignore[operator]
+            + tuple(expectation["reason"] for expectation in value["failureExpectations"])  # type: ignore[union-attr]
+        )
+    if item.kind == "verification":
+        return tuple(value["traces"])  # type: ignore[arg-type]
+    if item.kind == "projection":
+        return tuple(value["traces"]) + tuple(value["preservedInvariants"])  # type: ignore[arg-type]
+    if item.kind == "dependency":
+        return tuple(value["requiredFor"])  # type: ignore[arg-type]
+    return ()
+
+
+def _impacted_ids(old: ContractDocument, new: ContractDocument, ids: set[str], kind: str) -> tuple[str, ...]:
+    affected = set(ids)
+    objects = tuple(old.objects_by_id.values()) + tuple(new.objects_by_id.values())
+    changed = True
+    while changed:
+        changed = False
+        for item in objects:
+            if item.id in affected or not (set(_referenced_object_ids(item)) & affected):
+                continue
+            affected.add(item.id)
+            changed = True
+    return tuple(sorted({item.id for item in objects if item.kind == kind and item.id in affected}))
+
+
+def _display_ids(ids: Sequence[str]) -> str:
+    return ", ".join(ids) if ids else "none"
+
+
+def diff_contracts(old: ContractDocument, new: ContractDocument) -> ContractDiff:
+    """Compare two fully validated canonical contracts by stable object kind and ID."""
+    before = _objects_by_kind_and_id(old)
+    after = _objects_by_kind_and_id(new)
+    old_keys = set(before)
+    new_keys = set(after)
+    added_keys = new_keys - old_keys
+    removed_keys = old_keys - new_keys
+    shared_keys = old_keys & new_keys
+
+    added = tuple(sorted(identifier for _, identifier in added_keys))
+    removed = tuple(sorted(identifier for _, identifier in removed_keys))
+    changed = tuple(sorted(after[key].id for key in shared_keys if _semantic_object_value(before[key]) != _semantic_object_value(after[key])))
+    unchanged = tuple(sorted(after[key].id for key in shared_keys if _semantic_object_value(before[key]) == _semantic_object_value(after[key])))
+
+    severity = "none"
+    ambiguous: list[str] = []
+    errors: list[str] = []
+    under_bumped: list[str] = []
+    for key in shared_keys:
+        previous = before[key]
+        current = after[key]
+        fields = _changed_fields(previous, current)
+        if not fields:
+            continue
+        if current.kind != "contract" and _semver_parts(current.version) <= _semver_parts(previous.version):
+            under_bumped.append(current.id)
+        if fields <= {"name", "note"}:
+            severity = max((severity, "patch"), key=lambda value: _BUMP_ORDER[value])
+        elif _is_major_change(current, fields):
+            severity = "major"
+        else:
+            ambiguous.append(f"changed {current.kind} requires human review: {current.id}")
+
+    for key in added_keys:
+        item = after[key]
+        if _is_optional_addition(item, new):
+            severity = max((severity, "minor"), key=lambda value: _BUMP_ORDER[value])
+        else:
+            severity = "major"
+    for key in removed_keys:
+        item = before[key]
+        if item.kind == "future-capability":
+            ambiguous.append(f"removed future-capability requires human review: {item.id}")
+        else:
+            severity = "major"
+
+    removed_by_id = {item.id: item for key, item in before.items() if key in removed_keys}
+    for key in added_keys:
+        item = after[key]
+        supersedes = tuple(item.value.get("supersedes", ()))
+        for predecessor in supersedes:
+            historical = removed_by_id.get(predecessor)
+            if historical is None:
+                errors.append(f"invalid historical supersedes for {item.id}: {predecessor}")
+            elif historical.kind != item.kind:
+                errors.append(f"invalid historical supersedes kind for {item.id}: {predecessor}")
+            elif (item.kind == "future-capability") != (historical.kind == "future-capability"):
+                errors.append(f"invalid historical supersedes current/future crossing for {item.id}: {predecessor}")
+
+        for predecessor in removed_by_id.values():
+            if predecessor.kind != item.kind or _replacement_value(predecessor) != _replacement_value(item):
+                continue
+            if predecessor.id not in supersedes:
+                errors.append(
+                    f"stable-ID replacement without valid supersedes: {predecessor.id} -> {item.id}"
+                )
+
+    if ambiguous or errors:
+        required: Literal["none", "patch", "minor", "major", "human-review"] = "human-review"
+    else:
+        required = severity  # type: ignore[assignment]
+    actual = _actual_bump(old.objects_by_id[_identifier(old.raw["id"], "id")].version, new.objects_by_id[_identifier(new.raw["id"], "id")].version)
+
+    impacts: list[str] = [
+        f"affected verification IDs: {_display_ids(_impacted_ids(old, new, set(added) | set(removed) | set(changed), 'verification'))}",
+        f"affected projection IDs: {_display_ids(_impacted_ids(old, new, set(added) | set(removed) | set(changed), 'projection'))}",
+        f"removed IDs: {_display_ids(removed)}",
+        f"under-bumped objects: {_display_ids(tuple(sorted(under_bumped)))}",
+    ]
+    if actual == "invalid":
+        impacts.append(
+            f"[ERROR] invalid contract root version relation: {old.objects_by_id[_identifier(old.raw['id'], 'id')].version} -> {new.objects_by_id[_identifier(new.raw['id'], 'id')].version}"
+        )
+    elif required != "human-review" and _BUMP_ORDER[actual] < _BUMP_ORDER[required]:
+        impacts.append(f"[ERROR] under-bumped contract root: required {required}, actual {actual}")
+    for identifier in sorted(under_bumped):
+        impacts.append(f"[ERROR] under-bumped object version: {identifier}")
+    impacts.extend(f"[ERROR] {message}" for message in sorted(set(errors)))
+    impacts.extend(f"[WARN] {message}" for message in sorted(set(ambiguous)))
+    return ContractDiff(added, removed, changed, unchanged, required, actual, tuple(impacts))
+
+
+def render_contract_diff(diff: ContractDiff) -> str:
+    lines = (
+        f"added: {_display_ids(diff.added)}",
+        f"removed: {_display_ids(diff.removed)}",
+        f"changed: {_display_ids(diff.changed)}",
+        f"unchanged: {_display_ids(diff.unchanged)}",
+        f"required bump: {diff.required_bump}",
+        f"actual bump: {diff.actual_bump}",
+        *diff.review_impacts,
+    )
+    return "\n".join(lines)
+
+
+def contract_diff_exit_code(diff: ContractDiff) -> int:
+    return 1 if any(impact.startswith("[ERROR]") for impact in diff.review_impacts) else 0
 
 
 def load_contract(repo_root: Path, file_path: Path) -> ContractDocument:
