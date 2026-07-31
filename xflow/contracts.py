@@ -468,25 +468,62 @@ def _build_document(path: Path, raw: dict[str, object], raw_bytes: bytes) -> Con
     )
 
 
-_ROOT_SEMANTIC_FIELDS = {"id", "name", "status", "created", "note"}
+_ROOT_SEMANTIC_FIELDS = {"id", "name", "status", "created", "note", "references"}
 _BUMP_ORDER = {"none": 0, "patch": 1, "minor": 2, "major": 3}
+_SET_LIKE_FIELDS = {
+    "participants",
+    "inputs",
+    "outputs",
+    "meanings",
+    "preserves",
+    "entryConditions",
+    "completionConditions",
+    "responsibilities",
+    "doesNotOwn",
+    "accepts",
+    "produces",
+    "traces",
+    "derivedRepresentations",
+    "preservedInvariants",
+    "requiredFor",
+    "supersedes",
+}
 
 
 def _objects_by_kind_and_id(document: ContractDocument) -> dict[tuple[str, str], ContractObject]:
     return {(item.kind, item.id): item for item in document.objects_by_id.values()}
 
 
+def _canonical_record(record: object) -> tuple[tuple[str, object], ...]:
+    if not isinstance(record, dict):
+        raise ValueError("canonical contract record must be a mapping")
+    return tuple(
+        sorted(
+            (
+                field,
+                tuple(sorted(value)) if field == "preserves" and isinstance(value, list) else value,
+            )
+            for field, value in record.items()
+            if field != "version"
+        )
+    )
+
+
+def _canonical_field(item: ContractObject, field: str, value: object) -> object:
+    if item.kind == "capability" and field == "constraints":
+        return tuple(sorted(constraint["id"] for constraint in value))  # type: ignore[union-attr]
+    if field in {"failureExpectations", "verifyBy", "references"}:
+        return tuple(sorted(_canonical_record(record) for record in value))  # type: ignore[union-attr]
+    if field == "constraints" or field in _SET_LIKE_FIELDS:
+        return tuple(sorted(value))  # type: ignore[arg-type]
+    return value
+
+
 def _semantic_object_value(item: ContractObject) -> dict[str, object]:
-    if item.kind == "contract":
-        return {field: item.value[field] for field in _ROOT_SEMANTIC_FIELDS}
-    return {field: value for field, value in item.value.items() if field != "version"}
-
-
-def _replacement_value(item: ContractObject) -> dict[str, object]:
+    fields = _ROOT_SEMANTIC_FIELDS if item.kind == "contract" else set(item.value) - {"version"}
     return {
-        field: value
-        for field, value in _semantic_object_value(item).items()
-        if field not in {"id", "supersedes"}
+        field: _canonical_field(item, field, item.value[field])
+        for field in fields
     }
 
 
@@ -514,38 +551,44 @@ def _changed_fields(old: ContractObject, new: ContractObject) -> set[str]:
     return {field for field in set(before) | set(after) if before.get(field) != after.get(field)}
 
 
-def _is_optional_addition(item: ContractObject, document: ContractDocument) -> bool:
+def _is_optional_addition(
+    item: ContractObject,
+    document: ContractDocument,
+    added_ids: set[str],
+) -> bool | None:
     if item.kind in {"future-capability", "verification", "projection"}:
         return True
     if item.kind == "precondition":
         return item.value["requiredBefore"] == "never"
-    if item.kind == "semantic-value":
-        for candidate in document.objects_by_id.values():
-            if candidate.kind == "capability" and item.id in (
-                *candidate.value["inputs"],  # type: ignore[arg-type]
-                *candidate.value["outputs"],  # type: ignore[arg-type]
-            ):
-                return False
-            if candidate.kind == "interaction" and item.id in (
-                *candidate.value["accepts"],  # type: ignore[arg-type]
-                *candidate.value["produces"],  # type: ignore[arg-type]
-            ):
-                return False
+    if item.kind == "interaction":
+        newly_owned = {
+            identifier
+            for identifier in _referenced_object_ids(item)
+            if identifier in added_ids
+        }
+        if any(
+            document.objects_by_id[identifier].kind not in {"semantic-value", "failure-reason"}
+            for identifier in newly_owned
+        ):
+            return None
         return True
-    if item.kind == "failure-reason":
-        return not any(
-            item.id == expectation["reason"]
+    if item.kind in {"semantic-value", "failure-reason"}:
+        referrers = [
+            candidate
             for candidate in document.objects_by_id.values()
-            if candidate.kind == "interaction"
-            for expectation in candidate.value["failureExpectations"]  # type: ignore[union-attr]
-        )
+            if item.id in _referenced_object_ids(candidate)
+        ]
+        return all(candidate.kind == "interaction" and candidate.id in added_ids for candidate in referrers)
     if item.kind == "context-role":
-        for candidate in document.objects_by_id.values():
-            if candidate.kind == "capability" and item.id in candidate.value["participants"]:  # type: ignore[operator]
-                return False
-            if candidate.kind == "interaction" and item.id in candidate.value["participants"]:  # type: ignore[operator]
-                return False
-        return True
+        referrers = [
+            candidate
+            for candidate in document.objects_by_id.values()
+            if item.id in _referenced_object_ids(candidate)
+        ]
+        return True if not referrers else None
+    if item.kind == "dependency":
+        required_for = set(item.value["requiredFor"])  # type: ignore[arg-type]
+        return None if required_for <= added_ids else False
     return False
 
 
@@ -559,6 +602,22 @@ def _is_major_change(item: ContractObject, fields: set[str]) -> bool:
     if item.kind == "context":
         return bool(fields & {"entryConditions", "completionConditions", "responsibilities"})
     return False
+
+
+def _object_mechanical_floor(item: ContractObject, fields: set[str]) -> Literal["none", "patch", "major"]:
+    if not fields:
+        return "none"
+    if fields <= {"name", "note"}:
+        return "patch"
+    if _is_major_change(item, fields):
+        return "major"
+    return "patch"
+
+
+def _ambiguous_change_impact(item: ContractObject, fields: set[str]) -> str:
+    if item.kind == "contract" and fields == {"references"}:
+        return "changed contract references require human review"
+    return f"changed {item.kind} requires human review: {item.id}"
 
 
 def _referenced_object_ids(item: ContractObject) -> tuple[str, ...]:
@@ -590,6 +649,8 @@ def _referenced_object_ids(item: ContractObject) -> tuple[str, ...]:
 def _impacted_ids(old: ContractDocument, new: ContractDocument, ids: set[str], kind: str) -> tuple[str, ...]:
     affected = set(ids)
     objects = tuple(old.objects_by_id.values()) + tuple(new.objects_by_id.values())
+    if any(item.kind == "capability" and item.id in affected for item in objects):
+        affected.update(item.id for item in objects if item.kind == "interaction")
     changed = True
     while changed:
         changed = False
@@ -620,66 +681,123 @@ def diff_contracts(old: ContractDocument, new: ContractDocument) -> ContractDiff
     changed = tuple(sorted(after[key].id for key in shared_keys if _semantic_object_value(before[key]) != _semantic_object_value(after[key])))
     unchanged = tuple(sorted(after[key].id for key in shared_keys if _semantic_object_value(before[key]) == _semantic_object_value(after[key])))
 
-    severity = "none"
+    mechanical_floor = "none"
     ambiguous: list[str] = []
     errors: list[str] = []
     under_bumped: list[str] = []
+    object_version_errors: list[str] = []
     for key in shared_keys:
         previous = before[key]
         current = after[key]
         fields = _changed_fields(previous, current)
         if not fields:
+            if current.kind != "contract" and current.version != previous.version:
+                object_version_errors.append(
+                    f"unchanged object version changed: {current.id} {previous.version} -> {current.version}"
+                )
             continue
-        if current.kind != "contract" and _semver_parts(current.version) <= _semver_parts(previous.version):
-            under_bumped.append(current.id)
-        if fields <= {"name", "note"}:
-            severity = max((severity, "patch"), key=lambda value: _BUMP_ORDER[value])
-        elif _is_major_change(current, fields):
-            severity = "major"
-        else:
-            ambiguous.append(f"changed {current.kind} requires human review: {current.id}")
+        object_floor = _object_mechanical_floor(current, fields)
+        mechanical_floor = max((mechanical_floor, object_floor), key=lambda value: _BUMP_ORDER[value])
+        if current.kind != "contract":
+            object_actual = _actual_bump(previous.version, current.version)
+            if object_actual == "invalid" or _BUMP_ORDER[object_actual] < _BUMP_ORDER[object_floor]:
+                under_bumped.append(current.id)
+                object_version_errors.append(
+                    f"under-bumped object version: {current.id} required {object_floor}, actual {object_actual}"
+                )
+        if not _is_major_change(current, fields) and not fields <= {"name", "note"}:
+            ambiguous.append(_ambiguous_change_impact(current, fields))
 
+    added_ids = set(added)
     for key in added_keys:
         item = after[key]
-        if _is_optional_addition(item, new):
-            severity = max((severity, "minor"), key=lambda value: _BUMP_ORDER[value])
+        optional = _is_optional_addition(item, new, added_ids)
+        if optional is True:
+            mechanical_floor = max((mechanical_floor, "minor"), key=lambda value: _BUMP_ORDER[value])
+        elif optional is False:
+            mechanical_floor = "major"
         else:
-            severity = "major"
+            mechanical_floor = max((mechanical_floor, "minor"), key=lambda value: _BUMP_ORDER[value])
+            ambiguous.append(f"added {item.kind} optionality requires human review: {item.id}")
     for key in removed_keys:
         item = before[key]
         if item.kind == "future-capability":
+            mechanical_floor = max((mechanical_floor, "patch"), key=lambda value: _BUMP_ORDER[value])
             ambiguous.append(f"removed future-capability requires human review: {item.id}")
         else:
-            severity = "major"
+            mechanical_floor = "major"
 
     removed_by_id = {item.id: item for key, item in before.items() if key in removed_keys}
-    for key in added_keys:
+    old_by_id = old.objects_by_id
+    valid_supersedes: dict[str, set[str]] = {}
+    supersedes_keys = set(added_keys)
+    supersedes_keys.update(
+        key
+        for key in shared_keys
+        if tuple(before[key].value.get("supersedes", ())) != tuple(after[key].value.get("supersedes", ()))
+    )
+    for key in supersedes_keys:
         item = after[key]
-        supersedes = tuple(item.value.get("supersedes", ()))
-        for predecessor in supersedes:
-            historical = removed_by_id.get(predecessor)
+        for predecessor in tuple(item.value.get("supersedes", ())):
+            historical = old_by_id.get(predecessor)
             if historical is None:
                 errors.append(f"invalid historical supersedes for {item.id}: {predecessor}")
-            elif historical.kind != item.kind:
-                errors.append(f"invalid historical supersedes kind for {item.id}: {predecessor}")
-            elif (item.kind == "future-capability") != (historical.kind == "future-capability"):
-                errors.append(f"invalid historical supersedes current/future crossing for {item.id}: {predecessor}")
-
-        for predecessor in removed_by_id.values():
-            if predecessor.kind != item.kind or _replacement_value(predecessor) != _replacement_value(item):
                 continue
-            if predecessor.id not in supersedes:
-                errors.append(
-                    f"stable-ID replacement without valid supersedes: {predecessor.id} -> {item.id}"
-                )
+            if predecessor == item.id:
+                errors.append(f"invalid historical supersedes self-reference for {item.id}")
+                continue
+            if historical.kind != item.kind:
+                errors.append(f"invalid historical supersedes kind for {item.id}: {predecessor}")
+                continue
+            if (item.kind == "future-capability") != (historical.kind == "future-capability"):
+                errors.append(f"invalid historical supersedes current/future crossing for {item.id}: {predecessor}")
+                continue
+            if predecessor not in removed_by_id:
+                errors.append(f"invalid historical supersedes target is not removed for {item.id}: {predecessor}")
+                continue
+            valid_supersedes.setdefault(item.id, set()).add(predecessor)
+
+    for successor, predecessors in valid_supersedes.items():
+        if len(predecessors) > 1:
+            ambiguous.append(f"one new object supersedes multiple old objects: {successor}")
+    successors_by_predecessor: dict[str, set[str]] = {}
+    for successor, predecessors in valid_supersedes.items():
+        for predecessor in predecessors:
+            successors_by_predecessor.setdefault(predecessor, set()).add(successor)
+    for predecessor, successors in successors_by_predecessor.items():
+        if len(successors) > 1:
+            ambiguous.append(f"one old object is superseded by multiple new objects: {predecessor}")
+
+    replacement_kinds = {kind for kind, _ in added_keys} & {kind for kind, _ in removed_keys}
+    for kind in sorted(replacement_kinds):
+        kind_added_ids = {identifier for candidate_kind, identifier in added_keys if candidate_kind == kind}
+        removed_ids = {identifier for candidate_kind, identifier in removed_keys if candidate_kind == kind}
+        mapped = {
+            successor: valid_supersedes.get(successor, set()) & removed_ids
+            for successor in kind_added_ids
+        }
+        mapped_back = {
+            predecessor: {successor for successor, predecessors in mapped.items() if predecessor in predecessors}
+            for predecessor in removed_ids
+        }
+        if any(len(predecessors) != 1 for predecessors in mapped.values()) or any(
+            len(successors) != 1 for successors in mapped_back.values()
+        ):
+            ambiguous.append(
+                f"unmapped same-kind replacements: {kind} removed {_display_ids(tuple(sorted(removed_ids)))}; "
+                f"added {_display_ids(tuple(sorted(kind_added_ids)))}"
+            )
 
     if ambiguous or errors:
         required: Literal["none", "patch", "minor", "major", "human-review"] = "human-review"
     else:
-        required = severity  # type: ignore[assignment]
-    actual = _actual_bump(old.objects_by_id[_identifier(old.raw["id"], "id")].version, new.objects_by_id[_identifier(new.raw["id"], "id")].version)
+        required = mechanical_floor  # type: ignore[assignment]
+    old_root = old.objects_by_id[_identifier(old.raw["id"], "id")]
+    new_root = new.objects_by_id[_identifier(new.raw["id"], "id")]
+    actual = _actual_bump(old_root.version, new_root.version)
 
     impacts: list[str] = [
+        f"mechanical floor: {mechanical_floor}",
         f"affected verification IDs: {_display_ids(_impacted_ids(old, new, set(added) | set(removed) | set(changed), 'verification'))}",
         f"affected projection IDs: {_display_ids(_impacted_ids(old, new, set(added) | set(removed) | set(changed), 'projection'))}",
         f"removed IDs: {_display_ids(removed)}",
@@ -687,12 +805,13 @@ def diff_contracts(old: ContractDocument, new: ContractDocument) -> ContractDiff
     ]
     if actual == "invalid":
         impacts.append(
-            f"[ERROR] invalid contract root version relation: {old.objects_by_id[_identifier(old.raw['id'], 'id')].version} -> {new.objects_by_id[_identifier(new.raw['id'], 'id')].version}"
+            f"[ERROR] invalid contract root version relation: {old_root.version} -> {new_root.version}"
         )
-    elif required != "human-review" and _BUMP_ORDER[actual] < _BUMP_ORDER[required]:
-        impacts.append(f"[ERROR] under-bumped contract root: required {required}, actual {actual}")
-    for identifier in sorted(under_bumped):
-        impacts.append(f"[ERROR] under-bumped object version: {identifier}")
+    elif mechanical_floor == "none" and actual != "none":
+        impacts.append(f"[ERROR] unchanged contract root version changed: {old_root.version} -> {new_root.version}")
+    elif _BUMP_ORDER[actual] < _BUMP_ORDER[mechanical_floor]:
+        impacts.append(f"[ERROR] under-bumped contract root: required {mechanical_floor}, actual {actual}")
+    impacts.extend(f"[ERROR] {message}" for message in sorted(object_version_errors))
     impacts.extend(f"[ERROR] {message}" for message in sorted(set(errors)))
     impacts.extend(f"[WARN] {message}" for message in sorted(set(ambiguous)))
     return ContractDiff(added, removed, changed, unchanged, required, actual, tuple(impacts))
