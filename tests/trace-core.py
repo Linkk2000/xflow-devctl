@@ -23,7 +23,7 @@ from xflow.bindings import git_path, resolve_bindings
 from xflow.checks import check_resolution_report
 from xflow.collaboration import repository_lock
 from xflow.contracts import load_contract, validate_contract_acceptance
-from xflow.paths import active_task_pointer_file
+from xflow.paths import active_task_pointer_file, legacy_active_task_pointer_file, task_authority_file
 from xflow.task_state import TaskState, activate_task, render_task_state
 from xflow.traceability import check_traceability, check_traceability_resolution
 
@@ -387,6 +387,38 @@ def test_ui_identity_rejections(repo: Path) -> None:
     write(path, baseline)
 
 
+def test_strict_product_url_identity() -> None:
+    invalid = (
+        "https://example.test/a\x01b",
+        "https://exa mple.test/path",
+        "https://exa\u00a0mple.test/path",
+        "https://@example.test/path",
+        "https://user@example.test/path",
+        "https://example.test:/path",
+        "https://example.test:not-a-port/path",
+        "https://[example.test]/path",
+        "https://-bad.example/path",
+        "https://exa_mple.test/path",
+        "https://xn--abc.example/path",
+        "https:///missing-host",
+    )
+    for value in invalid:
+        assert_error(
+            "must be a complete HTTP(S) URL",
+            lambda value=value: traceability_module._normalize_http_url(value, "product target"),
+        )
+
+    assert traceability_module._normalize_http_url(
+        "HTTP://EXAMPLE.TEST:80", "product target"
+    ) == ("HTTP://EXAMPLE.TEST:80", "http://example.test/")
+    assert traceability_module._normalize_http_url(
+        "https://EXAMPLE.TEST:443/path?mode=1#result", "product target"
+    ) == (
+        "https://EXAMPLE.TEST:443/path?mode=1#result",
+        "https://example.test/path?mode=1#result",
+    )
+
+
 def test_resolution_consistency(repo: Path) -> None:
     path = prepare_valid_chain(repo)
     baseline = path.read_text(encoding="utf-8")
@@ -556,6 +588,19 @@ def test_contract_derived_ui_obligations(repo: Path) -> None:
     structured = path.parent / "evidence" / "dom" / "c-001-after.json"
     write(structured, "{not-json}\n")
     assert_error("structured evidence must be a JSON mapping", lambda: check_traceability(repo, "101", contract, path))
+    prepare_valid_chain(repo)
+    contract = load_contract(repo, contract_path)
+    structured_text = structured.read_text(encoding="utf-8")
+    for field, duplicate in (
+        ('"surface": "product",', '"surface": "component-harness", "surface": "product",'),
+        (
+            '"targetUrl": "http://127.0.0.1:5173/design/42",',
+            '"targetUrl": "https://substituted.example/", '
+            '"targetUrl": "http://127.0.0.1:5173/design/42",',
+        ),
+    ):
+        write(structured, structured_text.replace(field, duplicate))
+        assert_error("duplicate JSON key", lambda: check_traceability(repo, "101", contract, path))
     prepare_valid_chain(repo)
     baseline = path.read_text(encoding="utf-8")
     contract = load_contract(repo, contract_path)
@@ -744,6 +789,64 @@ def test_criteria_schema_and_exact_conclusions(repo: Path) -> None:
     for old, new, expected in conclusion_cases:
         write(report, report_text.replace(old, new))
         assert_error(expected, lambda: check_resolution_report(repo, "101"))
+
+
+def test_duplicate_resolution_report_sections(repo: Path) -> None:
+    prepare_valid_chain(repo)
+    report = write_resolution_report(repo)
+    baseline = report.read_text(encoding="utf-8")
+    write(
+        report,
+        baseline
+        + "\n## Closure Conclusion\nConclusion: blocked\nReason: Contradictory duplicate.\n",
+    )
+    assert_error("duplicate required resolution-report section: ## Closure Conclusion", lambda: check_resolution_report(repo, "101"))
+
+    subsection_cases = (
+        (
+            "#### Verification Type\nproduct-integration",
+            "#### Verification Type\nproduct-integration\n\n#### Verification Type\nmanual",
+            "#### Verification Type",
+        ),
+        (
+            "#### Expected Result\nThe contract verification reaches its declared result.",
+            "#### Expected Result\nThe contract verification reaches its declared result.\n\n"
+            "#### Expected Result\nA contradictory result is expected.",
+            "#### Expected Result",
+        ),
+        (
+            "#### Actual Result\nThe declared result was observed in fresh local evidence.",
+            "#### Actual Result\nThe declared result was observed in fresh local evidence.\n\n"
+            "#### Actual Result\nThe result was not observed.",
+            "#### Actual Result",
+        ),
+        (
+            "#### Human Review\n- [ ] Confirm this evidence supports criterion C-001.",
+            "#### Human Review\n- [ ] Confirm this evidence supports criterion C-001.\n\n"
+            "#### Human Review\n- [ ] Reject the contradictory evidence.",
+            "#### Human Review",
+        ),
+    )
+    for old, new, heading in subsection_cases:
+        write(report, baseline.replace(old, new, 1))
+        assert_error(
+            f"duplicate required resolution-report criterion 001 field: {heading}",
+            lambda: check_resolution_report(repo, "101"),
+        )
+
+    write(
+        report,
+        baseline.replace(
+            "#### Actual Result\nThe declared result was observed in fresh local evidence.",
+            "#### Evidence\n- https://object.example/forbidden.json\n\n"
+            "#### Actual Result\nThe declared result was observed in fresh local evidence.",
+            1,
+        ),
+    )
+    assert_error(
+        "duplicate required resolution-report criterion 001 field: #### Evidence",
+        lambda: check_resolution_report(repo, "101"),
+    )
 
 
 def valid_gap_analysis_text(*, recognized: str = "yes", include_second: bool = True) -> str:
@@ -960,6 +1063,68 @@ def test_repository_collaboration_lock(repo: Path) -> None:
         )
     assert completed.returncode == 1
     assert "another devctl process holds the repository collaboration lock" in completed.stderr
+
+
+def test_final_authority_and_git_revalidation(repo: Path) -> None:
+    path = prepare_valid_chain(repo)
+    report = write_resolution_report(repo)
+    bindings = resolve_bindings(repo)
+    authority = task_authority_file(repo, bindings.worktree, "101")
+    original_authority = authority.read_text(encoding="utf-8")
+    original_verify_closure = traceability_module._verify_closure
+
+    def mutate_authority(*args: object, **kwargs: object) -> object:
+        result = original_verify_closure(*args, **kwargs)
+        write(authority, original_authority + "\n")
+        return result
+
+    try:
+        with patch.object(traceability_module, "_verify_closure", side_effect=mutate_authority):
+            assert_error("task authority changed during closure validation", lambda: check_resolution_report(repo, "101", report))
+    finally:
+        write(authority, original_authority)
+
+    legacy_pointer = legacy_active_task_pointer_file(repo, bindings.worktree)
+    active_pointer = active_task_pointer_file(repo, bindings.worktree)
+
+    def create_legacy_pointer(*args: object, **kwargs: object) -> object:
+        result = original_verify_closure(*args, **kwargs)
+        write(legacy_pointer, active_pointer.read_text(encoding="utf-8"))
+        return result
+
+    try:
+        with patch.object(traceability_module, "_verify_closure", side_effect=create_legacy_pointer):
+            assert_error("legacy active task pointer changed during closure validation", lambda: check_resolution_report(repo, "101", report))
+    finally:
+        legacy_pointer.unlink(missing_ok=True)
+
+    branch = "feature/closure-race"
+
+    def switch_branch(*args: object, **kwargs: object) -> object:
+        result = original_verify_closure(*args, **kwargs)
+        git(repo, "checkout", "-b", branch, "-q")
+        return result
+
+    try:
+        with patch.object(traceability_module, "_verify_closure", side_effect=switch_branch):
+            assert_error("Git branch changed during closure validation", lambda: check_resolution_report(repo, "101", report))
+    finally:
+        if resolve_bindings(repo).branch == branch:
+            git(repo, "checkout", "main", "-q")
+        subprocess.run(
+            ["git", "-C", str(repo), "branch", "-D", branch],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def advance_head(*args: object, **kwargs: object) -> object:
+        result = original_verify_closure(*args, **kwargs)
+        git(repo, "commit", "--allow-empty", "-m", "test: advance closure HEAD", "-q")
+        return result
+
+    with patch.object(traceability_module, "_verify_closure", side_effect=advance_head):
+        assert_error("Git HEAD changed during closure validation", lambda: check_resolution_report(repo, "101", report))
 
 
 def test_legacy_resolution_still_binds_current_issue(repo: Path) -> None:
@@ -1205,15 +1370,18 @@ def main() -> None:
         test_schema_and_reference_rejections(repo)
         test_path_and_evidence_rejections(repo)
         test_ui_identity_rejections(repo)
+        test_strict_product_url_identity()
         test_resolution_consistency(repo)
         test_durable_closure_and_authoritative_bindings(repo)
         test_evidence_identity_and_digest_rejections(repo)
         test_contract_derived_ui_obligations(repo)
         test_criteria_schema_and_exact_conclusions(repo)
+        test_duplicate_resolution_report_sections(repo)
         test_single_authoritative_criterion_source(repo)
         test_current_repository_acceptance_binding(repo, root)
         test_snapshot_content_and_transitive_revalidation(repo)
         test_repository_collaboration_lock(repo)
+        test_final_authority_and_git_revalidation(repo)
         test_legacy_resolution_still_binds_current_issue(repo)
         test_provider_endpoint_families(repo)
         test_caller_specific_size_limits(repo)

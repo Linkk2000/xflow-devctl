@@ -14,6 +14,7 @@ sys.path.insert(0, str(OPS_ROOT))
 from xflow.bindings import resolve_bindings
 from xflow.checks import check_current_task
 from xflow.bindings import git_path
+from xflow.collaboration import repository_lock
 from xflow.paths import active_task_pointer_file, legacy_active_task_pointer_file
 from xflow.task_state import (
     TaskState,
@@ -69,7 +70,7 @@ def write_state(repo_root: Path, value: TaskState) -> Path:
     return path
 
 
-def run_devctl(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def run_devctl_result(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = {
         **os.environ,
         "DEVCTL_REPO_ROOT": str(repo_root),
@@ -79,7 +80,7 @@ def run_devctl(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         "PYTHONPATH": str(OPS_ROOT),
         "XFLOW_COLLABORATION_LOCK_TIMEOUT": "0.2",
     }
-    result = subprocess.run(
+    return subprocess.run(
         [sys.executable, "-m", "xflow", *args],
         cwd=repo_root,
         env=env,
@@ -88,6 +89,10 @@ def run_devctl(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+
+
+def run_devctl(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    result = run_devctl_result(repo_root, *args)
     assert result.returncode == 0, result.stderr
     return result
 
@@ -149,6 +154,42 @@ def test_git_hook_devctl_reentry(root: Path) -> None:
     run_devctl(repo, "git", "commit-msg", "-a", "-c", "验证钩子重入")
 
 
+def test_official_git_start_respects_closure_lock(root: Path) -> None:
+    repo = root / "git-start-lock"
+    origin = root / "git-start-origin.git"
+    git(root, "init", "--bare", "-q", str(origin))
+    git(root, "init", "-q", str(repo))
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test User")
+    git(repo, "checkout", "-b", "main", "-q")
+    write(repo / "README.md", "# Git mutation lock\n")
+    git(repo, "add", "README.md")
+    git(repo, "commit", "-m", "test: initialize mutation fixture", "-q")
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "push", "-u", "origin", "main", "-q")
+
+    with repository_lock(repo):
+        result = run_devctl_result(
+            repo,
+            "git",
+            "start",
+            "parallel-mutation",
+            "--issue",
+            "77",
+            "--base",
+            "main",
+        )
+    assert result.returncode == 1, result.stdout
+    assert "another devctl process holds the repository collaboration lock" in result.stderr
+    assert resolve_bindings(repo).branch == "main"
+
+    with repository_lock(repo):
+        result = run_devctl_result(repo, "git", "done", "--force", "--issue", "77")
+    assert result.returncode == 1, result.stdout
+    assert "another devctl process holds the repository collaboration lock" in result.stderr
+    assert resolve_bindings(repo).branch == "main"
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
@@ -191,6 +232,20 @@ def main() -> None:
         assert payload["contractId"] == "example.contract.capability-name"
         assert payload["contractVersion"] == "0.1.0"
         assert payload["contractFile"] == "docs/requirements/example/contract.yaml"
+        pointer_bytes = pointer.read_text(encoding="utf-8")
+        for field, replacement in (
+            (
+                '  "branch": "feature/101-a",',
+                '  "branch": "feature/stale",\n  "branch": "feature/101-a",',
+            ),
+            (
+                '  "taskMode": "modern-contract",',
+                '  "taskMode": "legacy",\n  "taskMode": "modern-contract",',
+            ),
+        ):
+            write(pointer, pointer_bytes.replace(field, replacement))
+            assert_value_error("duplicate JSON key", lambda: load_active_task(worktree_a))
+        write(pointer, pointer_bytes)
         authority = authority_file(worktree_a, "101")
         authority_payload = json.loads(authority.read_text(encoding="utf-8"))
         assert authority_payload["taskMode"] == "modern-contract"
@@ -267,6 +322,15 @@ def main() -> None:
 
         old_location = legacy_active_task_pointer_file(worktree_a, resolve_bindings(worktree_a).worktree)
         pointer.unlink()
+        legacy_pointer_text = json.dumps(old_payload, ensure_ascii=True, indent=2) + "\n"
+        write(
+            old_location,
+            legacy_pointer_text.replace(
+                '  "branch": "feature/101-a",',
+                '  "branch": "feature/stale",\n  "branch": "feature/101-a",',
+            ),
+        )
+        assert_value_error("duplicate JSON key: branch", lambda: load_active_task(worktree_a))
         write(old_location, json.dumps(old_payload, ensure_ascii=True, indent=2) + "\n")
         check_current_task(worktree_a, "101")
         assert pointer.is_file()
@@ -418,6 +482,7 @@ def main() -> None:
         assert "CLI7" in migrated_output.stdout
         assert load_active_task(worktree_a).issue == "CLI7"
 
+        test_official_git_start_respects_closure_lock(root)
         test_git_hook_devctl_reentry(root)
 
     print("task state ok")

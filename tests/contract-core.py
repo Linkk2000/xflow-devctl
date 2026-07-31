@@ -552,7 +552,7 @@ def test_draft_rejection_and_bom_acceptance(repo: Path) -> None:
     write(stale_state_path, render_task_state(stale_state))
     assert_value_error("contract status is incompatible", lambda: parse_task_state(stale_state_path))
     write(stale_state_path, render_task_state(legacy_state))
-    activate_task(repo, issue)
+    migrate_legacy_current_task(repo)
 
     bom_path = repo / "contracts" / "bom.yaml"
     bom_path.write_bytes(b"\xef\xbb\xbf" + FIXTURE.read_bytes())
@@ -709,7 +709,7 @@ def test_contract_acceptance_recovers_partial_publication(repo: Path) -> None:
         write(state_path, render_task_state(recovered_state))
         assert parse_task_state(state_path).human_approval_ref == reference
         write(state_path, render_task_state(legacy_state))
-        activate_task(repo, issue)
+        migrate_legacy_current_task(repo)
         original_history = accepted.read_bytes()
         accepted.write_bytes(original_history.replace(b"reviewerSummary: reviewer", b"reviewerSummary: changed"))
         assert_value_error(

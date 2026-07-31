@@ -297,10 +297,14 @@ def subsection_text(text: str, heading: str) -> str:
 
 
 def required_subsections(text: str, sections: tuple[str, ...], label: str) -> dict[str, str]:
+    for section in sections:
+        count = len(re.findall(rf"(?m)^\s*{re.escape(section)}\s*$", text))
+        if count == 0:
+            raise ValueError(f"missing required {label} field: {section}")
+        if count != 1:
+            raise ValueError(f"duplicate required {label} field: {section}")
     found = {}
     for section in sections:
-        if not has_section(text, section):
-            raise ValueError(f"missing required {label} field: {section}")
         found[section] = subsection_text(text, section)
         if not found[section]:
             raise ValueError(f"empty required {label} field: {section}")
@@ -308,10 +312,14 @@ def required_subsections(text: str, sections: tuple[str, ...], label: str) -> di
 
 
 def required_sections(text: str, sections: tuple[str, ...], label: str) -> dict[str, str]:
+    for section in sections:
+        count = len(re.findall(rf"(?m)^\s*{re.escape(section)}\s*$", text))
+        if count == 0:
+            raise ValueError(f"missing required {label} section: {section}")
+        if count != 1:
+            raise ValueError(f"duplicate required {label} section: {section}")
     found = {}
     for section in sections:
-        if not has_section(text, section):
-            raise ValueError(f"missing required {label} section: {section}")
         found[section] = section_text(text, section)
         if not found[section]:
             raise ValueError(f"empty required {label} section: {section}")

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
+import re
+import secrets
 import threading
 import time
 from contextlib import contextmanager
@@ -9,7 +12,8 @@ from functools import wraps
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterator, TypeVar, cast
 
-from .bindings import git_path
+from .bindings import fingerprint, git_path
+from .json_safety import loads_unique_json
 
 
 @dataclass
@@ -21,7 +25,11 @@ class _LockState:
 
 _STATES_GUARD = threading.Lock()
 _STATES: dict[Path, _LockState] = {}
+_MUTATION_LOCAL = threading.local()
 _F = TypeVar("_F", bound=Callable[..., object])
+_LEASE_ENV = "XFLOW_DEVCTL_MUTATION_LEASE"
+_LEASE_TOKEN_RE = re.compile(r"[0-9a-f]{64}")
+_LEASE_FIELDS = {"version", "token", "repository", "worktree", "ownerPid"}
 
 
 def _lock_path(repo_root: Path) -> Path:
@@ -30,6 +38,64 @@ def _lock_path(repo_root: Path) -> Path:
     except ValueError:
         owner = repo_root.resolve() / ".xflow" / "local"
     return owner / "locks" / "devctl-repository.lock"
+
+
+def _lease_identity(repo_root: Path) -> tuple[Path, str, str]:
+    common_dir = git_path(repo_root, "--git-common-dir")
+    worktree = git_path(repo_root, "--show-toplevel")
+    return (
+        common_dir,
+        fingerprint("repository", common_dir),
+        fingerprint("worktree", worktree),
+    )
+
+
+def _lease_path(common_dir: Path, token: str) -> Path:
+    return common_dir / "xflow" / "locks" / "mutations" / f"{token}.json"
+
+
+def _inherited_lease(repo_root: Path) -> str | None:
+    token = os.environ.get(_LEASE_ENV, "")
+    if not _LEASE_TOKEN_RE.fullmatch(token):
+        return None
+    try:
+        from .local_artifacts import MAX_SMALL_ARTIFACT_BYTES, capture_stable_file
+
+        common_dir, repository, worktree = _lease_identity(repo_root)
+        path = _lease_path(common_dir, token)
+        snapshot = capture_stable_file(
+            common_dir,
+            path,
+            common_dir,
+            "repository mutation lease",
+            max_bytes=MAX_SMALL_ARTIFACT_BYTES,
+        )
+        assert snapshot.content is not None
+        payload = loads_unique_json(snapshot.content.decode("utf-8", errors="strict"))
+    except (UnicodeError, ValueError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _LEASE_FIELDS
+        or payload.get("version") != 1
+        or payload.get("token") != token
+        or payload.get("repository") != repository
+        or payload.get("worktree") != worktree
+        or type(payload.get("ownerPid")) is not int
+        or payload["ownerPid"] <= 0
+    ):
+        return None
+    return token
+
+
+def git_child_environment(repo_root: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    token = getattr(_MUTATION_LOCAL, "token", None)
+    if isinstance(token, str):
+        env[_LEASE_ENV] = token
+    elif _inherited_lease(repo_root) is None:
+        env.pop(_LEASE_ENV, None)
+    return env
 
 
 def _try_lock(stream: BinaryIO) -> bool:
@@ -65,6 +131,9 @@ def _unlock(stream: BinaryIO) -> None:
 
 @contextmanager
 def repository_lock(repo_root: Path, *, timeout_seconds: float | None = None) -> Iterator[None]:
+    if _inherited_lease(repo_root) is not None:
+        yield
+        return
     path = _lock_path(repo_root)
     with _STATES_GUARD:
         state = _STATES.setdefault(path, _LockState())
@@ -99,6 +168,38 @@ def repository_lock(repo_root: Path, *, timeout_seconds: float | None = None) ->
                 state.stream = None
     finally:
         state.thread_lock.release()
+
+
+@contextmanager
+def repository_mutation(repo_root: Path) -> Iterator[None]:
+    if _inherited_lease(repo_root) is not None:
+        yield
+        return
+    with repository_lock(repo_root):
+        common_dir, repository, worktree = _lease_identity(repo_root)
+        token = secrets.token_hex(32)
+        path = _lease_path(common_dir, token)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "token": token,
+            "repository": repository,
+            "worktree": worktree,
+            "ownerPid": os.getpid(),
+        }
+        with path.open("x", encoding="utf-8", newline="\n") as stream:
+            json.dump(payload, stream, ensure_ascii=True, indent=2)
+            stream.write("\n")
+        previous = getattr(_MUTATION_LOCAL, "token", None)
+        _MUTATION_LOCAL.token = token
+        try:
+            yield
+        finally:
+            if previous is None:
+                delattr(_MUTATION_LOCAL, "token")
+            else:
+                _MUTATION_LOCAL.token = previous
+            path.unlink(missing_ok=True)
 
 
 def repository_locked(function: _F) -> _F:

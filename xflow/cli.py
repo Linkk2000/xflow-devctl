@@ -25,6 +25,7 @@ from .checks import (
 from .commit_message import check_commit_message
 from .bindings import resolve_bindings
 from .classification import check_classification
+from .collaboration import git_child_environment, repository_mutation
 from .env import RuntimeContext, load_env_files, python_version, token_status_lines
 from .dependencies import check_dependencies
 from .migration import apply_issue_workspace_migration, inspect, inspect_issue_workspace_migration, write_wrappers
@@ -633,6 +634,7 @@ def git_output(repo_root: Path, args: list[str]) -> str:
         errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=git_child_environment(repo_root),
     )
     return result.stdout.strip() if result.returncode == 0 else ""
 
@@ -646,10 +648,21 @@ def git_run(repo_root: Path, args: list[str]) -> str:
         errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=git_child_environment(repo_root),
     )
     if result.returncode != 0:
         raise ValueError(f"git {' '.join(args)} failed: {result.stderr.strip() or result.stdout.strip()}")
     return result.stdout.strip()
+
+
+def git_succeeds(repo_root: Path, args: list[str]) -> bool:
+    return subprocess.run(
+        ["git", "-C", str(repo_root), *args],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=git_child_environment(repo_root),
+    ).returncode == 0
 
 
 def current_branch(repo_root: Path) -> str:
@@ -685,6 +698,7 @@ def unset_branch_meta(repo_root: Path, key: str) -> None:
     subprocess.run(
         ["git", "-C", str(repo_root), "config", "--worktree", "--unset-all", f"devctl.{key}"],
         check=False,
+        env=git_child_environment(repo_root),
     )
 
 
@@ -692,9 +706,9 @@ def default_base(repo_root: Path) -> str:
     env_base = os.environ.get("DEVCTL_BASE_BRANCH")
     if env_base:
         return env_base
-    if subprocess.run(["git", "-C", str(repo_root), "show-ref", "--verify", "--quiet", "refs/heads/master"]).returncode == 0:
+    if git_succeeds(repo_root, ["show-ref", "--verify", "--quiet", "refs/heads/master"]):
         return "master"
-    if subprocess.run(["git", "-C", str(repo_root), "show-ref", "--verify", "--quiet", "refs/heads/main"]).returncode == 0:
+    if git_succeeds(repo_root, ["show-ref", "--verify", "--quiet", "refs/heads/main"]):
         return "main"
     origin_head = git_output(repo_root, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
     if origin_head.startswith("origin/"):
@@ -703,9 +717,9 @@ def default_base(repo_root: Path) -> str:
 
 
 def require_clean_worktree(repo_root: Path) -> None:
-    if subprocess.run(["git", "-C", str(repo_root), "diff", "--quiet"], check=False).returncode != 0:
+    if not git_succeeds(repo_root, ["diff", "--quiet"]):
         raise ValueError("worktree has unstaged changes; commit or stash them first")
-    if subprocess.run(["git", "-C", str(repo_root), "diff", "--cached", "--quiet"], check=False).returncode != 0:
+    if not git_succeeds(repo_root, ["diff", "--cached", "--quiet"]):
         raise ValueError("index has staged changes; commit or reset them first")
     if git_output(repo_root, ["ls-files", "--others", "--exclude-standard"]):
         raise ValueError("worktree has untracked files; add, ignore, or remove them first")
@@ -837,6 +851,7 @@ def push_branch(repo_root: Path, branch: str) -> PushResult:
         errors="replace",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=git_child_environment(repo_root),
     )
     if result.returncode != 0:
         raise ValueError(f"git push failed: {result.stderr.strip() or result.stdout.strip()}")
@@ -860,6 +875,7 @@ def require_branch_contains_remote_base(repo_root: Path, base: str) -> None:
         check=False,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=git_child_environment(repo_root),
     )
     if result.returncode == 1:
         raise ValueError(
@@ -974,7 +990,7 @@ def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
         git_run(ctx.repo_root, ["checkout", base])
     print(f"[INFO] pull origin/{base}")
     git_run(ctx.repo_root, ["pull", "--ff-only", "origin", base])
-    if subprocess.run(["git", "-C", str(ctx.repo_root), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], check=False).returncode == 0:
+    if git_succeeds(ctx.repo_root, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"]):
         raise ValueError(f"branch already exists: {branch}")
     print(f"[INFO] create branch {branch}")
     git_run(ctx.repo_root, ["checkout", "-b", branch])
@@ -1008,8 +1024,8 @@ def run_git_status(ctx: RuntimeContext) -> int:
         behind = git_output(ctx.repo_root, ["rev-list", "--count", f"HEAD..{upstream}"]) or "0"
         print(f"ahead:   {ahead}  behind: {behind}")
     dirty = (
-        subprocess.run(["git", "-C", str(ctx.repo_root), "diff", "--quiet"], check=False).returncode != 0
-        or subprocess.run(["git", "-C", str(ctx.repo_root), "diff", "--cached", "--quiet"], check=False).returncode != 0
+        not git_succeeds(ctx.repo_root, ["diff", "--quiet"])
+        or not git_succeeds(ctx.repo_root, ["diff", "--cached", "--quiet"])
         or bool(git_output(ctx.repo_root, ["ls-files", "--others", "--exclude-standard"]))
     )
     print(f"worktree: {'dirty' if dirty else 'clean'}")
@@ -1055,7 +1071,7 @@ def run_git_done(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     git_run(ctx.repo_root, ["checkout", base])
     print(f"[INFO] pull origin/{base}")
     git_run(ctx.repo_root, ["pull", "--ff-only", "origin", base])
-    if subprocess.run(["git", "-C", str(ctx.repo_root), "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], check=False).returncode == 0:
+    if git_succeeds(ctx.repo_root, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"]):
         delete_flag = "-D" if args.force else "-d"
         git_run(ctx.repo_root, ["branch", delete_flag, branch])
         print(f"[INFO] deleted local branch {branch}")
@@ -1066,8 +1082,7 @@ def run_git_done(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     return 0
 
 
-def run_git(args: argparse.Namespace) -> int:
-    ctx = context()
+def _run_git(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     if args.git_command == "start":
         return run_git_start(ctx, args)
     if args.git_command == "status":
@@ -1182,6 +1197,18 @@ def run_git(args: argparse.Namespace) -> int:
         print("[INFO] state backfill push skipped")
     print(result.number)
     return 0
+
+
+def run_git(args: argparse.Namespace) -> int:
+    ctx = context()
+    mutates_local_git = (
+        args.git_command in {"start", "done", "mr"}
+        or (args.git_command == "commit-msg" and args.commit)
+    )
+    if mutates_local_git:
+        with repository_mutation(ctx.repo_root):
+            return _run_git(ctx, args)
+    return _run_git(ctx, args)
 
 
 def run_approval(args: argparse.Namespace) -> int:

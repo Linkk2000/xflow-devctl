@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import hashlib
+import ipaddress
 import os
 import re
+import unicodedata
 import warnings
 from io import BytesIO
 from dataclasses import dataclass, field
@@ -14,7 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 from PIL import Image, UnidentifiedImageError
 
 from . import approval
-from .bindings import git_path, resolve_bindings
+from .bindings import GitBindings, git_output, resolve_bindings
 from .classification import (
     _decode_classification_bytes,
     _load_yaml,
@@ -41,15 +43,20 @@ from .local_artifacts import (
     revalidate_snapshots,
     safe_relative_reference,
 )
-from .paths import active_task_pointer_file, legacy_active_task_pointer_file, normalized_issue
+from .json_safety import loads_unique_json
+from .paths import normalized_issue
 from .project_config import require_safe_repo_path
 from .task_state import (
     TaskState,
-    _pointer,
+    _load_authority,
+    _pointer_snapshots,
+    _read_pointer_snapshot,
+    _validate_authority_pointer,
+    _validate_authority_state,
+    _validate_pointer_bindings,
     _validate_pointer_state,
     load_active_pointer,
     parse_task_state_text,
-    task_authority_exists,
 )
 
 
@@ -97,6 +104,8 @@ class CriterionIdentity:
 class _ClosureContext:
     root: Path
     issue_directory: Path
+    bindings: GitBindings
+    head: str | None
     required: bool
     task_state: TaskState | None
     contract: ContractDocument | None
@@ -230,6 +239,15 @@ def _optional_snapshot(
     )
 
 
+def _git_head(root: Path) -> str | None:
+    head = git_output(root, "rev-parse", "--verify", "HEAD")
+    if not head:
+        return None
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", head):
+        raise ValueError("cannot determine current Git HEAD")
+    return head
+
+
 def _load_context(
     repo_root: Path,
     issue: str,
@@ -241,18 +259,17 @@ def _load_context(
     root, issue_directory, matrix_path = _issue_paths(repo_root, issue, matrix)
     tracked: list[tuple[StableFileSnapshot, str]] = []
     bindings = resolve_bindings(root)
-    common_dir = git_path(root, "--git-common-dir")
-    pointer_path = active_task_pointer_file(root, bindings.worktree)
-    legacy_pointer_path = legacy_active_task_pointer_file(root, bindings.worktree)
-    if pointer_path.is_file() or legacy_pointer_path.is_file():
+    head = _git_head(root)
+    pointer_snapshot, legacy_pointer_snapshot = _pointer_snapshots(root, bindings)
+    if pointer_snapshot.exists or legacy_pointer_snapshot.exists:
         load_active_pointer(root)
-    pointer_snapshot = capture_stable_file(
-        common_dir,
-        pointer_path,
-        common_dir,
-        "active task pointer",
+        pointer_snapshot, legacy_pointer_snapshot = _pointer_snapshots(root, bindings)
+    expected_issue = normalized_issue(issue)
+    authority_snapshot, authority = _load_authority(
+        root,
+        bindings,
+        expected_issue,
         required=False,
-        max_bytes=MAX_SMALL_ARTIFACT_BYTES,
     )
     task_snapshot = _optional_snapshot(root, issue_directory, "task-state.md", "task-state")
     classification_snapshot = _optional_snapshot(root, issue_directory, "classification.yaml", "classification")
@@ -267,6 +284,8 @@ def _load_context(
     tracked.extend(
         (
             (pointer_snapshot, "active task pointer"),
+            (legacy_pointer_snapshot, "legacy active task pointer"),
+            (authority_snapshot, "task authority"),
             (task_snapshot, "task-state"),
             (classification_snapshot, "classification"),
             (matrix_snapshot, "traceability matrix"),
@@ -277,7 +296,7 @@ def _load_context(
         task_snapshot.exists
         or classification_snapshot.exists
         or matrix_snapshot.exists
-        or task_authority_exists(root, normalized_issue(issue))
+        or authority_snapshot.exists
     )
     if not pointer_snapshot.exists:
         if local_contract_signal or require_task_state:
@@ -300,19 +319,20 @@ def _load_context(
             raise ValueError(
                 f"legacy current task Issue mismatch: expected {normalized_issue(issue)}, found {legacy_issue}"
             )
-        return _ClosureContext(root, issue_directory, False, None, None, None, None, tuple(tracked))
-    try:
-        pointer_payload = json.loads(_decode_utf8(pointer_snapshot, "active task pointer"))
-    except json.JSONDecodeError as exc:
-        raise ValueError("invalid active task pointer JSON") from exc
-    pointer = _pointer(pointer_payload)
-    if pointer.repository != bindings.repository:
-        raise ValueError("active task repository mismatch")
-    if pointer.worktree != bindings.worktree:
-        raise ValueError("active task worktree mismatch")
-    if pointer.branch != bindings.branch:
-        raise ValueError(f"active task branch mismatch: expected {bindings.branch}, found {pointer.branch}")
-    expected_issue = normalized_issue(issue)
+        return _ClosureContext(
+            root,
+            issue_directory,
+            bindings,
+            head,
+            False,
+            None,
+            None,
+            None,
+            None,
+            tuple(tracked),
+        )
+    pointer = _read_pointer_snapshot(pointer_snapshot)
+    _validate_pointer_bindings(pointer, bindings)
     if pointer.issue != expected_issue:
         raise ValueError(f"active task Issue mismatch: expected {expected_issue}, found {pointer.issue}")
 
@@ -329,11 +349,26 @@ def _load_context(
         _validate_pointer_state(pointer, state, bindings)
     else:
         raise ValueError("active contract closure requires matching task-state.md")
+    if authority is None:
+        raise ValueError("active contract closure requires matching task authority")
+    _validate_authority_state(authority, state)
+    _validate_authority_pointer(authority, pointer)
 
     if pointer.taskMode == "legacy":
         if classification_snapshot.exists or matrix_snapshot.exists:
             raise ValueError("legacy active task pointer conflicts with modern contract authority")
-        return _ClosureContext(root, issue_directory, False, state, None, None, None, tuple(tracked))
+        return _ClosureContext(
+            root,
+            issue_directory,
+            bindings,
+            head,
+            False,
+            state,
+            None,
+            None,
+            None,
+            tuple(tracked),
+        )
     if not classification_snapshot.exists:
         raise ValueError("contract-bearing Issue requires classification.yaml")
     if not matrix_snapshot.exists:
@@ -426,6 +461,8 @@ def _load_context(
     return _ClosureContext(
         root,
         issue_directory,
+        bindings,
+        head,
         True,
         state,
         contract,
@@ -496,6 +533,14 @@ def _product_targets(verification: object) -> tuple[str, ...]:
 
 
 def _normalize_http_url(value: object, label: str) -> tuple[str, str]:
+    if not isinstance(value, str) or any(
+        character.isspace()
+        or ord(character) < 32
+        or ord(character) == 127
+        or unicodedata.category(character) == "Cc"
+        for character in value
+    ):
+        raise ValueError(f"{label} must be a complete HTTP(S) URL")
     text = _meaningful(value, label)
     try:
         parsed = urlsplit(text)
@@ -503,10 +548,56 @@ def _normalize_http_url(value: object, label: str) -> tuple[str, str]:
     except ValueError as exc:
         raise ValueError(f"{label} must be a complete HTTP(S) URL") from exc
     scheme = parsed.scheme.casefold()
-    if scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+    if scheme not in {"http", "https"} or not parsed.hostname or not parsed.netloc or "@" in parsed.netloc:
         raise ValueError(f"{label} must be a complete HTTP(S) URL")
-    hostname = parsed.hostname.casefold()
-    normalized_host = f"[{hostname}]" if ":" in hostname else hostname
+    hostname = parsed.hostname
+    bracketed = parsed.netloc.startswith("[")
+    if bracketed:
+        match = re.fullmatch(r"\[([^\]]+)\](?::([0-9]+))?", parsed.netloc)
+        if match is None or "%" in hostname:
+            raise ValueError(f"{label} must be a complete HTTP(S) URL")
+        try:
+            ipaddress.IPv6Address(hostname)
+        except ValueError as exc:
+            raise ValueError(f"{label} must be a complete HTTP(S) URL") from exc
+    else:
+        if parsed.netloc.count(":") > 1:
+            raise ValueError(f"{label} must be a complete HTTP(S) URL")
+        raw_host, separator, raw_port = parsed.netloc.rpartition(":")
+        if separator and (not raw_host or not raw_port or not raw_port.isascii() or not raw_port.isdigit()):
+            raise ValueError(f"{label} must be a complete HTTP(S) URL")
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            if re.fullmatch(r"[0-9.]+", hostname):
+                raise ValueError(f"{label} must be a complete HTTP(S) URL")
+            try:
+                ascii_hostname = hostname.encode("idna").decode("ascii")
+            except UnicodeError as exc:
+                raise ValueError(f"{label} must be a complete HTTP(S) URL") from exc
+            dns_name = ascii_hostname[:-1] if ascii_hostname.endswith(".") else ascii_hostname
+            labels = dns_name.split(".")
+            if (
+                not dns_name
+                or len(dns_name) > 253
+                or any(
+                    not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", item)
+                    for item in labels
+                )
+            ):
+                raise ValueError(f"{label} must be a complete HTTP(S) URL")
+            for dns_label in labels:
+                if not dns_label.casefold().startswith("xn--"):
+                    continue
+                try:
+                    decoded_label = dns_label.encode("ascii").decode("idna")
+                    round_trip = decoded_label.encode("idna").decode("ascii")
+                except UnicodeError as exc:
+                    raise ValueError(f"{label} must be a complete HTTP(S) URL") from exc
+                if round_trip.casefold() != dns_label.casefold():
+                    raise ValueError(f"{label} must be a complete HTTP(S) URL")
+    normalized_hostname = hostname.lower()
+    normalized_host = f"[{normalized_hostname}]" if bracketed else normalized_hostname
     if port is not None and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
         normalized_host = f"{normalized_host}:{port}"
     normalized = urlunsplit((scheme, normalized_host, parsed.path or "/", parsed.query, parsed.fragment))
@@ -585,7 +676,7 @@ def _verify_ui(
         raise ValueError("UI screenshot and structured evidence must have distinct identities")
     _validate_image(screenshot.content or b"")
     try:
-        structured_document = json.loads((structured.content or b"").decode("utf-8-sig", errors="strict"))
+        structured_document = loads_unique_json((structured.content or b"").decode("utf-8-sig", errors="strict"))
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("ui.structured evidence must be a JSON mapping") from exc
     required_identity = {"surface", "targetUrl", "pageTitle", "modelIdentity"}
@@ -871,7 +962,7 @@ def _entries_from_context(context: _ClosureContext) -> tuple[TraceEntry, ...]:
     return tuple(_verify_entry(context, index, raw) for index, raw in enumerate(raw_entries))
 
 
-def _revalidate(root: Path, snapshots: tuple[tuple[StableFileSnapshot, str], ...]) -> None:
+def _revalidate(context: _ClosureContext, snapshots: tuple[tuple[StableFileSnapshot, str], ...]) -> None:
     seen: dict[Path, StableFileSnapshot] = {}
     for snapshot, label in snapshots:
         previous = seen.get(snapshot.path)
@@ -880,7 +971,17 @@ def _revalidate(root: Path, snapshots: tuple[tuple[StableFileSnapshot, str], ...
                 raise ValueError(f"{label} changed between closure snapshots: {snapshot.path}")
             continue
         seen[snapshot.path] = snapshot
-        revalidate_snapshots(root, (snapshot,), label)
+        revalidate_snapshots(context.root, (snapshot,), label)
+    current = resolve_bindings(context.root)
+    if current.repository != context.bindings.repository:
+        raise ValueError("Git repository changed during closure validation")
+    if current.worktree != context.bindings.worktree:
+        raise ValueError("Git worktree changed during closure validation")
+    if current.branch != context.bindings.branch:
+        raise ValueError("Git branch changed during closure validation")
+    head = _git_head(context.root)
+    if head != context.head:
+        raise ValueError("Git HEAD changed during closure validation")
 
 
 def _compatibility_evidence_limit(context: _ClosureContext, path: Path) -> int:
@@ -920,7 +1021,7 @@ def check_traceability(
     entries = _entries_from_context(context)
     artifact_snapshots, _ = _verify_closure(context, entries)
     snapshots = context.snapshots + artifact_snapshots
-    _revalidate(context.root, snapshots)
+    _revalidate(context, snapshots)
     return TraceabilityResult(context.matrix_snapshot.path, context.issue_directory, entries, snapshots)
 
 
@@ -955,7 +1056,7 @@ def check_traceability_resolution(
         base_snapshots += ((report_snapshot, "resolution report"),)
     base_snapshots += support_snapshots
     if not context.required:
-        _revalidate(context.root, context.snapshots + base_snapshots)
+        _revalidate(context, context.snapshots + base_snapshots)
         return
     entries = _entries_from_context(context)
     artifact_snapshots, source_criteria = _verify_closure(context, entries)
@@ -1003,4 +1104,4 @@ def check_traceability_resolution(
                         f"resolution-report Criterion C-{number} Verification Type must match matrix verification {entry.verification}"
                     )
     snapshots = context.snapshots + artifact_snapshots + base_snapshots
-    _revalidate(context.root, snapshots)
+    _revalidate(context, snapshots)
