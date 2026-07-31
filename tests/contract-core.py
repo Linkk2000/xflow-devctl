@@ -588,6 +588,7 @@ def test_atomic_contract_acceptance_claim(repo: Path) -> None:
             accepted_objects=ACCEPTED_OBJECTS,
         )
         approve(review)
+        approval_id = approval.field(review.read_text(encoding="utf-8"), "Approval ID")
 
         def accept() -> Path | ValueError:
             try:
@@ -599,10 +600,16 @@ def test_atomic_contract_acceptance_claim(repo: Path) -> None:
             results = tuple(executor.map(lambda _: accept(), range(2)))
         assert sum(isinstance(result, Path) for result in results) == 1, results
         failures = [str(result) for result in results if isinstance(result, ValueError)]
-        assert len(failures) == 1 and "approval already claimed" in failures[0], failures
+        assert len(failures) == 1 and failures[0] in {
+            f"approval already claimed: {approval_id}",
+            f"approval already consumed: {approval_id}",
+        }, failures
         history_root = repo / ".xflow" / "issues" / f"issue-{issue}" / "approvals" / "history"
-        assert len(tuple((history_root / "claims").glob("*.yaml"))) == 1
-        assert len(tuple(history_root.glob("*.yaml"))) == 1
+        claims = tuple((history_root / "claims").glob("*.yaml"))
+        archives = tuple((history_root / "consumed").glob("*.md"))
+        histories = tuple(history_root.glob("*.yaml"))
+        assert len(claims) == len(archives) == len(histories) == 1
+        assert approval.validate_contract_acceptance_history(repo, histories[0])["approvalId"] == approval_id
 
 
 def test_contract_acceptance_recovers_partial_publication(repo: Path) -> None:
