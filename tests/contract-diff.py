@@ -81,7 +81,7 @@ def test_required_evolution_bumps(repo: Path) -> None:
     assert "affected projection IDs: example.projection.primary-implementation" in major_impacts
 
 
-def test_rejects_stale_versions_and_reviews_unlinked_replacements(repo: Path) -> None:
+def test_rejects_stale_versions_and_exact_unlinked_replacements(repo: Path) -> None:
     base_path = copied_contract(repo, "valid.yaml")
     base = load_contract(repo, base_path)
 
@@ -105,9 +105,13 @@ def test_rejects_stale_versions_and_reviews_unlinked_replacements(repo: Path) ->
     renamed = load_contract(repo, renamed_path)
     renamed_diff = diff_contracts(base, renamed)
     assert renamed_diff.required_bump == "human-review"
-    assert "unmapped same-kind replacements" in "\n".join(renamed_diff.review_impacts)
-    result = run_devctl(repo, "contract", "diff", "--old", str(base_path), "--new", str(renamed_path), expect=0)
-    assert "[WARN]" in result.stdout
+    assert (
+        "[ERROR] exact stable-ID replacement lacks one-to-one supersedes: "
+        "example.future.optional-extension -> example.future.optional-extension-v2"
+        in "\n".join(renamed_diff.review_impacts)
+    )
+    result = run_devctl(repo, "contract", "diff", "--old", str(base_path), "--new", str(renamed_path), expect=1)
+    assert "[ERROR]" in result.stdout
 
 
 def test_accepts_historical_supersedes_and_prints_stable_impacts(repo: Path) -> None:
@@ -439,8 +443,89 @@ def test_supersedes_many_to_many_is_human_review(repo: Path) -> None:
     )
 
 
+def test_persisted_supersedes_edges_are_canonical_sets(repo: Path) -> None:
+    old_path = copied_contract(repo, "valid.yaml", "lineage-order-old.yaml")
+    old_payload = yaml.safe_load(old_path.read_text(encoding="utf-8"))
+    old_payload["futureCapabilitiesOutOfScope"][0]["supersedes"] = [
+        "example.future.lineage-a",
+        "example.future.lineage-b",
+    ]
+    write(old_path, old_payload)
+
+    reordered_path = copied_contract(repo, "valid.yaml", "lineage-order-new.yaml")
+    reordered_payload = copy.deepcopy(old_payload)
+    reordered_payload["futureCapabilitiesOutOfScope"][0]["supersedes"].reverse()
+    write(reordered_path, reordered_payload)
+
+    diff = diff_contracts(load_contract(repo, old_path), load_contract(repo, reordered_path))
+    assert diff.required_bump == "none"
+    assert diff.changed == ()
+    assert not any(impact.startswith("[ERROR]") for impact in diff.review_impacts)
+    run_devctl(repo, "contract", "diff", "--old", str(old_path), "--new", str(reordered_path), expect=0)
+
+
+def test_removed_historical_supersedes_edge_is_error(repo: Path) -> None:
+    old_path = copied_contract(repo, "valid.yaml", "lineage-removal-old.yaml")
+    old_payload = yaml.safe_load(old_path.read_text(encoding="utf-8"))
+    old_payload["futureCapabilitiesOutOfScope"][0]["supersedes"] = [
+        "example.future.lineage-a",
+        "example.future.lineage-b",
+    ]
+    write(old_path, old_payload)
+
+    candidate_path = copied_contract(repo, "valid.yaml", "lineage-removal-new.yaml")
+    candidate_payload = copy.deepcopy(old_payload)
+    candidate_payload["version"] = "0.1.1"
+    candidate_payload["futureCapabilitiesOutOfScope"][0]["version"] = "0.1.1"
+    candidate_payload["futureCapabilitiesOutOfScope"][0]["supersedes"] = ["example.future.lineage-a"]
+    write(candidate_path, candidate_payload)
+
+    diff = diff_contracts(load_contract(repo, old_path), load_contract(repo, candidate_path))
+    impacts = "\n".join(diff.review_impacts)
+    assert (
+        "[ERROR] removed historical supersedes edge: "
+        "example.future.optional-extension -> example.future.lineage-b"
+        in impacts
+    )
+    assert "invalid historical supersedes for example.future.optional-extension: example.future.lineage-a" not in impacts
+    run_devctl(repo, "contract", "diff", "--old", str(old_path), "--new", str(candidate_path), expect=1)
+
+
+def test_only_new_supersedes_edges_require_old_snapshot_validation(repo: Path) -> None:
+    old_path = copied_contract(repo, "valid.yaml", "lineage-addition-old.yaml")
+    old_payload = yaml.safe_load(old_path.read_text(encoding="utf-8"))
+    old_payload["futureCapabilitiesOutOfScope"][0]["supersedes"] = ["example.future.older-lineage"]
+    old_payload["futureCapabilitiesOutOfScope"].append(
+        {
+            "id": "example.future.retired-extension",
+            "version": "0.1.0",
+            "capability": "即将被替代的可选扩展",
+            "reason": "不属于当前承诺且不进入当前验证",
+        }
+    )
+    write(old_path, old_payload)
+
+    candidate_path = copied_contract(repo, "valid.yaml", "lineage-addition-new.yaml")
+    candidate_payload = copy.deepcopy(old_payload)
+    candidate_payload["version"] = "0.2.0"
+    candidate_payload["futureCapabilitiesOutOfScope"] = [candidate_payload["futureCapabilitiesOutOfScope"][0]]
+    candidate_payload["futureCapabilitiesOutOfScope"][0]["version"] = "0.1.1"
+    candidate_payload["futureCapabilitiesOutOfScope"][0]["supersedes"].append(
+        "example.future.retired-extension"
+    )
+    write(candidate_path, candidate_payload)
+
+    diff = diff_contracts(load_contract(repo, old_path), load_contract(repo, candidate_path))
+    impacts = "\n".join(diff.review_impacts)
+    assert "invalid historical supersedes" not in impacts
+    assert "removed historical supersedes edge" not in impacts
+    assert diff.required_bump == "human-review"
+    run_devctl(repo, "contract", "diff", "--old", str(old_path), "--new", str(candidate_path), expect=0)
+
+
 def test_unmapped_changed_replacement_is_human_review(repo: Path) -> None:
-    base = load_contract(repo, copied_contract(repo, "valid.yaml"))
+    base_path = copied_contract(repo, "valid.yaml")
+    base = load_contract(repo, base_path)
     candidate_path = copied_contract(repo, "valid.yaml", "unmapped-active-replacement.yaml")
     payload = yaml.safe_load(candidate_path.read_text(encoding="utf-8"))
     payload["version"] = "1.0.0"
@@ -464,6 +549,8 @@ def test_unmapped_changed_replacement_is_human_review(repo: Path) -> None:
         "[WARN] unmapped same-kind replacements: semantic-value removed example.value.request; added example.value.request-v2"
         in impacts
     )
+    assert "exact stable-ID replacement" not in impacts
+    run_devctl(repo, "contract", "diff", "--old", str(base_path), "--new", str(candidate_path), expect=0)
 
 
 def test_capability_semantics_impact_all_coverage(repo: Path) -> None:
@@ -596,11 +683,106 @@ def test_uncertain_optional_interaction_is_human_review(repo: Path) -> None:
     assert "added interaction optionality requires human review: example.interaction.optional-observation" in impacts
 
 
+def test_dependency_add_change_remove_impacts_required_interaction_coverage(repo: Path) -> None:
+    base_path = copied_contract(repo, "valid.yaml", "dependency-base.yaml")
+    base_payload = yaml.safe_load(base_path.read_text(encoding="utf-8"))
+    base_payload["interactionContracts"].append(
+        {
+            "id": "example.interaction.audit-operation",
+            "version": "0.1.0",
+            "context": "example.context.operation",
+            "participants": ["example.role.operator"],
+            "accepts": ["example.value.request"],
+            "produces": ["example.value.result"],
+            "constraints": ["example.constraint.preserve-state-on-rejection"],
+            "failureExpectations": [
+                {"reason": "example.failure-reason.invalid-state", "preserves": ["既有业务状态"]}
+            ],
+        }
+    )
+    base_payload["verificationMatrix"].append(
+        {
+            "id": "example.verify.case.audit-operation",
+            "version": "0.1.0",
+            "traces": ["example.interaction.audit-operation"],
+            "given": "审计操作满足当前合法前态",
+            "when": "参与者发起审计操作",
+            "then": "产生可验证的审计结果",
+            "verifyBy": [{"type": "automated", "target": "audit-contract-test"}],
+        }
+    )
+    base_payload["engineeringProjections"].append(
+        {
+            "id": "example.projection.audit-implementation",
+            "version": "0.1.0",
+            "traces": ["example.interaction.audit-operation"],
+            "authorityRepresentation": "领域模型中的审计状态",
+            "derivedRepresentations": ["审计响应"],
+            "transformationBoundary": "适配层只转换审计表示",
+            "preservedInvariants": ["example.constraint.preserve-state-on-rejection"],
+        }
+    )
+    write(base_path, base_payload)
+    base = load_contract(repo, base_path)
+    candidates: list[tuple[str, dict[str, object]]] = []
+
+    changed = copy.deepcopy(base_payload)
+    changed["version"] = "0.1.1"
+    changed["dependsOn"][0]["version"] = "0.1.1"
+    changed["dependsOn"][0]["requiredFor"] = ["example.interaction.audit-operation"]
+    candidates.append(("changed", changed))
+
+    added = copy.deepcopy(base_payload)
+    added["version"] = "1.0.0"
+    added["dependsOn"].append(
+        {
+            "id": "example.dependency.audit-foundation",
+            "version": "0.1.0",
+            "contract": "foundation.contract.audit-capability",
+            "requiredFor": ["example.interaction.perform-operation"],
+            "ownerRepository": "audit-foundation-repository",
+        }
+    )
+    candidates.append(("added", added))
+
+    removed = copy.deepcopy(base_payload)
+    removed["version"] = "1.0.0"
+    removed["dependsOn"] = []
+    candidates.append(("removed", removed))
+
+    expected = {
+        "changed": (
+            "affected verification IDs: example.verify.case.audit-operation, "
+            "example.verify.case.operation-rejection, example.verify.case.operation-success",
+            "affected projection IDs: example.projection.audit-implementation, "
+            "example.projection.primary-implementation",
+        ),
+        "added": (
+            "affected verification IDs: example.verify.case.operation-rejection, "
+            "example.verify.case.operation-success",
+            "affected projection IDs: example.projection.primary-implementation",
+        ),
+        "removed": (
+            "affected verification IDs: example.verify.case.operation-rejection, "
+            "example.verify.case.operation-success",
+            "affected projection IDs: example.projection.primary-implementation",
+        ),
+    }
+    for label, payload in candidates:
+        candidate_path = copied_contract(repo, "valid.yaml", f"dependency-{label}.yaml")
+        write(candidate_path, payload)
+        diff = diff_contracts(base, load_contract(repo, candidate_path))
+        impacts = "\n".join(diff.review_impacts)
+        expected_verifications, expected_projection = expected[label]
+        assert expected_verifications in impacts, (label, impacts)
+        assert expected_projection in impacts, (label, impacts)
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as raw:
         test_required_evolution_bumps(init_repo(Path(raw)))
     with tempfile.TemporaryDirectory() as raw:
-        test_rejects_stale_versions_and_reviews_unlinked_replacements(init_repo(Path(raw)))
+        test_rejects_stale_versions_and_exact_unlinked_replacements(init_repo(Path(raw)))
     with tempfile.TemporaryDirectory() as raw:
         test_accepts_historical_supersedes_and_prints_stable_impacts(init_repo(Path(raw)))
     with tempfile.TemporaryDirectory() as raw:
@@ -622,6 +804,12 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as raw:
         test_supersedes_many_to_many_is_human_review(init_repo(Path(raw)))
     with tempfile.TemporaryDirectory() as raw:
+        test_persisted_supersedes_edges_are_canonical_sets(init_repo(Path(raw)))
+    with tempfile.TemporaryDirectory() as raw:
+        test_removed_historical_supersedes_edge_is_error(init_repo(Path(raw)))
+    with tempfile.TemporaryDirectory() as raw:
+        test_only_new_supersedes_edges_require_old_snapshot_validation(init_repo(Path(raw)))
+    with tempfile.TemporaryDirectory() as raw:
         test_unmapped_changed_replacement_is_human_review(init_repo(Path(raw)))
     with tempfile.TemporaryDirectory() as raw:
         test_capability_semantics_impact_all_coverage(init_repo(Path(raw)))
@@ -631,6 +819,8 @@ def main() -> None:
         test_added_value_in_required_capability_membership_is_major(init_repo(Path(raw)))
     with tempfile.TemporaryDirectory() as raw:
         test_uncertain_optional_interaction_is_human_review(init_repo(Path(raw)))
+    with tempfile.TemporaryDirectory() as raw:
+        test_dependency_add_change_remove_impacts_required_interaction_coverage(init_repo(Path(raw)))
     print("contract diff ok")
 
 

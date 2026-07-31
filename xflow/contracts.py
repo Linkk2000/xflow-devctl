@@ -527,6 +527,14 @@ def _semantic_object_value(item: ContractObject) -> dict[str, object]:
     }
 
 
+def _replacement_value(item: ContractObject) -> dict[str, object]:
+    return {
+        field: value
+        for field, value in _semantic_object_value(item).items()
+        if field not in {"id", "supersedes"}
+    }
+
+
 def _semver_parts(value: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in value.split("."))  # type: ignore[return-value]
 
@@ -649,6 +657,9 @@ def _referenced_object_ids(item: ContractObject) -> tuple[str, ...]:
 def _impacted_ids(old: ContractDocument, new: ContractDocument, ids: set[str], kind: str) -> tuple[str, ...]:
     affected = set(ids)
     objects = tuple(old.objects_by_id.values()) + tuple(new.objects_by_id.values())
+    for item in objects:
+        if item.kind == "dependency" and item.id in affected:
+            affected.update(item.value["requiredFor"])  # type: ignore[arg-type]
     if any(item.kind == "capability" and item.id in affected for item in objects):
         affected.update(item.id for item in objects if item.kind == "interaction")
     changed = True
@@ -730,15 +741,14 @@ def diff_contracts(old: ContractDocument, new: ContractDocument) -> ContractDiff
     removed_by_id = {item.id: item for key, item in before.items() if key in removed_keys}
     old_by_id = old.objects_by_id
     valid_supersedes: dict[str, set[str]] = {}
-    supersedes_keys = set(added_keys)
-    supersedes_keys.update(
-        key
-        for key in shared_keys
-        if tuple(before[key].value.get("supersedes", ())) != tuple(after[key].value.get("supersedes", ()))
-    )
-    for key in supersedes_keys:
+    lineage_keys = set(added_keys) | shared_keys
+    for key in lineage_keys:
         item = after[key]
-        for predecessor in tuple(item.value.get("supersedes", ())):
+        old_edges = set(before[key].value.get("supersedes", ())) if key in shared_keys else set()
+        new_edges = set(item.value.get("supersedes", ()))
+        for predecessor in sorted(old_edges - new_edges):
+            errors.append(f"removed historical supersedes edge: {item.id} -> {predecessor}")
+        for predecessor in sorted(new_edges - old_edges):
             historical = old_by_id.get(predecessor)
             if historical is None:
                 errors.append(f"invalid historical supersedes for {item.id}: {predecessor}")
@@ -780,6 +790,32 @@ def diff_contracts(old: ContractDocument, new: ContractDocument) -> ContractDiff
             predecessor: {successor for successor, predecessors in mapped.items() if predecessor in predecessors}
             for predecessor in removed_ids
         }
+        exact_candidates = {
+            predecessor: {
+                successor
+                for successor in kind_added_ids
+                if _replacement_value(before[(kind, predecessor)]) == _replacement_value(after[(kind, successor)])
+            }
+            for predecessor in removed_ids
+        }
+        exact_candidates_back = {
+            successor: {
+                predecessor
+                for predecessor, successors in exact_candidates.items()
+                if successor in successors
+            }
+            for successor in kind_added_ids
+        }
+        for predecessor, successors in exact_candidates.items():
+            if len(successors) != 1:
+                continue
+            successor = next(iter(successors))
+            if len(exact_candidates_back[successor]) != 1:
+                continue
+            if mapped.get(successor) != {predecessor} or mapped_back.get(predecessor) != {successor}:
+                errors.append(
+                    f"exact stable-ID replacement lacks one-to-one supersedes: {predecessor} -> {successor}"
+                )
         if any(len(predecessors) != 1 for predecessors in mapped.values()) or any(
             len(successors) != 1 for successors in mapped_back.values()
         ):
