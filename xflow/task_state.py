@@ -779,12 +779,19 @@ def _write_pointer(path: Path, pointer: ActiveTaskPointer) -> None:
     _write_atomic(path, json.dumps(asdict(pointer), ensure_ascii=True, indent=2) + "\n")
 
 
-def _pointer_snapshots(repo_root: Path, bindings: GitBindings) -> tuple[object, object]:
+def _capture_pointer_snapshots(repo_root: Path, bindings: GitBindings) -> tuple[object, object]:
     common_dir = git_path(repo_root, "--git-common-dir")
     path = active_task_pointer_file(repo_root, bindings.worktree)
     legacy_path = legacy_active_task_pointer_file(repo_root, bindings.worktree)
     current = _capture_file(common_dir, path, common_dir, "active task pointer", required=False)
     legacy = _capture_file(repo_root.resolve(), legacy_path, repo_root.resolve(), "legacy active task pointer", required=False)
+    return current, legacy
+
+
+def _pointer_snapshots(repo_root: Path, bindings: GitBindings) -> tuple[object, object]:
+    common_dir = git_path(repo_root, "--git-common-dir")
+    legacy_path = legacy_active_task_pointer_file(repo_root, bindings.worktree)
+    current, legacy = _capture_pointer_snapshots(repo_root, bindings)
     if getattr(current, "exists") and getattr(legacy, "exists"):
         if getattr(current, "content") != getattr(legacy, "content"):
             raise ValueError("conflicting active task pointers in git common-dir and legacy worktree location")
@@ -859,14 +866,30 @@ def _require_exact_migration_state(repo_root: Path, state: TaskState, rendered: 
 
 
 def _load_pointer(repo_root: Path, bindings: GitBindings) -> ActiveTaskPointer:
+    from .local_artifacts import revalidate_snapshots
+
+    common_dir = git_path(repo_root, "--git-common-dir")
+    root = repo_root.resolve()
     path = active_task_pointer_file(repo_root, bindings.worktree)
     legacy_path = legacy_active_task_pointer_file(repo_root, bindings.worktree)
-    current_snapshot, legacy_snapshot = _pointer_snapshots(repo_root, bindings)
+    current_snapshot, legacy_snapshot = _capture_pointer_snapshots(repo_root, bindings)
+    current_pointer = _read_pointer_snapshot(current_snapshot) if getattr(current_snapshot, "exists") else None
+    legacy_pointer = _read_pointer_snapshot(legacy_snapshot) if getattr(legacy_snapshot, "exists") else None
+    for candidate in (current_pointer, legacy_pointer):
+        if candidate is not None:
+            _validate_pointer_bindings(candidate, bindings)
+    if (
+        current_pointer is not None
+        and legacy_pointer is not None
+        and getattr(current_snapshot, "content") != getattr(legacy_snapshot, "content")
+        and not (current_pointer.version == POINTER_VERSION and legacy_pointer.version == 1)
+    ):
+        raise ValueError("conflicting active task pointers in git common-dir and legacy worktree location")
     pointer_source_snapshot = current_snapshot if getattr(current_snapshot, "exists") else legacy_snapshot
     if not getattr(pointer_source_snapshot, "exists"):
         raise ValueError(f"missing active task pointer: {path}")
-    pointer = _read_pointer_snapshot(pointer_source_snapshot)
-    _validate_pointer_bindings(pointer, bindings)
+    pointer = current_pointer if current_pointer is not None else legacy_pointer
+    assert pointer is not None
     state_snapshot, state = _load_task_state(
         task_state_file(repo_root, pointer.issue),
         binding_mode="recorded",
@@ -880,6 +903,14 @@ def _load_pointer(repo_root: Path, bindings: GitBindings) -> ActiveTaskPointer:
         pointer = _v2_pointer(pointer, state)
     else:
         _validate_pointer_state(pointer, state, bindings)
+    if (
+        current_pointer is not None
+        and legacy_pointer is not None
+        and getattr(current_snapshot, "content") != getattr(legacy_snapshot, "content")
+    ):
+        if current_pointer != _v2_pointer(legacy_pointer, state):
+            raise ValueError("conflicting active task pointers in git common-dir and legacy worktree location")
+        pointer = current_pointer
 
     authority_snapshot, authority = _load_authority(repo_root, bindings, pointer.issue, required=False)
     if authority is None:
@@ -916,6 +947,10 @@ def _load_pointer(repo_root: Path, bindings: GitBindings) -> ActiveTaskPointer:
         )
         legacy_snapshots = (source_snapshot, validated_task_snapshot, authority_snapshot)
 
+    revalidate_snapshots(common_dir, (current_snapshot, authority_snapshot), "active task recovery")
+    revalidate_snapshots(root, (legacy_snapshot, state_snapshot), "active task recovery")
+    if legacy_snapshots:
+        _revalidate_legacy_provenance(repo_root, legacy_snapshots)
     if pointer.version == POINTER_VERSION and (
         getattr(pointer_source_snapshot, "path") == legacy_path or getattr(current_snapshot, "content") != (
             json.dumps(asdict(pointer), ensure_ascii=True, indent=2) + "\n"
@@ -924,8 +959,6 @@ def _load_pointer(repo_root: Path, bindings: GitBindings) -> ActiveTaskPointer:
         _write_pointer(path, pointer)
     if getattr(legacy_snapshot, "exists"):
         legacy_path.unlink()
-    if legacy_snapshots:
-        _revalidate_legacy_provenance(repo_root, legacy_snapshots)
     return pointer
 
 

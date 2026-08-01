@@ -739,6 +739,11 @@ def main() -> None:
         assert json.loads(pointer.read_text(encoding="utf-8"))["version"] == 2
 
         write(old_location, json.dumps(old_payload, ensure_ascii=True, indent=2) + "\n")
+        assert load_active_task(worktree_a).issue == "101"
+        assert not old_location.exists()
+
+        conflicting_old_payload = {**old_payload, "activatedAt": "2000-01-01T00:00:00+00:00"}
+        write(old_location, json.dumps(conflicting_old_payload, ensure_ascii=True, indent=2) + "\n")
         assert_value_error("conflicting active task pointers", lambda: load_active_task(worktree_a))
         old_location.unlink()
 
