@@ -135,6 +135,52 @@ def v1_pointer(payload: dict[str, object]) -> dict[str, object]:
     }
 
 
+def task_artifact_bytes(repo_root: Path, issue: str) -> dict[Path, bytes | None]:
+    bindings = resolve_bindings(repo_root)
+    paths = (
+        active_task_pointer_file(repo_root, bindings.worktree),
+        legacy_active_task_pointer_file(repo_root, bindings.worktree),
+        authority_file(repo_root, issue),
+        repo_root / ".xflow" / "issues" / f"issue-{issue}" / "task-state.md",
+    )
+    return {path: path.read_bytes() if path.exists() else None for path in paths}
+
+
+def start_mutation_owner(repo_root: Path) -> tuple[subprocess.Popen[str], str]:
+    script = """
+import sys
+import time
+from pathlib import Path
+from xflow.collaboration import git_child_environment, repository_mutation
+
+repo = Path(sys.argv[1])
+with repository_mutation(repo):
+    print(git_child_environment(repo)["XFLOW_DEVCTL_MUTATION_LEASE"], flush=True)
+    time.sleep(60)
+"""
+    env = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONPATH": str(OPS_ROOT),
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(repo_root)],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    token = process.stdout.readline().strip()
+    if len(token) != 64:
+        assert process.stderr is not None
+        raise AssertionError(process.stderr.read())
+    return process, token
+
+
 def test_git_hook_devctl_reentry(root: Path) -> None:
     repo = root / "hook-reentry"
     git(root, "init", "-q", str(repo))
@@ -161,7 +207,7 @@ def test_git_hook_devctl_reentry(root: Path) -> None:
     if not hook.is_absolute():
         hook = repo / hook
     python_executable = Path(sys.executable).as_posix()
-    write(hook, f'#!/bin/sh\n"{python_executable}" -m xflow task status >/dev/null\n')
+    write(hook, f'#!/bin/sh\n"{python_executable}" -m xflow hook task-status >/dev/null\n')
     hook.chmod(0o755)
     write(repo / "README.md", "# Hook reentry\n\nchanged\n")
     run_devctl(repo, "git", "commit-msg", "-a", "-c", "验证钩子重入")
@@ -222,11 +268,25 @@ def test_inherited_mutation_lease_is_scoped_and_live(root: Path) -> None:
     other = initialized_repo(root, "lease-other", "feature/505-other")
     write_state(other, state("505", "feature/505-other"))
     activate_task(other, "505")
+    sibling = root / "lease-sibling"
+    git(repo, "worktree", "add", "-b", "feature/505-sibling", str(sibling), "-q")
 
     with repository_mutation(repo):
         token = git_child_environment(repo)["XFLOW_DEVCTL_MUTATION_LEASE"]
         child_env = {"XFLOW_DEVCTL_MUTATION_LEASE": token}
-        assert run_devctl_result(repo, "task", "status", env_overrides=child_env).returncode == 0
+        pointer = active_task_pointer_file(repo, resolve_bindings(repo).worktree)
+        old_pointer = legacy_active_task_pointer_file(repo, resolve_bindings(repo).worktree)
+        write(old_pointer, pointer.read_text(encoding="utf-8"))
+        before = task_artifact_bytes(repo, "504")
+        hook_status = run_devctl_result(repo, "hook", "task-status", env_overrides=child_env)
+        assert hook_status.returncode == 0, hook_status.stderr
+        assert "Issue: 504" in hook_status.stdout
+        assert task_artifact_bytes(repo, "504") == before
+
+        ordinary_status = run_devctl_result(repo, "task", "status", env_overrides=child_env)
+        assert ordinary_status.returncode == 1, ordinary_status.stdout
+        assert "does not allow command" in ordinary_status.stderr
+        assert task_artifact_bytes(repo, "504") == before
 
         forbidden = (
             ("task", "activate", "--issue", "504"),
@@ -242,14 +302,27 @@ def test_inherited_mutation_lease_is_scoped_and_live(root: Path) -> None:
             assert result.returncode == 1, (command, result.stdout, result.stderr)
             assert "does not allow command" in result.stderr, (command, result.stderr)
 
-        wrong_repo = run_devctl_result(other, "task", "status", env_overrides=child_env)
+        wrong_repo = run_devctl_result(other, "hook", "task-status", env_overrides=child_env)
         assert wrong_repo.returncode == 1, wrong_repo.stdout
         assert "invalid or inactive" in wrong_repo.stderr
+        wrong_worktree = run_devctl_result(sibling, "hook", "task-status", env_overrides=child_env)
+        assert wrong_worktree.returncode == 1, wrong_worktree.stdout
+        assert "invalid or inactive" in wrong_worktree.stderr
 
         forged_env = {"XFLOW_DEVCTL_MUTATION_LEASE": "0" * 64}
-        forged = run_devctl_result(repo, "task", "status", env_overrides=forged_env)
+        forged = run_devctl_result(repo, "hook", "task-status", env_overrides=forged_env)
         assert forged.returncode == 1, forged.stdout
         assert "invalid or inactive" in forged.stderr
+
+        authority = authority_file(repo, "504")
+        authority_bytes = authority.read_bytes()
+        authority.unlink()
+        missing_authority_before = task_artifact_bytes(repo, "504")
+        missing_authority = run_devctl_result(repo, "hook", "task-status", env_overrides=child_env)
+        assert missing_authority.returncode == 1, missing_authority.stdout
+        assert "missing task authority" in missing_authority.stderr
+        assert task_artifact_bytes(repo, "504") == missing_authority_before
+        write(authority, authority_bytes.decode("utf-8"))
 
         lease_path = (
             git_path(repo, "--git-common-dir")
@@ -261,15 +334,98 @@ def test_inherited_mutation_lease_is_scoped_and_live(root: Path) -> None:
 
         def remove_live_lease() -> None:
             with patch.dict(os.environ, child_env):
-                with inherited_lease_command(repo, ("task", "status")):
-                    with repository_lock(repo):
-                        lease_path.unlink()
+                with inherited_lease_command(repo, ("hook", "task-status")):
+                    lease_path.unlink()
+                    raise ValueError("snapshot operation failed")
 
         assert_value_error("invalid or inactive", remove_live_lease)
 
-    stale = run_devctl_result(repo, "task", "status", env_overrides=child_env)
+    stale = run_devctl_result(repo, "hook", "task-status", env_overrides=child_env)
     assert stale.returncode == 1, stale.stdout
     assert "invalid or inactive" in stale.stderr
+
+    with repository_lock(repo):
+        locked_status = run_devctl_result(repo, "task", "status")
+    assert locked_status.returncode == 1, locked_status.stdout
+    assert "another devctl process holds" in locked_status.stderr
+    assert run_devctl_result(repo, "task", "status").returncode == 0
+    assert not old_pointer.exists()
+
+
+def test_inherited_mutation_lease_owner_identity_fails_closed(root: Path) -> None:
+    repo = initialized_repo(root, "lease-owner", "feature/506-owner")
+    write_state(repo, state("506", "feature/506-owner"))
+    activate_task(repo, "506")
+    before = task_artifact_bytes(repo, "506")
+
+    with repository_mutation(repo):
+        token = git_child_environment(repo)["XFLOW_DEVCTL_MUTATION_LEASE"]
+        lease_path = git_path(repo, "--git-common-dir") / "xflow" / "locks" / "mutations" / f"{token}.json"
+        payload = json.loads(lease_path.read_text(encoding="utf-8"))
+        assert isinstance(payload.get("ownerStartIdentity"), str)
+        payload["ownerStartIdentity"] = "mismatched-process-start"
+        write(lease_path, json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
+        mismatch = run_devctl_result(
+            repo,
+            "hook",
+            "task-status",
+            env_overrides={"XFLOW_DEVCTL_MUTATION_LEASE": token},
+        )
+        assert mismatch.returncode == 1, mismatch.stdout
+        assert "invalid or inactive" in mismatch.stderr
+        assert task_artifact_bytes(repo, "506") == before
+
+    owner, token = start_mutation_owner(repo)
+    lease_path = git_path(repo, "--git-common-dir") / "xflow" / "locks" / "mutations" / f"{token}.json"
+    try:
+        owner.terminate()
+        owner.wait(timeout=10)
+        dead = run_devctl_result(
+            repo,
+            "hook",
+            "task-status",
+            env_overrides={"XFLOW_DEVCTL_MUTATION_LEASE": token},
+        )
+        assert dead.returncode == 1, dead.stdout
+        assert "invalid or inactive" in dead.stderr
+        assert task_artifact_bytes(repo, "506") == before
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait(timeout=10)
+        lease_path.unlink(missing_ok=True)
+
+
+def test_owner_death_between_hook_entry_and_exit_is_read_only(root: Path) -> None:
+    repo = initialized_repo(root, "lease-owner-exit", "feature/507-owner-exit")
+    write_state(repo, state("507", "feature/507-owner-exit"))
+    activate_task(repo, "507")
+    pointer = active_task_pointer_file(repo, resolve_bindings(repo).worktree)
+    old_pointer = legacy_active_task_pointer_file(repo, resolve_bindings(repo).worktree)
+    write(old_pointer, pointer.read_text(encoding="utf-8"))
+    before = task_artifact_bytes(repo, "507")
+    owner, token = start_mutation_owner(repo)
+    lease_path = git_path(repo, "--git-common-dir") / "xflow" / "locks" / "mutations" / f"{token}.json"
+
+    def die_during_read() -> None:
+        with patch.dict(os.environ, {"XFLOW_DEVCTL_MUTATION_LEASE": token}):
+            with inherited_lease_command(repo, ("hook", "task-status")):
+                owner.terminate()
+                owner.wait(timeout=10)
+                from xflow.task_state import load_active_task_snapshot
+
+                bindings, active = load_active_task_snapshot(repo)
+                assert bindings.branch == "feature/507-owner-exit"
+                assert active.issue == "507"
+
+    try:
+        assert_value_error("invalid or inactive", die_during_read)
+        assert task_artifact_bytes(repo, "507") == before
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+            owner.wait(timeout=10)
+        lease_path.unlink(missing_ok=True)
 
 
 def initialized_repo(root: Path, name: str, branch: str) -> Path:
@@ -735,6 +891,8 @@ def main() -> None:
         test_official_git_start_respects_closure_lock(root)
         test_git_hook_devctl_reentry(root)
         test_inherited_mutation_lease_is_scoped_and_live(root)
+        test_inherited_mutation_lease_owner_identity_fails_closed(root)
+        test_owner_death_between_hook_entry_and_exit_is_read_only(root)
         test_modern_pointer_blocks_legacy_migration(root)
         test_legacy_authority_is_live_provenance(root)
         test_legacy_fallback_is_stable_and_authority_aware(root)

@@ -23,7 +23,7 @@ from .checks import (
     write_pr_state_update_suggestion,
 )
 from .commit_message import check_commit_message
-from .bindings import resolve_bindings
+from .bindings import GitBindings, resolve_bindings
 from .classification import check_classification
 from .collaboration import (
     git_child_environment,
@@ -37,6 +37,7 @@ from .dependencies import check_dependencies
 from .migration import apply_issue_workspace_migration, inspect, inspect_issue_workspace_migration, write_wrappers
 from .paths import default_issue_file, normalized_issue
 from .task_state import (
+    TaskState,
     _capture_file,
     _legacy_field,
     _pointer_snapshots,
@@ -44,6 +45,7 @@ from .task_state import (
     activate_task,
     list_task_states,
     load_active_task,
+    load_active_task_snapshot,
     migrate_legacy_current_task,
     task_authority_issues,
 )
@@ -166,6 +168,10 @@ def build_parser() -> argparse.ArgumentParser:
     task_sub.add_parser("status")
     task_sub.add_parser("list")
     task_sub.add_parser("migrate-current")
+
+    hook = sub.add_parser("hook")
+    hook_sub = hook.add_subparsers(dest="hook_command", required=True)
+    hook_sub.add_parser("task-status")
 
     contract = sub.add_parser("contract")
     contract_sub = contract.add_subparsers(dest="contract_command", required=True)
@@ -440,6 +446,25 @@ def run_task(args: argparse.Namespace) -> int:
         print(f"[INFO] migrated current task: #{state.issue}")
         return 0
     raise ValueError(f"unknown task subcommand: {args.task_command}")
+
+
+def _print_task_status(bindings: GitBindings, state: TaskState) -> None:
+    print(f"repository: {bindings.repository[:12]}")
+    print(f"worktree: {bindings.worktree[:12]}")
+    print(f"branch: {bindings.branch}")
+    print(f"Issue: {state.issue}")
+    print(f"Execution State: {state.execution_state}")
+    print(f"Semantic Phase: {state.semantic_phase}")
+    print(f"Classification: {state.classification}")
+    print(f"Contract: {state.contract}")
+
+
+def run_hook(args: argparse.Namespace) -> int:
+    if args.hook_command != "task-status":
+        raise ValueError(f"unknown hook subcommand: {args.hook_command}")
+    bindings, state = load_active_task_snapshot(context().repo_root)
+    _print_task_status(bindings, state)
+    return 0
 
 
 def run_contract(args: argparse.Namespace) -> int:
@@ -1428,6 +1453,8 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         return run_check(args)
     if args.command == "task":
         return run_task(args)
+    if args.command == "hook":
+        return run_hook(args)
     if args.command == "contract":
         return run_contract(args)
     if args.command == "trace":

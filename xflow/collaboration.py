@@ -4,6 +4,7 @@ import json
 import os
 import re
 import secrets
+import subprocess
 import threading
 import time
 from contextlib import contextmanager
@@ -30,8 +31,8 @@ _INHERITED_LOCAL = threading.local()
 _F = TypeVar("_F", bound=Callable[..., object])
 _LEASE_ENV = "XFLOW_DEVCTL_MUTATION_LEASE"
 _LEASE_TOKEN_RE = re.compile(r"[0-9a-f]{64}")
-_LEASE_FIELDS = {"version", "token", "repository", "worktree", "ownerPid"}
-_SAFE_INHERITED_COMMANDS = frozenset({("task", "status")})
+_LEASE_FIELDS = {"version", "token", "repository", "worktree", "ownerPid", "ownerStartIdentity"}
+_SAFE_INHERITED_COMMANDS = frozenset({("hook", "task-status")})
 
 
 def _lock_path(repo_root: Path) -> Path:
@@ -54,6 +55,97 @@ def _lease_identity(repo_root: Path) -> tuple[Path, str, str]:
 
 def _lease_path(common_dir: Path, token: str) -> Path:
     return common_dir / "xflow" / "locks" / "mutations" / f"{token}.json"
+
+
+def _windows_process_start_identity(pid: int) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    open_process = kernel32.OpenProcess
+    open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    open_process.restype = wintypes.HANDLE
+    get_process_times = kernel32.GetProcessTimes
+    get_process_times.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+        ctypes.POINTER(wintypes.FILETIME),
+    )
+    get_process_times.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    handle = open_process(process_query_limited_information, False, pid)
+    if not handle:
+        raise ValueError("mutation lease owner is not live")
+    try:
+        creation = wintypes.FILETIME()
+        exit_time = wintypes.FILETIME()
+        kernel_time = wintypes.FILETIME()
+        user_time = wintypes.FILETIME()
+        if not get_process_times(
+            handle,
+            ctypes.byref(creation),
+            ctypes.byref(exit_time),
+            ctypes.byref(kernel_time),
+            ctypes.byref(user_time),
+        ):
+            raise ValueError("mutation lease owner is not live")
+        exit_value = (int(exit_time.dwHighDateTime) << 32) | int(exit_time.dwLowDateTime)
+        if exit_value != 0:
+            raise ValueError("mutation lease owner is not live")
+        value = (int(creation.dwHighDateTime) << 32) | int(creation.dwLowDateTime)
+        return f"windows-filetime:{value}"
+    finally:
+        close_handle(handle)
+
+
+def _posix_process_start_identity(pid: int) -> str:
+    proc_stat = Path(f"/proc/{pid}/stat")
+    if proc_stat.exists():
+        try:
+            text = proc_stat.read_text(encoding="ascii", errors="strict")
+        except (OSError, UnicodeError) as exc:
+            raise ValueError("mutation lease owner is not live") from exc
+        closing = text.rfind(")")
+        fields = text[closing + 2 :].split() if closing >= 0 else []
+        if len(fields) <= 19 or fields[0] in {"Z", "X", "x"} or not fields[19].isdigit():
+            raise ValueError("mutation lease owner is not live")
+        return f"posix-proc-start:{fields[19]}"
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError as exc:
+        raise ValueError("mutation lease owner is not live") from exc
+    except PermissionError:
+        pass
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-o", "lstart=", "-p", str(pid)],
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="strict",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("mutation lease owner is not live") from exc
+    output = " ".join(result.stdout.split())
+    status, separator, started = output.partition(" ")
+    if result.returncode != 0 or not separator or not started or status.startswith(("Z", "X")):
+        raise ValueError("mutation lease owner is not live")
+    return f"posix-ps-start:{started}"
+
+
+def _process_start_identity(pid: int) -> str:
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("mutation lease owner PID is invalid")
+    return _windows_process_start_identity(pid) if os.name == "nt" else _posix_process_start_identity(pid)
 
 
 def _validate_inherited_lease(repo_root: Path, token: str) -> None:
@@ -80,12 +172,14 @@ def _validate_inherited_lease(repo_root: Path, token: str) -> None:
         if (
             not isinstance(payload, dict)
             or set(payload) != _LEASE_FIELDS
-            or payload.get("version") != 1
+            or payload.get("version") != 2
             or payload.get("token") != token
             or payload.get("repository") != repository
             or payload.get("worktree") != worktree
             or type(payload.get("ownerPid")) is not int
             or payload["ownerPid"] <= 0
+            or not isinstance(payload.get("ownerStartIdentity"), str)
+            or payload["ownerStartIdentity"] != _process_start_identity(payload["ownerPid"])
         ):
             raise ValueError("mutation lease identity mismatch")
         revalidate_snapshots(common_dir, (snapshot,), "repository mutation lease")
@@ -112,12 +206,14 @@ def inherited_lease_command(repo_root: Path, command: tuple[str, ...]) -> Iterat
     _INHERITED_LOCAL.authorization = (token, command)
     try:
         yield
-        _validate_inherited_lease(repo_root, token)
     finally:
-        if previous is None:
-            delattr(_INHERITED_LOCAL, "authorization")
-        else:
-            _INHERITED_LOCAL.authorization = previous
+        try:
+            _validate_inherited_lease(repo_root, token)
+        finally:
+            if previous is None:
+                delattr(_INHERITED_LOCAL, "authorization")
+            else:
+                _INHERITED_LOCAL.authorization = previous
 
 
 def _authorized_inherited_lease(repo_root: Path) -> str | None:
@@ -233,11 +329,12 @@ def repository_mutation(repo_root: Path) -> Iterator[None]:
         path = _lease_path(common_dir, token)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "version": 1,
+            "version": 2,
             "token": token,
             "repository": repository,
             "worktree": worktree,
             "ownerPid": os.getpid(),
+            "ownerStartIdentity": _process_start_identity(os.getpid()),
         }
         with path.open("x", encoding="utf-8", newline="\n") as stream:
             json.dump(payload, stream, ensure_ascii=True, indent=2)

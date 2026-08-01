@@ -948,6 +948,54 @@ def _state_for_pointer(repo_root: Path, pointer: ActiveTaskPointer, bindings: Gi
     return state
 
 
+def load_active_task_snapshot(repo_root: Path) -> tuple[GitBindings, TaskState]:
+    from .local_artifacts import revalidate_snapshots
+
+    bindings = resolve_bindings(repo_root)
+    common_dir = git_path(repo_root, "--git-common-dir")
+    root = repo_root.resolve()
+    path = active_task_pointer_file(repo_root, bindings.worktree)
+    legacy_path = legacy_active_task_pointer_file(repo_root, bindings.worktree)
+    current = _capture_file(common_dir, path, common_dir, "active task pointer", required=False)
+    legacy = _capture_file(root, legacy_path, root, "legacy active task pointer", required=False)
+    available = tuple(snapshot for snapshot in (current, legacy) if getattr(snapshot, "exists"))
+    if not available:
+        raise ValueError(f"missing active task pointer: {path}")
+    if len(available) == 2 and getattr(current, "content") != getattr(legacy, "content"):
+        raise ValueError("conflicting active task pointers in git common-dir and legacy worktree location")
+    pointer = _read_pointer_snapshot(current if getattr(current, "exists") else legacy)
+    _validate_pointer_bindings(pointer, bindings)
+    state_snapshot, state = _load_task_state(
+        task_state_file(repo_root, pointer.issue),
+        binding_mode="recorded",
+        validate_acceptance=False,
+    )
+    if pointer.version == 1:
+        pointer = _v2_pointer(pointer, state)
+    else:
+        _validate_pointer_state(pointer, state, bindings)
+    authority_snapshot, authority = _load_authority(repo_root, bindings, pointer.issue, required=True)
+    assert authority is not None
+    _validate_authority_state(authority, state)
+    _validate_authority_pointer(authority, pointer)
+    legacy_snapshots: tuple[object, ...] = ()
+    if authority.taskMode == "legacy":
+        source_snapshot, validated_task_snapshot = _validate_legacy_authority_provenance(
+            repo_root,
+            bindings,
+            authority,
+            state,
+            task_snapshot=state_snapshot,
+        )
+        legacy_snapshots = (source_snapshot, validated_task_snapshot, authority_snapshot)
+
+    revalidate_snapshots(common_dir, (current, authority_snapshot), "active task snapshot")
+    revalidate_snapshots(root, (legacy, state_snapshot), "active task snapshot")
+    if legacy_snapshots:
+        _revalidate_legacy_provenance(repo_root, legacy_snapshots)
+    return bindings, state
+
+
 @repository_locked
 def activate_task(repo_root: Path, issue: str) -> TaskState:
     bindings = resolve_bindings(repo_root)
