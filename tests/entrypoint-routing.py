@@ -337,6 +337,24 @@ def assert_issue_workspace_migration_is_discoverable() -> None:
     ).stdout
 
 
+def assert_complete_command_contract_is_published() -> None:
+    anchors = (
+        "devctl task activate --issue IK3RR6",
+        "devctl check classification --issue IK3RR6",
+        "devctl contract lint --file docs/requirements/example/contract.yaml",
+        "devctl contract accept --issue IK3RR6 --file docs/requirements/example/contract.yaml --objects <id,id,...>",
+        "devctl contract diff --old <old.yaml> --new <new.yaml>",
+        "devctl trace check --issue IK3RR6 --contract <contract.yaml> --matrix <traceability-matrix.yaml>",
+        ".xflow/issues/ is tracked by default",
+        "lint does not approve semantic quality",
+        "contract acceptance never supports unattended mode",
+    )
+    for path in (OPS_ROOT / "help.txt", OPS_ROOT / "README.md"):
+        text = path.read_text(encoding="utf-8")
+        for anchor in anchors:
+            assert anchor in text, (path, anchor)
+
+
 def run_powershell_devctl(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = {
         **test_env(),
@@ -397,6 +415,7 @@ def main() -> None:
     assert_contract_commands_are_discoverable()
     assert_trace_commands_are_discoverable()
     assert_issue_workspace_migration_is_discoverable()
+    assert_complete_command_contract_is_published()
 
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)

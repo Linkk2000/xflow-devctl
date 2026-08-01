@@ -2488,6 +2488,32 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "subtask `evidence/` directory" in readme_text
 
 
+def test_capability_contract_guidance_is_visible() -> None:
+    expected = (
+        "devctl task activate --issue IK3RR6",
+        "devctl task status",
+        "devctl task list",
+        "devctl task migrate-current",
+        "devctl check classification --issue IK3RR6",
+        "devctl contract lint --file docs/requirements/example/contract.yaml",
+        "devctl contract accept --issue IK3RR6 --file docs/requirements/example/contract.yaml --objects <id,id,...>",
+        "devctl contract diff --old <old.yaml> --new <new.yaml>",
+        "devctl trace check --issue IK3RR6 --contract <contract.yaml> --matrix <traceability-matrix.yaml>",
+        "devctl migrate issue-workspace --mode tracked --check",
+        "devctl migrate issue-workspace --mode local --check",
+        ".xflow/issues/ is tracked by default",
+        "contract acceptance never supports unattended mode",
+        "approval history",
+        "parallel worktrees",
+        "devctl hook task-status",
+    )
+    for path in (OPS_ROOT / "help.txt", OPS_ROOT / "README.md"):
+        text = path.read_text(encoding="utf-8")
+        for anchor in expected:
+            assert anchor in text, (path, anchor)
+        assert "Do not use `devctl hook task-status` as a normal user or AI command." in text
+
+
 class RecordingApiHandler(BaseHTTPRequestHandler):
     requests: list[dict[str, object]] = []
     release_created: bool = False
@@ -2726,6 +2752,7 @@ def main() -> None:
         test_git_task_metadata_is_scoped_to_each_worktree(repo / "worktree-metadata")
         test_git_push_and_mr_are_separate_with_state_backfill(repo / "push-mr-state")
         test_ai_call_guidance_is_visible(repo)
+        test_capability_contract_guidance_is_visible()
 
         issue_file = repo / ".xflow" / "issues" / "issue-draft" / "issue-draft.md"
         write(

@@ -195,6 +195,77 @@ Approval:
   Prepared by AI or tooling does not mean approved.
   Only the human reviewer may change Approved: no to Approved: yes.
 
+Task authority v2 and contract closure:
+  Run these commands from the repository worktree that owns the task. Portable
+  examples use devctl; in native Windows PowerShell, replace each leading
+  devctl with .\devctl.ps1. Do not use a user-level PATH devctl shim.
+
+  Task authority is repository-common but worktree-bound. In parallel worktrees,
+  activate and inspect the task from the worktree that owns the branch:
+    devctl task activate --issue IK3RR6
+    devctl task status
+    devctl task list
+  task status reports the repository, worktree, branch, Issue, execution state,
+  semantic phase, classification, and selected contract. Parallel worktrees do
+  not share an active task identity just because they share one Git repository.
+
+  The shortest happy path for a contract-bearing Issue is:
+    devctl task activate --issue IK3RR6
+    devctl check classification --issue IK3RR6
+    devctl contract lint --file docs/requirements/composed-activity/contract.yaml
+    devctl approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/composed-activity/contract.yaml
+    devctl contract accept --issue IK3RR6 --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
+    devctl trace check --issue IK3RR6 --contract docs/requirements/composed-activity/contract.yaml --matrix .xflow/issues/issue-IK3RR6/traceability-matrix.yaml
+  Native Windows PowerShell recipe:
+    .\devctl.ps1 task activate --issue IK3RR6
+    .\devctl.ps1 check classification --issue IK3RR6
+    .\devctl.ps1 contract lint --file docs/requirements/composed-activity/contract.yaml
+    .\devctl.ps1 approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/composed-activity/contract.yaml
+    .\devctl.ps1 contract accept --issue IK3RR6 --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
+    .\devctl.ps1 trace check --issue IK3RR6 --contract docs/requirements/composed-activity/contract.yaml --matrix .xflow/issues/issue-IK3RR6/traceability-matrix.yaml
+
+  Mechanical contract commands:
+    devctl check classification --issue IK3RR6 [--file .xflow/issues/issue-IK3RR6/classification.yaml]
+    devctl contract lint --file docs/requirements/example/contract.yaml
+    devctl contract diff --old <old.yaml> --new <new.yaml>
+    devctl trace check --issue IK3RR6 --contract <contract.yaml> --matrix <traceability-matrix.yaml>
+  Classification, lint, diff, and trace check are mechanical validation and
+  comparison steps. lint does not approve semantic quality. A passing lint,
+  diff, or trace check is evidence for review, never a human acceptance.
+
+  Contract acceptance is a human-only command boundary:
+    devctl approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/example/contract.yaml
+    devctl contract accept --issue IK3RR6 --file docs/requirements/example/contract.yaml --objects <id,id,...>
+  The human reviewer must review the exact file and approved object list, then
+  change the prepared review from Approved: no to Approved: yes. AI may prepare
+  the review and run mechanical checks, but may not approve or accept on the
+  human's behalf. contract acceptance never supports unattended mode.
+  A successful acceptance seals immutable approval history under
+  .xflow/issues/issue-<id>/approvals/history/; do not edit, reuse, or manually
+  manufacture approval history records.
+
+  The normal user and AI interface is devctl task status. devctl hook task-status
+  is an internal integration hook for an already-authorized inherited mutation
+  lease; it is not a normal workflow entrypoint. Do not use `devctl hook task-status` as a normal user or AI command.
+
+Task and issue-workspace migration:
+  Existing repositories with only .xflow/current-task.md can migrate once from
+  the owning worktree:
+    devctl task migrate-current
+  Keep the legacy file only while compatibility consumers still need it; the v2
+  task authority becomes the source of truth after migration.
+
+  .xflow/issues/ is tracked by default. Inspect before changing an older local
+  workspace policy, then apply the selected mode only after a human reviews the
+  reported ignores, active approvals, credentials, local paths, and large files:
+    devctl migrate issue-workspace --mode tracked --check
+    devctl migrate issue-workspace --mode tracked --apply
+    devctl migrate issue-workspace --mode local --check
+    devctl migrate issue-workspace --mode local --apply
+  tracked keeps Issue evidence and approval history in Git. local is a legacy
+  exception for repositories that intentionally ignore .xflow/issues/; it is
+  not the default and may require manual remediation before apply.
+
 AI rules:
   devctl rules list
   devctl rules sync <rule-id>|--all [--force]
@@ -202,6 +273,7 @@ AI rules:
 Migration:
   devctl migrate inspect
   devctl migrate wrappers
+  devctl migrate issue-workspace --mode tracked|local --check|--apply
 
 Runtime:
   Repository-local devctl.ps1 and generated project wrappers route normal commands to Python core.

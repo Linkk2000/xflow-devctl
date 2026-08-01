@@ -40,6 +40,17 @@ devctl check gap-analysis --issue 1
 devctl check resolution-report --issue 1
 devctl check dependencies --issue IK152D
 devctl check commit-msg --file .xflow/local/commit-message.txt --issue IK152D
+devctl task activate --issue IK3RR6
+devctl task status
+devctl task list
+devctl task migrate-current
+devctl check classification --issue IK3RR6
+devctl contract lint --file docs/requirements/example/contract.yaml
+devctl contract accept --issue IK3RR6 --file docs/requirements/example/contract.yaml --objects <id,id,...>
+devctl contract diff --old <old.yaml> --new <new.yaml>
+devctl trace check --issue IK3RR6 --contract <contract.yaml> --matrix <traceability-matrix.yaml>
+devctl migrate issue-workspace --mode tracked --check
+devctl migrate issue-workspace --mode local --check
 devctl git push --issue 1 --file .xflow/issues/issue-1/walkthrough.md
 devctl git mr --title "Title" --body-file .xflow/issues/issue-1/mr-draft.md --issue 1
 devctl check submodule-hygiene
@@ -54,6 +65,116 @@ Use these recipes instead of probing random flag combinations.
 Human Approval Is Non-Delegable. AI may prepare approval files, evidence,
 command drafts, and review notes, but AI must never satisfy a human gate
 itself. AI must never edit `Approved: no` to `Approved: yes`.
+
+## Task Authority And Contract Closure
+
+Run task and contract commands from the repository worktree that owns the
+branch. The portable recipes below use `devctl`. In native Windows PowerShell,
+use the repository-local `./devctl.ps1` in place of each leading `devctl`:
+
+```text
+# Portable
+devctl task activate --issue IK3RR6
+
+# Native Windows PowerShell
+.\devctl.ps1 task activate --issue IK3RR6
+```
+
+Task authority v2 is shared by the Git repository but bound to the active
+worktree and branch. For parallel worktrees, activate and inspect the task in
+the worktree that owns it; do not assume a task activated in one worktree is
+active in another.
+
+```text
+devctl task activate --issue IK3RR6
+devctl task status
+devctl task list
+```
+
+`task status` is the normal status interface for people and AI. It reports the
+repository, worktree, branch, Issue, execution state, semantic phase,
+classification, and selected contract. `devctl hook task-status` is an internal
+integration hook for an already-authorized inherited mutation lease, not a
+normal workflow entrypoint. Do not use `devctl hook task-status` as a normal user or AI command.
+
+For a contract-bearing Issue, the shortest copyable happy path is:
+
+```text
+devctl task activate --issue IK3RR6
+devctl check classification --issue IK3RR6
+devctl contract lint --file docs/requirements/composed-activity/contract.yaml
+devctl approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/composed-activity/contract.yaml
+devctl contract accept --issue IK3RR6 --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
+devctl trace check --issue IK3RR6 --contract docs/requirements/composed-activity/contract.yaml --matrix .xflow/issues/issue-IK3RR6/traceability-matrix.yaml
+```
+
+The native Windows PowerShell equivalent is:
+
+```text
+.\devctl.ps1 task activate --issue IK3RR6
+.\devctl.ps1 check classification --issue IK3RR6
+.\devctl.ps1 contract lint --file docs/requirements/composed-activity/contract.yaml
+.\devctl.ps1 approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/composed-activity/contract.yaml
+.\devctl.ps1 contract accept --issue IK3RR6 --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
+.\devctl.ps1 trace check --issue IK3RR6 --contract docs/requirements/composed-activity/contract.yaml --matrix .xflow/issues/issue-IK3RR6/traceability-matrix.yaml
+```
+
+The mechanical commands may be used by a user or AI to validate and compare
+artifacts:
+
+```text
+devctl check classification --issue IK3RR6 [--file .xflow/issues/issue-IK3RR6/classification.yaml]
+devctl contract lint --file docs/requirements/example/contract.yaml
+devctl contract diff --old <old.yaml> --new <new.yaml>
+devctl trace check --issue IK3RR6 --contract <contract.yaml> --matrix <traceability-matrix.yaml>
+```
+
+Classification, lint, diff, and trace checks are mechanical. lint does not approve semantic quality.
+Passing these commands provides review evidence; it does not make a design or
+contract acceptable.
+
+Contract acceptance is a human-only boundary:
+
+```text
+devctl approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/example/contract.yaml
+devctl contract accept --issue IK3RR6 --file docs/requirements/example/contract.yaml --objects <id,id,...>
+```
+
+The reviewer must inspect the exact contract bytes and object list and change
+the prepared review from `Approved: no` to `Approved: yes`. AI may prepare the
+review or run the mechanical checks but cannot perform this acceptance.
+contract acceptance never supports unattended mode. On success devctl writes
+sealed, non-reusable approval history under
+`.xflow/issues/issue-<id>/approvals/history/`; do not edit, reuse, or manually
+create those history records.
+
+## Compatibility And Issue Workspace Migration
+
+For an older repository whose active task exists only in
+`.xflow/current-task.md`, run this once from its owning worktree:
+
+```text
+devctl task migrate-current
+```
+
+The v2 authority is then authoritative. Retain the old file only for temporary
+compatibility with consumers that have not migrated.
+
+.xflow/issues/ is tracked by default. Use the migration check before any policy
+change; it reports active approvals, large files, local absolute paths,
+credential-like text, and ignore rules for human review:
+
+```text
+devctl migrate issue-workspace --mode tracked --check
+devctl migrate issue-workspace --mode tracked --apply
+devctl migrate issue-workspace --mode local --check
+devctl migrate issue-workspace --mode local --apply
+```
+
+`tracked` preserves Issue artifacts and approval history in Git. `local` is a
+legacy exception for repositories that intentionally ignore `.xflow/issues/`;
+it is never the default. Review migration output before `--apply`, especially
+when it identifies a manual action.
 
 Task-scoped unattended mode is enabled, inspected, and ended only through:
 
