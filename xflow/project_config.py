@@ -5,7 +5,11 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+
+if TYPE_CHECKING:
+    from .local_artifacts import StableFileSnapshot
 
 
 DEFAULT_ISSUE_WORKSPACE_MODE: Literal["tracked", "local"] = "tracked"
@@ -121,15 +125,27 @@ def parse_project_config(repo_root: Path, config_path: Path, raw: object) -> Pro
     return ProjectConfig(mode, contract_root)
 
 
-def load_project_config(repo_root: Path) -> ProjectConfig:
+def load_project_config_snapshot(repo_root: Path) -> tuple[StableFileSnapshot, ProjectConfig]:
+    from .local_artifacts import MAX_SMALL_ARTIFACT_BYTES, capture_stable_file
+
     repo_root = repo_root.resolve(strict=False)
     config_path = require_safe_repo_path(repo_root, repo_root / ".xflow" / "xflow.json", ".xflow/xflow.json")
-    if not config_path.exists():
-        return ProjectConfig(DEFAULT_ISSUE_WORKSPACE_MODE, DEFAULT_CONTRACT_ROOT)
-    if not config_path.is_file():
-        raise _invalid(config_path, "must be a regular file")
+    snapshot = capture_stable_file(
+        repo_root,
+        config_path,
+        repo_root,
+        ".xflow/xflow.json",
+        required=False,
+        max_bytes=MAX_SMALL_ARTIFACT_BYTES,
+    )
+    if not snapshot.exists:
+        return snapshot, ProjectConfig(DEFAULT_ISSUE_WORKSPACE_MODE, DEFAULT_CONTRACT_ROOT)
     try:
-        raw = json.loads(config_path.read_text(encoding="utf-8-sig", errors="strict"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raw = json.loads((snapshot.content or b"").decode("utf-8-sig", errors="strict"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
         raise _invalid(config_path, "must contain a UTF-8 JSON object") from exc
-    return parse_project_config(repo_root, config_path, raw)
+    return snapshot, parse_project_config(repo_root, config_path, raw)
+
+
+def load_project_config(repo_root: Path) -> ProjectConfig:
+    return load_project_config_snapshot(repo_root)[1]

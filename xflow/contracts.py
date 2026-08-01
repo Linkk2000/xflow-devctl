@@ -11,9 +11,9 @@ from pathlib import Path
 from typing import Literal, Mapping, Sequence
 
 from . import approval
-from .classification import _decode_classification_bytes, _load_yaml, _read_stable_bytes
-from .local_artifacts import MAX_TEXT_ARTIFACT_BYTES
-from .project_config import load_project_config, require_safe_repo_path
+from .classification import _decode_classification_bytes, _load_yaml
+from .local_artifacts import MAX_TEXT_ARTIFACT_BYTES, StableFileSnapshot, capture_stable_file
+from .project_config import ProjectConfig, load_project_config, load_project_config_snapshot, require_safe_repo_path
 
 
 SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
@@ -196,9 +196,14 @@ def _validate_date(value: object) -> None:
         raise ValueError("created must be an ISO date") from exc
 
 
-def _contract_path(repo_root: Path, file_path: Path) -> tuple[Path, Path]:
+def _contract_path(
+    repo_root: Path,
+    file_path: Path,
+    *,
+    config: ProjectConfig | None = None,
+) -> tuple[Path, Path]:
     root = repo_root.resolve()
-    config = load_project_config(root)
+    config = config or load_project_config(root)
     contract_root = require_safe_repo_path(root, root / config.contract_root, "contracts.root")
     requested = file_path if file_path.is_absolute() else root / file_path
     target = Path(os.path.abspath(requested))
@@ -208,13 +213,6 @@ def _contract_path(repo_root: Path, file_path: Path) -> tuple[Path, Path]:
         raise ValueError(f"contract file must stay under contracts.root: {contract_root}") from exc
     safe_target = require_safe_repo_path(root, target, "contract file")
     return contract_root, safe_target
-
-
-def _stable_contract_bytes(repo_root: Path, contract_root: Path, path: Path) -> bytes:
-    try:
-        return _read_stable_bytes(repo_root, path, contract_root, max_bytes=MAX_TEXT_ARTIFACT_BYTES)
-    except ValueError as exc:
-        raise ValueError(str(exc).replace("classification", "contract")) from exc
 
 
 def _parse_contract_yaml(text: str) -> dict[str, object]:
@@ -899,19 +897,32 @@ def load_contract(repo_root: Path, file_path: Path) -> ContractDocument:
     return document
 
 
-def _load_contract_snapshot(repo_root: Path, file_path: Path) -> tuple[ContractDocument, str]:
+def _load_contract_artifact_snapshot(
+    repo_root: Path,
+    file_path: Path,
+) -> tuple[StableFileSnapshot, StableFileSnapshot, ContractDocument]:
     root = repo_root.resolve()
-    contract_root, path = _contract_path(root, file_path)
-    if not path.is_file():
-        raise ValueError(f"missing contract file: {path}")
-    raw_bytes = _stable_contract_bytes(root, contract_root, path)
+    config_snapshot, config = load_project_config_snapshot(root)
+    contract_root, path = _contract_path(root, file_path, config=config)
+    contract_snapshot = capture_stable_file(
+        root,
+        path,
+        contract_root,
+        "contract file",
+        max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+    )
+    raw_bytes = contract_snapshot.content or b""
     try:
         text = _decode_classification_bytes(raw_bytes, path)
     except ValueError as exc:
         raise ValueError(str(exc).replace("classification", "contract")) from exc
     raw = _parse_contract_yaml(text)
     _validate_contract_schema(raw)
-    document = _build_document(path, raw, raw_bytes)
+    return config_snapshot, contract_snapshot, _build_document(path, raw, raw_bytes)
+
+
+def _load_contract_snapshot(repo_root: Path, file_path: Path) -> tuple[ContractDocument, str]:
+    _, _, document = _load_contract_artifact_snapshot(repo_root, file_path)
     return document, document.sha256
 
 
@@ -947,11 +958,35 @@ def validate_task_contract_acceptance(
     binding_mode: str = "current",
     recorded_branch: str | None = None,
 ) -> None:
+    validate_task_contract_acceptance_snapshots(
+        repo_root,
+        issue,
+        contract_name,
+        contract_file,
+        approval_reference,
+        semantic_phase,
+        binding_mode=binding_mode,
+        recorded_branch=recorded_branch,
+    )
+
+
+def validate_task_contract_acceptance_snapshots(
+    repo_root: Path,
+    issue: str,
+    contract_name: str,
+    contract_file: str,
+    approval_reference: str,
+    semantic_phase: str,
+    *,
+    binding_mode: str = "current",
+    recorded_branch: str | None = None,
+) -> tuple[StableFileSnapshot, ...]:
     root = repo_root.resolve()
     try:
-        document, digest = _load_contract_snapshot(root, Path(contract_file))
+        config_snapshot, contract_snapshot, document = _load_contract_artifact_snapshot(root, Path(contract_file))
     except ValueError as exc:
         raise ValueError(f"missing matching human contract acceptance: {exc}") from exc
+    digest = document.sha256
     contract_id = _identifier(document.raw["id"], "id")
     contract_version = _semver(document.raw["version"], "version")
     if document.raw["status"] != "accepted-design":
@@ -969,12 +1004,24 @@ def validate_task_contract_acceptance(
         history_path.relative_to(issue_root / "approvals" / "history")
     except ValueError as exc:
         raise ValueError("missing matching human contract acceptance") from exc
-    if not history_path.is_file():
-        raise ValueError("missing matching human contract acceptance")
     try:
-        record = approval.validate_contract_acceptance_history(root, history_path)
+        history_snapshot = capture_stable_file(
+            root,
+            history_path,
+            issue_root,
+            "accepted contract reference",
+            max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+        )
+        validated = approval.validate_contract_acceptance_history(
+            root,
+            history_path,
+            history_snapshot=history_snapshot,
+            return_snapshots=True,
+        )
     except ValueError as exc:
         raise ValueError(f"missing matching human contract acceptance: {exc}") from exc
+    assert isinstance(validated, tuple)
+    record, supporting_snapshots = validated
     bindings = approval.resolve_bindings(root)
     expected = {
         "repository": bindings.repository,
@@ -1006,3 +1053,4 @@ def validate_task_contract_acceptance(
         or any(item not in document.objects_by_id for item in accepted)
     ):
         raise ValueError("missing matching human contract acceptance")
+    return (config_snapshot, contract_snapshot, history_snapshot, *supporting_snapshots)

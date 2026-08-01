@@ -1022,10 +1022,28 @@ def load_active_task_snapshot(repo_root: Path) -> tuple[GitBindings, TaskState]:
         )
         legacy_snapshots = (source_snapshot, validated_task_snapshot, authority_snapshot)
 
+    acceptance_snapshots: tuple[object, ...] = ()
+    needs_approval = SEMANTIC_PHASES.index(state.semantic_phase) >= SEMANTIC_PHASES.index("accepted-design")
+    if needs_approval:
+        from .contracts import validate_task_contract_acceptance_snapshots
+
+        acceptance_snapshots = validate_task_contract_acceptance_snapshots(
+            root,
+            state.issue,
+            state.contract,
+            state.contract_file,
+            state.human_approval_ref,
+            state.semantic_phase,
+        )
+
     revalidate_snapshots(common_dir, (current, authority_snapshot), "active task snapshot")
     revalidate_snapshots(root, (legacy, state_snapshot), "active task snapshot")
     if legacy_snapshots:
         _revalidate_legacy_provenance(repo_root, legacy_snapshots)
+    if acceptance_snapshots:
+        revalidate_snapshots(root, acceptance_snapshots, "contract acceptance snapshot")
+    if resolve_bindings(root) != bindings:
+        raise ValueError("Git bindings changed during active task snapshot")
     return bindings, state
 
 

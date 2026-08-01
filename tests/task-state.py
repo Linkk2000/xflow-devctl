@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from dataclasses import replace as dataclass_replace
 from unittest.mock import patch
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from pathlib import Path
 OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
+from xflow import approval
 from xflow import local_artifacts as local_artifacts_module
 from xflow.bindings import resolve_bindings
 from xflow.checks import check_current_task
@@ -23,6 +25,7 @@ from xflow.collaboration import (
     repository_lock,
     repository_mutation,
 )
+from xflow.contracts import load_contract, validate_contract_acceptance
 from xflow.paths import active_task_pointer_file, legacy_active_task_pointer_file
 from xflow.task_state import (
     TaskState,
@@ -211,6 +214,131 @@ def test_git_hook_devctl_reentry(root: Path) -> None:
     hook.chmod(0o755)
     write(repo / "README.md", "# Hook reentry\n\nchanged\n")
     run_devctl(repo, "git", "commit-msg", "-a", "-c", "验证钩子重入")
+
+
+def test_git_hook_requires_retained_contract_acceptance(root: Path) -> None:
+    repo = initialized_repo(root, "hook-contract-acceptance", "feature/507-hook-acceptance")
+    issue = "507"
+    write(repo / ".xflow" / "xflow.json", '{"contracts":{"root":"contracts"}}\n')
+    contract_path = repo / "contracts" / "contract.yaml"
+    fixture = Path(__file__).parent / "fixtures" / "contracts" / "valid.yaml"
+    write(contract_path, fixture.read_text(encoding="utf-8"))
+    contract = load_contract(repo, contract_path)
+    classified = dataclass_replace(
+        state(issue, "feature/507-hook-acceptance"),
+        contract_file="contracts/contract.yaml",
+    )
+    write_state(repo, classified)
+    activate_task(repo, issue)
+
+    accepted_objects = (str(contract.raw["id"]),)
+    review = approval.prepare(
+        repo,
+        issue,
+        "contract-acceptance",
+        contract.path,
+        reviewer="human reviewer",
+        force=True,
+        accepted_objects=accepted_objects,
+    )
+    write(review, review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"))
+    history = validate_contract_acceptance(repo, issue, contract, accepted_objects)
+    issue_root = repo / ".xflow" / "issues" / f"issue-{issue}"
+    history_reference = history.relative_to(issue_root).as_posix()
+    write_state(
+        repo,
+        dataclass_replace(
+            classified,
+            semantic_phase="accepted-design",
+            human_approval_ref=history_reference,
+        ),
+    )
+    git(repo, "config", "extensions.worktreeConfig", "true")
+    git(repo, "config", "--worktree", "devctl.issue", issue)
+
+    hook_result = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--git-path", "hooks/pre-commit"],
+        check=True,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    hook = Path(hook_result.stdout.strip())
+    if not hook.is_absolute():
+        hook = repo / hook
+    python_executable = Path(sys.executable).as_posix()
+    write(hook, f'#!/bin/sh\n"{python_executable}" -m xflow hook task-status >/dev/null\n')
+    hook.chmod(0o755)
+
+    write(repo / "README.md", "# hook-contract-acceptance\n\nvalid acceptance\n")
+    valid_commit = run_devctl_result(repo, "git", "commit-msg", "-a", "-c", "验证合同验收钩子")
+    assert valid_commit.returncode == 0, valid_commit.stderr
+    assert "[INFO] committed" in valid_commit.stdout
+
+    record = approval.parse_contract_acceptance_history(repo, history)
+    archived_review = issue_root / str(record["approvedReviewFile"])
+    claim = issue_root / str(record["approvalClaimFile"])
+    bindings = resolve_bindings(repo)
+    protected_paths = (
+        repo / ".xflow" / "xflow.json",
+        active_task_pointer_file(repo, bindings.worktree),
+        legacy_active_task_pointer_file(repo, bindings.worktree),
+        authority_file(repo, issue),
+        issue_root / "task-state.md",
+        contract_path,
+        history,
+        archived_review,
+        claim,
+    )
+
+    def protected_bytes() -> dict[Path, bytes | None]:
+        return {path: path.read_bytes() if path.exists() else None for path in protected_paths}
+
+    def assert_invalid_acceptance_rejects(label: str) -> None:
+        before = protected_bytes()
+        ordinary = run_devctl_result(repo, "task", "status")
+        assert ordinary.returncode == 1, ordinary.stdout
+        assert "missing matching human contract acceptance" in ordinary.stderr
+
+        with repository_mutation(repo):
+            token = git_child_environment(repo)["XFLOW_DEVCTL_MUTATION_LEASE"]
+            hook_status = run_devctl_result(
+                repo,
+                "hook",
+                "task-status",
+                env_overrides={"XFLOW_DEVCTL_MUTATION_LEASE": token},
+            )
+        assert hook_status.returncode == 1, hook_status.stdout
+        assert "missing matching human contract acceptance" in hook_status.stderr
+
+        head_before = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        write(repo / "README.md", f"# hook-contract-acceptance\n\n{label}\n")
+        commit = run_devctl_result(repo, "git", "commit-msg", "-a", "-c", f"拒绝{label}验收")
+        assert commit.returncode == 1, commit.stdout
+        assert "missing matching human contract acceptance" in commit.stderr
+        head_after = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+        ).stdout.strip()
+        assert head_after == head_before
+        assert protected_bytes() == before
+
+    history_bytes = history.read_bytes()
+    history.unlink()
+    assert_invalid_acceptance_rejects("删除")
+    history.write_bytes(history_bytes)
+    history.write_bytes(history_bytes + b"forged: true\n")
+    assert_invalid_acceptance_rejects("篡改")
 
 
 def test_official_git_start_respects_closure_lock(root: Path) -> None:
@@ -895,6 +1023,7 @@ def main() -> None:
 
         test_official_git_start_respects_closure_lock(root)
         test_git_hook_devctl_reentry(root)
+        test_git_hook_requires_retained_contract_acceptance(root)
         test_inherited_mutation_lease_is_scoped_and_live(root)
         test_inherited_mutation_lease_owner_identity_fails_closed(root)
         test_owner_death_between_hook_entry_and_exit_is_read_only(root)
