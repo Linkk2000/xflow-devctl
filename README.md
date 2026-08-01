@@ -103,7 +103,7 @@ For a contract-bearing Issue, the shortest copyable happy path is:
 devctl task activate --issue IK3RR6
 devctl check classification --issue IK3RR6
 devctl contract lint --file docs/requirements/composed-activity/contract.yaml
-devctl approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/composed-activity/contract.yaml
+devctl approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
 devctl contract accept --issue IK3RR6 --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
 devctl trace check --issue IK3RR6 --contract docs/requirements/composed-activity/contract.yaml --matrix .xflow/issues/issue-IK3RR6/traceability-matrix.yaml
 ```
@@ -114,7 +114,7 @@ The native Windows PowerShell equivalent is:
 .\devctl.ps1 task activate --issue IK3RR6
 .\devctl.ps1 check classification --issue IK3RR6
 .\devctl.ps1 contract lint --file docs/requirements/composed-activity/contract.yaml
-.\devctl.ps1 approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/composed-activity/contract.yaml
+.\devctl.ps1 approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
 .\devctl.ps1 contract accept --issue IK3RR6 --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
 .\devctl.ps1 trace check --issue IK3RR6 --contract docs/requirements/composed-activity/contract.yaml --matrix .xflow/issues/issue-IK3RR6/traceability-matrix.yaml
 ```
@@ -136,7 +136,7 @@ contract acceptable.
 Contract acceptance is a human-only boundary:
 
 ```text
-devctl approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/example/contract.yaml
+devctl approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/example/contract.yaml --objects <id,id,...>
 devctl contract accept --issue IK3RR6 --file docs/requirements/example/contract.yaml --objects <id,id,...>
 ```
 

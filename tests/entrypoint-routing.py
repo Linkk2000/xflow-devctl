@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,7 @@ OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
 from xflow import approval as approval_gate
+from xflow.cli import build_parser
 
 
 def test_env() -> dict[str, str]:
@@ -355,6 +357,39 @@ def assert_complete_command_contract_is_published() -> None:
             assert anchor in text, (path, anchor)
 
 
+def assert_contract_acceptance_recipes_match_parser() -> None:
+    parser = build_parser()
+    prefixes = ("devctl ", ".\\devctl.ps1 ")
+    for path in (OPS_ROOT / "README.md", OPS_ROOT / "help.txt"):
+        pending = None
+        pairs = 0
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            prefix = next((item for item in prefixes if line.startswith(item)), None)
+            if prefix is None:
+                continue
+            command_text = line[len(prefix) :]
+            is_prepare = command_text.startswith("approval prepare ") and "--action contract-acceptance" in command_text
+            is_accept = pending is not None and command_text.startswith("contract accept ")
+            if not is_prepare and not is_accept:
+                continue
+            args = parser.parse_args(shlex.split(command_text))
+            if is_prepare:
+                assert pending is None, (path, line)
+                assert args.objects, (path, line)
+                pending = (args, line)
+                continue
+            prepare, prepare_line = pending
+            assert args.command == "contract" and args.contract_command == "accept", (path, line)
+            assert prepare.issue == args.issue, (path, prepare_line, line)
+            assert prepare.file == args.file, (path, prepare_line, line)
+            assert prepare.objects == args.objects, (path, prepare_line, line)
+            pending = None
+            pairs += 1
+        assert pending is None, (path, pending)
+        assert pairs == 3, (path, pairs)
+
+
 def run_powershell_devctl(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = {
         **test_env(),
@@ -416,6 +451,7 @@ def main() -> None:
     assert_trace_commands_are_discoverable()
     assert_issue_workspace_migration_is_discoverable()
     assert_complete_command_contract_is_published()
+    assert_contract_acceptance_recipes_match_parser()
 
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)

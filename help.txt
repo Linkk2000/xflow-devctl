@@ -213,14 +213,14 @@ Task authority v2 and contract closure:
     devctl task activate --issue IK3RR6
     devctl check classification --issue IK3RR6
     devctl contract lint --file docs/requirements/composed-activity/contract.yaml
-    devctl approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/composed-activity/contract.yaml
+    devctl approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
     devctl contract accept --issue IK3RR6 --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
     devctl trace check --issue IK3RR6 --contract docs/requirements/composed-activity/contract.yaml --matrix .xflow/issues/issue-IK3RR6/traceability-matrix.yaml
   Native Windows PowerShell recipe:
     .\devctl.ps1 task activate --issue IK3RR6
     .\devctl.ps1 check classification --issue IK3RR6
     .\devctl.ps1 contract lint --file docs/requirements/composed-activity/contract.yaml
-    .\devctl.ps1 approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/composed-activity/contract.yaml
+    .\devctl.ps1 approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
     .\devctl.ps1 contract accept --issue IK3RR6 --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
     .\devctl.ps1 trace check --issue IK3RR6 --contract docs/requirements/composed-activity/contract.yaml --matrix .xflow/issues/issue-IK3RR6/traceability-matrix.yaml
 
@@ -234,7 +234,7 @@ Task authority v2 and contract closure:
   diff, or trace check is evidence for review, never a human acceptance.
 
   Contract acceptance is a human-only command boundary:
-    devctl approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/example/contract.yaml
+    devctl approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/example/contract.yaml --objects <id,id,...>
     devctl contract accept --issue IK3RR6 --file docs/requirements/example/contract.yaml --objects <id,id,...>
   The human reviewer must review the exact file and approved object list, then
   change the prepared review from Approved: no to Approved: yes. AI may prepare
