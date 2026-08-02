@@ -247,7 +247,14 @@ def _load_sealed_acceptance_contract(
     if hashlib.sha256(raw_bytes).hexdigest() != snapshot_sha256:
         raise ValueError("accepted contract reference sealed contract snapshot SHA256 mismatch")
     try:
-        _, contract_path = _contract_path(root, Path(approved_file))
+        approved_relative = safe_relative_reference(approved_file, "accepted contract original path")
+        contract_path = require_safe_repo_path(
+            root,
+            root / approved_relative,
+            "accepted contract original path",
+        )
+        if approval.display_path(root, contract_path) != approved_file:
+            raise ValueError("accepted contract original path must be canonical")
         raw = _parse_contract_yaml(_decode_utf8(snapshot, "sealed contract snapshot"))
         _validate_contract_schema(raw)
         contract = _build_document(contract_path, raw, raw_bytes)
@@ -255,7 +262,37 @@ def _load_sealed_acceptance_contract(
         raise ValueError(f"accepted contract reference has invalid sealed contract snapshot: {exc}") from exc
     if contract.sha256 != snapshot_sha256:
         raise ValueError("accepted contract reference sealed contract snapshot SHA256 mismatch")
+    if contract.raw["status"] != "accepted-design":
+        raise ValueError("accepted contract reference sealed contract status must be accepted-design")
+    accepted = record.get("acceptedObjects")
+    if (
+        not isinstance(accepted, list)
+        or tuple(accepted) != approval.normalize_accepted_objects(accepted)
+        or any(identifier not in contract.objects_by_id for identifier in accepted)
+    ):
+        raise ValueError("accepted contract reference sealed contract accepted object set mismatch")
     return snapshot, contract
+
+
+def _validate_supplied_contract_evolution(
+    sealed_contract: ContractDocument,
+    supplied_contract: ContractDocument,
+) -> None:
+    if supplied_contract.raw["id"] != sealed_contract.raw["id"]:
+        raise ValueError("supplied ContractDocument must have the same contract identity as the sealed contract")
+    sealed_version = tuple(int(part) for part in str(sealed_contract.raw["version"]).split("."))
+    supplied_version = tuple(int(part) for part in str(supplied_contract.raw["version"]).split("."))
+    if supplied_version < sealed_version:
+        raise ValueError("supplied ContractDocument must be a legal non-regressing evolution of the sealed contract")
+    if supplied_contract.raw["status"] not in {"accepted-design", "active", "deprecated"}:
+        raise ValueError("supplied ContractDocument must be an accepted contract evolution")
+    if supplied_version == sealed_version:
+        sealed_semantics = {key: value for key, value in sealed_contract.raw.items() if key != "status"}
+        supplied_semantics = {key: value for key, value in supplied_contract.raw.items() if key != "status"}
+        if supplied_semantics != sealed_semantics:
+            raise ValueError(
+                "supplied ContractDocument must not change contract semantics without a version advance"
+            )
 
 
 def _optional_snapshot(
@@ -524,18 +561,17 @@ def _load_context(
             "source": "local-review",
             "action": "contract-acceptance",
         }
-        accepted = record.get("acceptedObjects")
         if (
-            contract.raw["status"] != "accepted-design"
-            or any(record.get(name) != expected for name, expected in expected_record.items())
-            or not isinstance(accepted, list)
-            or tuple(accepted) != approval.normalize_accepted_objects(accepted)
-            or any(identifier not in contract.objects_by_id for identifier in accepted)
+            any(record.get(name) != expected for name, expected in expected_record.items())
         ):
             raise ValueError(
                 "accepted contract reference does not match the current repository/worktree/branch/Issue and sealed contract bytes/path"
             )
+        if supplied_contract is not None:
+            _validate_supplied_contract_evolution(contract, supplied_contract)
     else:
+        if require_task_state and supplied_contract is None:
+            raise ValueError("non-acceptance trace check requires --contract")
         contract_snapshot, contract = _load_contract_snapshot(root, state.contract_file)
         tracked.append((contract_snapshot, "contract file"))
         expected_contract = f"{contract.raw['id']}@{contract.raw['version']}"

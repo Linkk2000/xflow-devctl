@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import io
+import hashlib
 import json
 import shutil
 import subprocess
@@ -297,6 +298,11 @@ def test_valid_chain_and_cli(repo: Path) -> None:
     completed = subprocess.run(command, cwd=repo, env=env, text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert completed.returncode == 0, completed.stderr
     assert "trace check passed" in completed.stdout
+
+    command = [sys.executable, "-m", "xflow", "trace", "check", "--issue", "101", "--matrix", str(path)]
+    completed = subprocess.run(command, cwd=repo, env=env, text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert completed.returncode != 0
+    assert "non-acceptance trace check requires --contract" in completed.stderr
 
 
 def test_capability_closure_requires_semantic_exit(repo: Path) -> None:
@@ -1221,6 +1227,137 @@ def _prepare_historical_contract_trace(repo: Path) -> tuple[Path, Path, Path]:
     return path, contract_path, history
 
 
+def _run_trace_cli(repo: Path, matrix: Path, contract: str | None = None) -> subprocess.CompletedProcess[str]:
+    command = [sys.executable, "-m", "xflow", "trace", "check", "--issue", "101", "--matrix", str(matrix)]
+    if contract is not None:
+        command.extend(("--contract", contract))
+    return subprocess.run(
+        command,
+        cwd=repo,
+        env={**os.environ, "DEVCTL_REPO_ROOT": str(repo), "PYTHONPATH": str(OPS_ROOT), "PYTHONDONTWRITEBYTECODE": "1"},
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def test_historical_contract_trace_cli_survives_deleted_current_contract(repo: Path) -> None:
+    path, contract_path, _ = _prepare_historical_contract_trace(repo)
+    contract_path.unlink()
+
+    completed = _run_trace_cli(repo, path)
+    assert completed.returncode == 0, completed.stderr
+    assert "trace check passed" in completed.stdout
+
+
+def test_historical_contract_trace_cli_accepts_moved_evolution_after_root_migration(repo: Path) -> None:
+    path, contract_path, _ = _prepare_historical_contract_trace(repo)
+    moved_contract = repo / "specifications" / "contract.yaml"
+    moved_contract.parent.mkdir(parents=True)
+    contract_path.replace(moved_contract)
+    replace(moved_contract, "version: 0.1.0", "version: 0.2.0")
+    write(repo / ".xflow" / "xflow.json", '{"contracts":{"root":"specifications"}}\n')
+
+    completed = _run_trace_cli(repo, path, "specifications/contract.yaml")
+    assert completed.returncode == 0, completed.stderr
+    assert "trace check passed" in completed.stdout
+
+
+def test_historical_contract_trace_rejects_invalid_supplied_evolution(repo: Path) -> None:
+    cases = (
+        (
+            "id: example.contract.capability-name",
+            "id: example.contract.unrelated",
+            "same contract identity",
+        ),
+        ("version: 0.1.0", "version: 0.0.9", "non-regressing evolution"),
+        ("note: 非规范性背景", "note: Changed without a version advance", "without a version advance"),
+        ("status: accepted-design", "status: draft", "accepted contract evolution"),
+    )
+    for original, replacement, expected in cases:
+        path, contract_path, _ = _prepare_historical_contract_trace(repo)
+        candidate_path = contract_path.with_name("candidate.yaml")
+        shutil.copyfile(contract_path, candidate_path)
+        replace(candidate_path, original, replacement)
+
+        completed = _run_trace_cli(repo, path, "contracts/candidate.yaml")
+        assert completed.returncode != 0
+        assert expected in completed.stderr, completed.stderr
+
+
+def _sealed_acceptance_fixture(
+    repo: Path,
+) -> tuple[Path, dict[str, object], tuple[object, ...], object]:
+    path, _, history = _prepare_historical_contract_trace(repo)
+    validated = approval.validate_contract_acceptance_history(repo, history, return_snapshots=True)
+    assert isinstance(validated, tuple)
+    record, snapshots = validated
+    snapshot_path = path.parent / Path(str(record["contractSnapshotFile"]))
+    sealed = next(snapshot for snapshot in snapshots if snapshot.path == snapshot_path)
+    return path, record, snapshots, sealed
+
+
+def _record_for_sealed_bytes(record: dict[str, object], content: bytes) -> dict[str, object]:
+    digest = hashlib.sha256(content).hexdigest()
+    return {
+        **record,
+        "approvedSha256": digest,
+        "contractSha256": digest,
+        "contractSnapshotSha256": digest,
+    }
+
+
+def test_sealed_acceptance_loader_rejects_missing_duplicate_and_schema(repo: Path) -> None:
+    path, record, snapshots, sealed = _sealed_acceptance_fixture(repo)
+    without_sealed = tuple(snapshot for snapshot in snapshots if snapshot is not sealed)
+    assert_error(
+        "exactly one sealed contract snapshot",
+        lambda: traceability_module._load_sealed_acceptance_contract(repo, path.parent, record, without_sealed),
+    )
+    assert_error(
+        "exactly one sealed contract snapshot",
+        lambda: traceability_module._load_sealed_acceptance_contract(repo, path.parent, record, snapshots + (sealed,)),
+    )
+
+    invalid_content = b"not: [valid contract yaml\n"
+    invalid_snapshot = dataclass_replace(sealed, content=invalid_content)
+    invalid_snapshots = tuple(invalid_snapshot if snapshot is sealed else snapshot for snapshot in snapshots)
+    assert_error(
+        "invalid sealed contract snapshot",
+        lambda: traceability_module._load_sealed_acceptance_contract(
+            repo,
+            path.parent,
+            _record_for_sealed_bytes(record, invalid_content),
+            invalid_snapshots,
+        ),
+    )
+
+
+def test_sealed_acceptance_loader_rejects_status_and_objects(repo: Path) -> None:
+    path, record, snapshots, sealed = _sealed_acceptance_fixture(repo)
+    assert sealed.content is not None
+    draft_content = sealed.content.replace(b"status: accepted-design", b"status: draft")
+    assert draft_content != sealed.content
+    draft_snapshot = dataclass_replace(sealed, content=draft_content)
+    draft_snapshots = tuple(draft_snapshot if snapshot is sealed else snapshot for snapshot in snapshots)
+    assert_error(
+        "sealed contract status must be accepted-design",
+        lambda: traceability_module._load_sealed_acceptance_contract(
+            repo,
+            path.parent,
+            _record_for_sealed_bytes(record, draft_content),
+            draft_snapshots,
+        ),
+    )
+
+    invalid_objects = {**record, "acceptedObjects": [*record["acceptedObjects"], "example.object.missing"]}
+    assert_error(
+        "sealed contract accepted object set mismatch",
+        lambda: traceability_module._load_sealed_acceptance_contract(repo, path.parent, invalid_objects, snapshots),
+    )
+
+
 def test_historical_contract_trace_uses_sealed_acceptance(repo: Path) -> None:
     for mutation in (
         lambda contract_path: replace(contract_path, "status: accepted-design", "status: active"),
@@ -1652,6 +1789,11 @@ def main() -> None:
         test_single_authoritative_criterion_source(repo)
         test_current_repository_acceptance_binding(repo, root)
         test_snapshot_content_and_transitive_revalidation(repo)
+        test_historical_contract_trace_cli_survives_deleted_current_contract(repo)
+        test_historical_contract_trace_cli_accepts_moved_evolution_after_root_migration(repo)
+        test_historical_contract_trace_rejects_invalid_supplied_evolution(repo)
+        test_sealed_acceptance_loader_rejects_missing_duplicate_and_schema(repo)
+        test_sealed_acceptance_loader_rejects_status_and_objects(repo)
         test_historical_contract_trace_uses_sealed_acceptance(repo)
         test_repository_collaboration_lock(repo)
         test_final_authority_and_git_revalidation(repo)

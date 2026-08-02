@@ -197,7 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     trace_sub = trace.add_subparsers(dest="trace_command", required=True)
     trace_check = trace_sub.add_parser("check")
     trace_check.add_argument("--issue", required=True)
-    trace_check.add_argument("--contract", required=True, type=Path)
+    trace_check.add_argument("--contract", type=Path)
     trace_check.add_argument("--matrix", required=True, type=Path)
 
     unattended_parser = sub.add_parser("unattended")
@@ -526,7 +526,7 @@ def run_trace(args: argparse.Namespace) -> int:
     ctx = context()
     if args.trace_command != "check":
         raise ValueError(f"unknown trace subcommand: {args.trace_command}")
-    contract = load_contract(ctx.repo_root, args.contract)
+    contract = load_contract(ctx.repo_root, args.contract) if args.contract is not None else None
     result = check_traceability(ctx.repo_root, args.issue, contract, args.matrix)
     print(f"[INFO] trace check passed: {result.path}")
     return 0
