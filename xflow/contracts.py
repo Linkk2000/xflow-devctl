@@ -12,8 +12,9 @@ from typing import Literal, Mapping, Sequence
 
 from . import approval
 from .classification import _decode_classification_bytes, _load_yaml
-from .local_artifacts import MAX_TEXT_ARTIFACT_BYTES, StableFileSnapshot, capture_stable_file
+from .local_artifacts import MAX_TEXT_ARTIFACT_BYTES, StableFileSnapshot, capture_stable_file, revalidate_snapshots
 from .project_config import ProjectConfig, load_project_config, load_project_config_snapshot, require_safe_repo_path
+from .stable_ids import require_stable_id
 
 
 SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
@@ -126,9 +127,7 @@ def normalize_verification_type(value: object, label: str = "verification type")
 
 def _identifier(value: object, label: str) -> str:
     identifier = _meaningful(value, label)
-    if any(character.isspace() for character in identifier):
-        raise ValueError(f"{label} must not contain whitespace")
-    return identifier
+    return require_stable_id(identifier, label)
 
 
 def _semver(value: object, label: str) -> str:
@@ -928,7 +927,8 @@ def _load_contract_snapshot(repo_root: Path, file_path: Path) -> tuple[ContractD
 
 def validate_contract_acceptance(repo_root: Path, issue: str, contract: ContractDocument, object_ids: Sequence[str]) -> Path:
     root = repo_root.resolve()
-    current, digest = _load_contract_snapshot(root, contract.path)
+    config_snapshot, contract_snapshot, current = _load_contract_artifact_snapshot(root, contract.path)
+    digest = current.sha256
     accepted_objects = approval.normalize_accepted_objects(object_ids)
     for identifier in accepted_objects:
         if identifier not in current.objects_by_id:
@@ -936,6 +936,7 @@ def validate_contract_acceptance(repo_root: Path, issue: str, contract: Contract
     if current.raw["status"] != "accepted-design":
         raise ValueError("candidate contract status must be accepted-design")
     _, path = _contract_path(root, current.path)
+    revalidate_snapshots(root, (config_snapshot, contract_snapshot), "contract acceptance")
     return approval.consume_contract_acceptance(
         root,
         issue,
@@ -944,6 +945,7 @@ def validate_contract_acceptance(repo_root: Path, issue: str, contract: Contract
         contract_version=_semver(current.raw["version"], "version"),
         contract_sha256=digest,
         accepted_objects=accepted_objects,
+        contract_bytes=current.raw_bytes,
     )
 
 
@@ -983,20 +985,10 @@ def validate_task_contract_acceptance_snapshots(
 ) -> tuple[StableFileSnapshot, ...]:
     root = repo_root.resolve()
     try:
-        config_snapshot, contract_snapshot, document = _load_contract_artifact_snapshot(root, Path(contract_file))
+        config_snapshot, config = load_project_config_snapshot(root)
+        _, path = _contract_path(root, Path(contract_file), config=config)
     except ValueError as exc:
         raise ValueError(f"missing matching human contract acceptance: {exc}") from exc
-    digest = document.sha256
-    contract_id = _identifier(document.raw["id"], "id")
-    contract_version = _semver(document.raw["version"], "version")
-    if document.raw["status"] != "accepted-design":
-        raise ValueError(
-            "missing matching human contract acceptance: contract status is incompatible "
-            f"with task semantic phase {semantic_phase}"
-        )
-    if contract_name != f"{contract_id}@{contract_version}":
-        raise ValueError("missing matching human contract acceptance: task-state Contract does not match contract file")
-    _, path = _contract_path(root, document.path)
     issue_root = root / ".xflow" / "issues" / f"issue-{issue}"
     reference = Path(approval_reference)
     history_path = require_safe_repo_path(root, issue_root / reference, "Human Approval Ref")
@@ -1022,6 +1014,35 @@ def validate_task_contract_acceptance_snapshots(
         raise ValueError(f"missing matching human contract acceptance: {exc}") from exc
     assert isinstance(validated, tuple)
     record, supporting_snapshots = validated
+    snapshot_path = require_safe_repo_path(
+        root,
+        issue_root / Path(str(record["contractSnapshotFile"])),
+        "archived contract snapshot",
+    )
+    contract_snapshots = tuple(
+        snapshot for snapshot in supporting_snapshots if snapshot.path == snapshot_path
+    )
+    if len(contract_snapshots) != 1:
+        raise ValueError("missing matching human contract acceptance: missing sealed contract snapshot")
+    contract_snapshot = contract_snapshots[0]
+    raw_bytes = contract_snapshot.content or b""
+    try:
+        text = _decode_classification_bytes(raw_bytes, snapshot_path)
+        raw = _parse_contract_yaml(text)
+        _validate_contract_schema(raw)
+        document = _build_document(path, raw, raw_bytes)
+    except ValueError as exc:
+        raise ValueError(f"missing matching human contract acceptance: invalid sealed contract snapshot: {exc}") from exc
+    digest = document.sha256
+    contract_id = _identifier(document.raw["id"], "id")
+    contract_version = _semver(document.raw["version"], "version")
+    if document.raw["status"] != "accepted-design":
+        raise ValueError(
+            "missing matching human contract acceptance: sealed contract status is incompatible "
+            f"with task semantic phase {semantic_phase}"
+        )
+    if contract_name != f"{contract_id}@{contract_version}":
+        raise ValueError("missing matching human contract acceptance: task-state Contract does not match sealed contract")
     bindings = approval.resolve_bindings(root)
     expected = {
         "repository": bindings.repository,
@@ -1053,4 +1074,4 @@ def validate_task_contract_acceptance_snapshots(
         or any(item not in document.objects_by_id for item in accepted)
     ):
         raise ValueError("missing matching human contract acceptance")
-    return (config_snapshot, contract_snapshot, history_snapshot, *supporting_snapshots)
+    return (config_snapshot, history_snapshot, *supporting_snapshots)

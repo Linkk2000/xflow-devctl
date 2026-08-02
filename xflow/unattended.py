@@ -137,7 +137,16 @@ def load(repo_root: Path) -> UnattendedState | None:
         raise ValueError("unattended state repository mismatch")
     if state.worktree != bindings.worktree:
         raise ValueError("unattended state worktree mismatch")
-    task_binding = _current_task_binding(repo_root)
+    from .task_state import load_active_task, modern_task_authority_exists
+
+    try:
+        active_task = load_active_task(repo_root)
+    except ValueError as exc:
+        if "missing active task pointer" not in str(exc) or modern_task_authority_exists(repo_root):
+            raise
+        task_binding = _current_task_binding(repo_root)
+    else:
+        task_binding = (active_task.issue, active_task.execution_state)
     if task_binding is not None:
         task_issue, task_state = task_binding
         if task_state == "S10_DONE":

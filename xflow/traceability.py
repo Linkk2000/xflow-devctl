@@ -389,6 +389,10 @@ def _load_context(
     _validate_authority_state(authority, state)
     _validate_authority_pointer(authority, pointer)
 
+    from .semantic_routes import require_route_semantics
+
+    require_route_semantics(state, "trace-closure")
+
     if pointer.taskMode == "legacy":
         if classification_snapshot.exists or matrix_snapshot.exists:
             raise ValueError("legacy active task pointer conflicts with modern contract authority")
@@ -443,7 +447,10 @@ def _load_context(
         supplied_contract.path != contract.path or supplied_contract.sha256 != contract.sha256
     ):
         raise ValueError("supplied ContractDocument bytes/path do not match the task-state contract")
-    if state.human_approval_ref != "none":
+    from .semantic_routes import semantic_reference_kind
+
+    reference_kind = semantic_reference_kind(state.classification, state.semantic_phase)
+    if reference_kind == "contract-acceptance":
         approval_snapshot = capture_stable_file(
             root,
             issue_directory / state.human_approval_ref,
@@ -490,6 +497,16 @@ def _load_context(
             raise ValueError(
                 "accepted contract reference does not match the current repository/worktree/branch/Issue and contract bytes/path"
             )
+    elif reference_kind == "gap-recognition":
+        try:
+            recognition_snapshots = approval.validate_task_gap_recognition_snapshots(
+                root,
+                state.issue,
+                state.human_approval_ref,
+            )
+        except ValueError as exc:
+            raise ValueError(f"missing matching human gap recognition: {exc}") from exc
+        tracked.extend((snapshot, "gap recognition supporting artifact") for snapshot in recognition_snapshots)
 
     matrix_snapshot, matrix_document = _load_matrix_snapshot(
         root, issue_directory, matrix_path, matrix_snapshot

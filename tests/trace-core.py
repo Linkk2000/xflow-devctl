@@ -166,7 +166,7 @@ contractSearch:
 classification: ui-defect
 contractChangeRequired: false
 reason: The implementation must close the existing contract.
-nextArtifact: issue-draft.md
+nextArtifact: lightweight-route-complete
 decisionSource: ai-proposed
 """,
     )
@@ -297,6 +297,47 @@ def test_valid_chain_and_cli(repo: Path) -> None:
     completed = subprocess.run(command, cwd=repo, env=env, text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert completed.returncode == 0, completed.stderr
     assert "trace check passed" in completed.stdout
+
+
+def test_capability_closure_requires_semantic_exit(repo: Path) -> None:
+    path = prepare_valid_chain(repo)
+    issue_root = path.parent
+    state = TaskState(
+        issue="101",
+        execution_state="S10_DONE",
+        semantic_phase="classified",
+        classification="capability-change",
+        contract="example.contract.capability-name@0.1.0",
+        contract_file="contracts/contract.yaml",
+        contract_change_required=True,
+        branch="main",
+        base="main",
+        allowed_actions=("inspect closure",),
+        forbidden_actions=("close without semantic acceptance",),
+        human_gate="capability design acceptance required",
+        human_approval_ref="none",
+    )
+    write(issue_root / "task-state.md", render_task_state(state))
+    write(
+        issue_root / "classification.yaml",
+        """version: 0.1.0
+request:
+  originalStatement: Deliver a new participant-visible capability.
+contractSearch:
+  status: found
+  refs: [contracts/contract.yaml]
+classification: capability-change
+contractChangeRequired: true
+reason: The request changes a participant-visible result.
+nextArtifact: contract-change-proposal.md
+decisionSource: ai-proposed
+""",
+    )
+    contract = load_contract(repo, repo / "contracts" / "contract.yaml")
+    assert_error(
+        "capability-change requires accepted-design",
+        lambda: check_traceability(repo, "101", contract, path),
+    )
 
 
 def test_schema_and_reference_rejections(repo: Path) -> None:
@@ -498,7 +539,12 @@ def test_durable_closure_and_authoritative_bindings(repo: Path) -> None:
     hidden_matrix.rename(path)
     write(state, original_state)
 
-    write(state, original_state.replace("Semantic Phase: classified", "Semantic Phase: accepted-design"))
+    write(
+        state,
+        original_state.replace("Semantic Phase: classified", "Semantic Phase: accepted-design")
+        .replace("Classification: ui-defect", "Classification: capability-change")
+        .replace("Contract Change Required: no", "Contract Change Required: yes"),
+    )
     assert_error("Human Approval Ref is required", lambda: check_traceability(repo, "101", contract, path))
     write(state, original_state)
 
@@ -916,6 +962,46 @@ Recognized: {recognized}
 """
 
 
+def bind_gap_recognition(repo: Path, state_path: Path, gap_path: Path) -> None:
+    state = traceability_module.parse_task_state_text(
+        state_path,
+        state_path.read_text(encoding="utf-8"),
+        binding_mode="recorded",
+        validate_acceptance=False,
+    )
+    candidate = dataclass_replace(
+        state,
+        execution_state="S2_REMOTE_ISSUE_CREATED",
+        semantic_phase="gap-analysis",
+        classification="implementation-gap",
+        contract_change_required=False,
+        human_approval_ref="none",
+    )
+    write(state_path, render_task_state(candidate))
+    review = approval.prepare(
+        repo,
+        state.issue,
+        "gap-recognition",
+        gap_path,
+        reviewer="human reviewer",
+        force=True,
+    )
+    approve(review)
+    history = approval.consume_gap_recognition(repo, state.issue, gap_path)
+    reference = history.relative_to(state_path.parent).as_posix()
+    write(
+        state_path,
+        render_task_state(
+            dataclass_replace(
+                candidate,
+                execution_state="S5_LOCAL_VERIFICATION",
+                semantic_phase="gap-recognized",
+                human_approval_ref=reference,
+            )
+        ),
+    )
+
+
 def test_single_authoritative_criterion_source(repo: Path) -> None:
     path = prepare_valid_chain(repo)
     contract = load_contract(repo, repo / "contracts" / "contract.yaml")
@@ -924,19 +1010,21 @@ def test_single_authoritative_criterion_source(repo: Path) -> None:
     write(state_path, render_task_state(dataclass_replace(state, classification="implementation-gap")))
     classification = path.with_name("classification.yaml")
     replace(classification, "classification: ui-defect", "classification: implementation-gap")
-    replace(classification, "nextArtifact: issue-draft.md", "nextArtifact: gap-analysis.md")
+    replace(classification, "nextArtifact: lightweight-route-complete", "nextArtifact: gap-analysis.md")
     gap = path.with_name("gap-analysis.md")
     write(gap, valid_gap_analysis_text(recognized="no"))
-    assert_error("Recognized: yes", lambda: check_traceability(repo, "101", contract, path))
+    assert_error("gap-recognized", lambda: check_traceability(repo, "101", contract, path))
 
     write(gap, valid_gap_analysis_text(include_second=False))
+    bind_gap_recognition(repo, state_path, gap)
     assert_error("acceptance criterion does not exist", lambda: check_traceability(repo, "101", contract, path))
 
     write(gap, valid_gap_analysis_text())
+    bind_gap_recognition(repo, state_path, gap)
     check_traceability(repo, "101", contract, path)
 
     gap.unlink()
-    assert_error("implementation-gap requires gap-analysis.md", lambda: check_traceability(repo, "101", contract, path))
+    assert_error("missing matching human gap recognition", lambda: check_traceability(repo, "101", contract, path))
 
     prepare_valid_chain(repo)
     issue_draft = path.with_name("issue-draft.md")
@@ -968,7 +1056,22 @@ def test_current_repository_acceptance_binding(repo: Path, root: Path) -> None:
         validate_acceptance=False,
     )
     history_ref = history.relative_to(source_path.parent).as_posix()
-    write(source_path.with_name("task-state.md"), render_task_state(dataclass_replace(source_state, semantic_phase="accepted-design", human_approval_ref=history_ref)))
+    write(
+        source_path.with_name("task-state.md"),
+        render_task_state(
+            dataclass_replace(
+                source_state,
+                semantic_phase="accepted-design",
+                classification="capability-change",
+                contract_change_required=True,
+                human_approval_ref=history_ref,
+            )
+        ),
+    )
+    source_classification = source_path.with_name("classification.yaml")
+    replace(source_classification, "classification: ui-defect", "classification: capability-change")
+    replace(source_classification, "contractChangeRequired: false", "contractChangeRequired: true")
+    replace(source_classification, "nextArtifact: lightweight-route-complete", "nextArtifact: contract-change-proposal.md")
 
     target_path = prepare_valid_chain(repo)
     shutil.copytree(source_path.parent / "approvals", target_path.parent / "approvals", dirs_exist_ok=True)
@@ -978,7 +1081,22 @@ def test_current_repository_acceptance_binding(repo: Path, root: Path) -> None:
         binding_mode="recorded",
         validate_acceptance=False,
     )
-    write(target_path.with_name("task-state.md"), render_task_state(dataclass_replace(target_state, semantic_phase="accepted-design", human_approval_ref=history_ref)))
+    write(
+        target_path.with_name("task-state.md"),
+        render_task_state(
+            dataclass_replace(
+                target_state,
+                semantic_phase="accepted-design",
+                classification="capability-change",
+                contract_change_required=True,
+                human_approval_ref=history_ref,
+            )
+        ),
+    )
+    target_classification = target_path.with_name("classification.yaml")
+    replace(target_classification, "classification: ui-defect", "classification: capability-change")
+    replace(target_classification, "contractChangeRequired: false", "contractChangeRequired: true")
+    replace(target_classification, "nextArtifact: lightweight-route-complete", "nextArtifact: contract-change-proposal.md")
     assert_error("current repository", lambda: check_traceability(repo, "101", load_contract(repo, repo / "contracts" / "contract.yaml"), target_path))
 
 
@@ -1018,7 +1136,26 @@ def test_snapshot_content_and_transitive_revalidation(repo: Path) -> None:
         validate_acceptance=False,
     )
     history_ref = history.relative_to(path.parent).as_posix()
-    write(state_path, render_task_state(dataclass_replace(state, semantic_phase="accepted-design", human_approval_ref=history_ref)))
+    write(
+        state_path,
+        render_task_state(
+            dataclass_replace(
+                state,
+                semantic_phase="accepted-design",
+                classification="capability-change",
+                contract_change_required=True,
+                human_approval_ref=history_ref,
+            )
+        ),
+    )
+    classification_path = path.with_name("classification.yaml")
+    replace(classification_path, "classification: ui-defect", "classification: capability-change")
+    replace(classification_path, "contractChangeRequired: false", "contractChangeRequired: true")
+    replace(
+        classification_path,
+        "nextArtifact: lightweight-route-complete",
+        "nextArtifact: contract-change-proposal.md",
+    )
     import yaml
 
     history_payload = yaml.safe_load(history.read_text(encoding="utf-8"))
@@ -1356,8 +1493,9 @@ def test_canonical_ids_object_store_variants_and_race(repo: Path) -> None:
     path = prepare_valid_chain(repo)
     contract_path = repo / "contracts" / "contract.yaml"
     contract_text = contract_path.read_text(encoding="utf-8")
-    write(contract_path, contract_text.replace("example.verify.case.operation-success", "验证.成功", 1))
-    matrix = path.read_text(encoding="utf-8").replace("example.verify.case.operation-success", "验证.成功", 1)
+    replacement_id = "example.verify.case.operation-success-v2"
+    write(contract_path, contract_text.replace("example.verify.case.operation-success", replacement_id, 1))
+    matrix = path.read_text(encoding="utf-8").replace("example.verify.case.operation-success", replacement_id, 1)
     write(path, matrix)
     check_traceability(repo, "101", load_contract(repo, contract_path), path)
 
@@ -1423,6 +1561,7 @@ def main() -> None:
         root = Path(raw)
         repo = init_repo(root)
         test_valid_chain_and_cli(repo)
+        test_capability_closure_requires_semantic_exit(repo)
         test_schema_and_reference_rejections(repo)
         test_path_and_evidence_rejections(repo)
         test_ui_identity_rejections(repo)

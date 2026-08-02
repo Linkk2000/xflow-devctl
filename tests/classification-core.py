@@ -155,10 +155,11 @@ def test_approved_route_table(repo_root: Path) -> None:
         document(
             "ui-defect",
             False,
-            "issue-draft.md",
+            "lightweight-route-complete",
             search_status="found",
             refs=("requirement:UI-17",),
         ),
+        document("ui-defect", False, "lightweight-route-complete"),
         document("infrastructure", False, "dependency-issue-proposal.md"),
         document(
             "infrastructure",
@@ -203,15 +204,15 @@ def test_approved_route_table(repo_root: Path) -> None:
         ),
         (
             document("ui-defect", False, "issue-draft.md"),
-            "ui-defect requires contractSearch.status: found",
+            "ui-defect requires nextArtifact: lightweight-route-complete",
         ),
         (
-            document("ui-defect", True, "issue-draft.md", search_status="found", refs=("requirement:UI-17",)),
+            document("ui-defect", True, "lightweight-route-complete", search_status="found", refs=("requirement:UI-17",)),
             "ui-defect requires contractChangeRequired: false",
         ),
         (
             document("ui-defect", False, "implementation-plan.md", search_status="found", refs=("requirement:UI-17",)),
-            "ui-defect requires nextArtifact: issue-draft.md",
+            "ui-defect requires nextArtifact: lightweight-route-complete",
         ),
         (document("infrastructure", True, "dependency-issue-proposal.md"), "infrastructure requires contractChangeRequired: false"),
         (document("infrastructure", False, "dependency-issue-draft.md"), "infrastructure requires nextArtifact: dependency-issue-proposal.md"),
@@ -228,6 +229,28 @@ def test_approved_route_table(repo_root: Path) -> None:
     for route, expected in invalid_routes:
         write(path, route)
         assert_value_error(expected, lambda: check_classification(repo_root, "route"))
+
+
+def test_ui_defect_lightweight_terminal_route(repo_root: Path) -> None:
+    path = repo_root / ".xflow" / "issues" / "issue-ui" / "classification.yaml"
+    for route in (
+        document("ui-defect", False, "lightweight-route-complete"),
+        document(
+            "ui-defect",
+            False,
+            "lightweight-route-complete",
+            search_status="found",
+            refs=("requirement:UI-17",),
+        ),
+    ):
+        write(path, route)
+        check_classification(repo_root, "ui")
+
+    write(path, document("ui-defect", False, "issue-draft.md"))
+    assert_value_error(
+        "ui-defect requires nextArtifact: lightweight-route-complete",
+        lambda: check_classification(repo_root, "ui"),
+    )
 
 
 def test_supported_version(repo_root: Path) -> None:
@@ -683,6 +706,7 @@ def main() -> None:
         repo_root = Path(raw)
         test_routes_and_document_shape(repo_root)
         test_approved_route_table(repo_root)
+        test_ui_defect_lightweight_terminal_route(repo_root)
         test_supported_version(repo_root)
         test_safe_yaml_and_containment(repo_root)
         test_safe_loader_duplicate_semantics(repo_root)

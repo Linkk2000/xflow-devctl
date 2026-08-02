@@ -9,11 +9,13 @@ from dataclasses import replace as dataclass_replace
 from unittest.mock import patch
 from pathlib import Path
 
+import yaml
+
 
 OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
-from xflow import approval
+from xflow import approval, unattended
 from xflow import local_artifacts as local_artifacts_module
 from xflow.bindings import resolve_bindings
 from xflow.checks import check_current_task
@@ -193,7 +195,14 @@ def test_git_hook_devctl_reentry(root: Path) -> None:
     write(repo / "README.md", "# Hook reentry\n")
     git(repo, "add", "README.md")
     git(repo, "commit", "-m", "test: initialize hook fixture", "-q")
-    write_state(repo, state("77", "feature/77-hook"))
+    write_state(
+        repo,
+        dataclass_replace(
+            state("77", "feature/77-hook"),
+            classification="ui-defect",
+            contract_change_required=False,
+        ),
+    )
     activate_task(repo, "77")
     git(repo, "config", "extensions.worktreeConfig", "true")
     git(repo, "config", "--worktree", "devctl.issue", "77")
@@ -389,9 +398,132 @@ def test_official_git_start_respects_closure_lock(root: Path) -> None:
     ).returncode == 0
 
 
+def test_first_capability_task_establishes_final_branch_before_acceptance(root: Path) -> None:
+    origin = root / "first-capability-origin.git"
+    repo = root / "first-capability"
+    git(root, "init", "--bare", "-q", str(origin))
+    git(root, "init", "-q", str(repo))
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test User")
+    git(repo, "checkout", "-b", "main", "-q")
+    write(repo / "README.md", "# First capability\n")
+    git(repo, "add", "README.md")
+    git(repo, "commit", "-m", "test: initialize first capability fixture", "-q")
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "push", "-u", "origin", "main", "-q")
+
+    issue = "701"
+    final_branch = "feat/701-first-capability"
+    candidate = dataclass_replace(
+        state(issue, final_branch),
+        semantic_phase="declaring",
+        human_gate="final task branch identity approval required",
+    )
+    state_path = write_state(repo, candidate)
+    write(
+        state_path.with_name("classification.yaml"),
+        """version: 0.1.0
+request:
+  originalStatement: Add one participant-visible capability.
+contractSearch:
+  status: not-found
+  refs: []
+classification: capability-change
+contractChangeRequired: true
+reason: The request adds a participant-visible result.
+nextArtifact: contract-change-proposal.md
+decisionSource: ai-proposed
+""",
+    )
+    review = approval.prepare(
+        repo,
+        issue,
+        "task-branch-start",
+        state_path,
+        reviewer="human reviewer",
+        force=True,
+    )
+    write(review, review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"))
+
+    started = run_devctl_result(
+        repo,
+        "git",
+        "start",
+        "first-capability",
+        "--issue",
+        issue,
+        "--base",
+        "main",
+        "--file",
+        str(state_path),
+    )
+    assert started.returncode == 0, started.stderr
+    assert resolve_bindings(repo).branch == final_branch
+    assert load_active_task(repo).issue == issue
+    assert load_active_task(repo).semantic_phase == "declaring"
+    remote_branch = subprocess.run(
+        ["git", "-C", str(repo), "ls-remote", "--heads", "origin", final_branch],
+        check=True,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+    )
+    assert remote_branch.stdout.strip() == ""
+
+    write_state(repo, dataclass_replace(candidate, execution_state="S4_TDD_AND_IMPLEMENTATION"))
+    assert_value_error("capability-change requires accepted-design", lambda: check_current_task(repo, issue))
+    write_state(repo, candidate)
+
+    write(repo / ".xflow" / "xflow.json", '{"contracts":{"root":"docs/requirements"}}\n')
+    contract_path = repo / "docs" / "requirements" / "example" / "contract.yaml"
+    fixture = Path(__file__).parent / "fixtures" / "contracts" / "valid.yaml"
+    write(contract_path, fixture.read_text(encoding="utf-8"))
+    contract = load_contract(repo, contract_path)
+    accepted_objects = (str(contract.raw["id"]),)
+    contract_review = approval.prepare(
+        repo,
+        issue,
+        "contract-acceptance",
+        contract_path,
+        reviewer="human reviewer",
+        force=True,
+        accepted_objects=accepted_objects,
+    )
+    write(
+        contract_review,
+        contract_review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"),
+    )
+    acceptance = validate_contract_acceptance(repo, issue, contract, accepted_objects)
+    acceptance_record = approval.parse_contract_acceptance_history(repo, acceptance)
+    assert acceptance_record["branch"] == final_branch
+    acceptance_ref = acceptance.relative_to(state_path.parent).as_posix()
+    accepted = dataclass_replace(
+        candidate,
+        execution_state="S4_TDD_AND_IMPLEMENTATION",
+        semantic_phase="accepted-design",
+        human_gate="development start approval required",
+        human_approval_ref=acceptance_ref,
+    )
+    write_state(repo, accepted)
+    check_current_task(repo, issue)
+
+    branch_records = tuple((state_path.parent / "approvals" / "history").glob("*-task-branch-start-*.yaml"))
+    assert len(branch_records) == 1
+    branch_record = yaml.safe_load(branch_records[0].read_text(encoding="utf-8"))
+    assert branch_record["branch"] == "main"
+    assert branch_record["targetBranch"] == final_branch
+
+
 def test_inherited_mutation_lease_is_scoped_and_live(root: Path) -> None:
     repo = initialized_repo(root, "lease-scope", "feature/504-lease")
-    write_state(repo, state("504", "feature/504-lease"))
+    write_state(
+        repo,
+        dataclass_replace(
+            state("504", "feature/504-lease"),
+            classification="ui-defect",
+            contract_change_required=False,
+        ),
+    )
     activate_task(repo, "504")
     other = initialized_repo(root, "lease-other", "feature/505-other")
     write_state(other, state("505", "feature/505-other"))
@@ -568,6 +700,146 @@ def initialized_repo(root: Path, name: str, branch: str) -> Path:
     return repo
 
 
+def gap_analysis_text() -> str:
+    return """# Gap Analysis
+
+## User Original Statement
+The accepted contract is not implemented.
+
+## Clarified Problem Or Gap
+The implementation violates one existing contract result.
+
+## Gap Analysis
+The contract remains stable while implementation evidence is repaired.
+
+## Evidence
+- evidence/before.txt
+
+## Evidence-Backed Findings
+### Finding F-001: Existing result is missing
+
+#### Finding Type
+non-ui
+
+#### Observation
+The implementation does not produce the contracted result.
+
+#### User Impact
+The participant cannot rely on the existing contract.
+
+#### Evidence
+- evidence/before.txt
+
+#### Analysis
+The implementation must be corrected without changing the contract.
+
+#### Proposed Change
+Restore the contracted result.
+
+#### Acceptance
+Fresh evidence proves the existing result.
+
+#### Human Review
+- [x] Review the finding.
+
+## Scope Boundaries
+Only the existing implementation gap is in scope.
+
+## Proposed Modification Plan
+Add a regression and restore the existing result.
+
+## Acceptance Criteria
+- [ ] C-001: The existing result is restored.
+
+## Human Recognition
+Recognized: yes
+"""
+
+
+def test_route_semantics_fail_closed_for_capability_actions(root: Path) -> None:
+    repo = initialized_repo(root, "capability-route-gate", "feature/601-route-gate")
+    issue = "601"
+    initial = state(issue, "feature/601-route-gate")
+    write_state(repo, initial)
+    activate_task(repo, issue)
+
+    for execution_state in (
+        "S4_TDD_AND_IMPLEMENTATION",
+        "S7_PUSH_BRANCH",
+        "S10_DONE",
+    ):
+        write_state(repo, dataclass_replace(initial, execution_state=execution_state))
+        assert_value_error(
+            "capability-change requires accepted-design",
+            lambda: check_current_task(repo, issue),
+        )
+
+    write_state(repo, initial)
+    approved_file = repo / ".xflow" / "issues" / f"issue-{issue}" / "walkthrough.md"
+    write(approved_file, "# Walkthrough\n")
+    unattended.enable(repo, issue, unattended.CONFIRMATION)
+    assert_value_error(
+        "capability-change requires accepted-design",
+        lambda: approval.require_remote_or_unattended(
+            repo,
+            "git-push",
+            approved_file,
+            issue,
+            request_unattended=True,
+        ),
+    )
+
+    hook = run_devctl_result(repo, "hook", "task-status")
+    assert hook.returncode == 1, hook.stdout
+    assert "capability-change requires accepted-design" in hook.stderr
+
+
+def test_implementation_gap_uses_immutable_gap_recognition(root: Path) -> None:
+    repo = initialized_repo(root, "gap-recognition", "fix/602-existing-gap")
+    issue = "602"
+    candidate = dataclass_replace(
+        state(issue, "fix/602-existing-gap"),
+        classification="implementation-gap",
+        contract_change_required=False,
+        semantic_phase="gap-analysis",
+        human_gate="human gap recognition required",
+    )
+    write_state(repo, candidate)
+    activate_task(repo, issue)
+    gap_file = repo / ".xflow" / "issues" / f"issue-{issue}" / "gap-analysis.md"
+    write(gap_file.parent / "evidence" / "before.txt", "captured before evidence\n")
+    write(gap_file, gap_analysis_text())
+
+    review = approval.prepare(
+        repo,
+        issue,
+        "gap-recognition",
+        gap_file,
+        reviewer="human reviewer",
+        force=True,
+    )
+    write(review, review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"))
+    recognized = run_devctl_result(repo, "gap", "recognize", "--issue", issue, "--file", str(gap_file))
+    assert recognized.returncode == 0, recognized.stderr
+    records = tuple((gap_file.parent / "approvals" / "history").glob("*-gap-recognition-*.yaml"))
+    assert len(records) == 1
+    recognition_ref = records[0].relative_to(gap_file.parent).as_posix()
+    recognized_state = dataclass_replace(
+        candidate,
+        execution_state="S4_TDD_AND_IMPLEMENTATION",
+        semantic_phase="gap-recognized",
+        human_approval_ref=recognition_ref,
+    )
+    write_state(repo, recognized_state)
+    check_current_task(repo, issue)
+
+    replay = run_devctl_result(repo, "gap", "recognize", "--issue", issue, "--file", str(gap_file))
+    assert replay.returncode == 1, replay.stdout
+    assert "approval already consumed" in replay.stderr
+    write(gap_file, gap_analysis_text().replace("Restore the contracted result.", "Change the recognized scope."))
+    assert_value_error("missing matching human gap recognition", lambda: check_current_task(repo, issue))
+
+
 def legacy_source(issue: str, *, action: str = "clarify-contract") -> str:
     return (
         f"# XFlow Current Task\n\nIssue: {issue}\nState: S2_REMOTE_ISSUE_CREATED\n\n"
@@ -718,6 +990,33 @@ def test_legacy_fallback_is_stable_and_authority_aware(root: Path) -> None:
     write(current_task, legacy_source("STALE"))
     with patch.object(local_artifacts_module, "_read_stable_bytes", side_effect=mutate_fallback):
         assert_value_error("changed while reading", lambda: current_task_issue(repo))
+
+
+def test_modern_unattended_ignores_preserved_legacy_task(root: Path) -> None:
+    repo = initialized_repo(root, "modern-unattended", "feature/509-modern")
+    legacy = repo / ".xflow" / "current-task.md"
+    original_legacy = legacy_source("MIGRATEDA")
+    write(legacy, original_legacy)
+    migrate_legacy_current_task(repo)
+
+    modern = dataclass_replace(
+        state("MODERNB", "feature/509-modern"),
+        classification="ui-defect",
+        contract_change_required=False,
+    )
+    write_state(repo, modern)
+    activate_task(repo, modern.issue)
+    unattended.enable(repo, modern.issue, unattended.CONFIRMATION)
+
+    loaded = unattended.load(repo)
+    assert loaded is not None and loaded.issue == modern.issue
+    assert legacy.read_text(encoding="utf-8") == original_legacy
+    assert unattended.state_path(repo).is_file()
+
+    write_state(repo, dataclass_replace(modern, execution_state="S10_DONE"))
+    assert_value_error("current task is completed", lambda: unattended.load(repo))
+    assert not unattended.state_path(repo).exists()
+    assert legacy.read_text(encoding="utf-8") == original_legacy
 
 def main() -> None:
     with tempfile.TemporaryDirectory() as raw:
@@ -1022,14 +1321,18 @@ def main() -> None:
         assert load_active_task(worktree_a).issue == "CLI7"
 
         test_official_git_start_respects_closure_lock(root)
+        test_first_capability_task_establishes_final_branch_before_acceptance(root)
         test_git_hook_devctl_reentry(root)
         test_git_hook_requires_retained_contract_acceptance(root)
         test_inherited_mutation_lease_is_scoped_and_live(root)
         test_inherited_mutation_lease_owner_identity_fails_closed(root)
         test_owner_death_between_hook_entry_and_exit_is_read_only(root)
+        test_route_semantics_fail_closed_for_capability_actions(root)
+        test_implementation_gap_uses_immutable_gap_recognition(root)
         test_modern_pointer_blocks_legacy_migration(root)
         test_legacy_authority_is_live_provenance(root)
         test_legacy_fallback_is_stable_and_authority_aware(root)
+        test_modern_unattended_ignores_preserved_legacy_task(root)
 
     print("task state ok")
 

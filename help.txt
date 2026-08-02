@@ -134,6 +134,7 @@ Check:
   devctl check issue-evidence --issue <id> [--publish-root .xflow/publish/issues/issue-<id>]
   devctl check subtask --issue <id> [--path .xflow/issues/issue-<id>/subtask-001]
   devctl check gap-analysis --issue draft|<id> [--file F]
+  devctl gap recognize --issue <id> --file .xflow/issues/issue-<id>/gap-analysis.md
   devctl check resolution-report --issue <id> [--file F]
   devctl check dependencies --issue IK152D [--file .xflow/issues/issue-IK152D/dependencies.yaml]
   devctl check commit-msg --file .xflow/local/commit-message.txt --issue IK152D
@@ -168,6 +169,11 @@ Problem/Gap Closure Loop:
   For resolved/reduced, all AI self-review checklist items must be checked.
   If the report is not true, AI must rework and rewrite it before handoff.
   devctl check gap-analysis --issue <id>
+  devctl approval prepare --issue <id> --action gap-recognition --file .xflow/issues/issue-<id>/gap-analysis.md
+  devctl gap recognize --issue <id> --file .xflow/issues/issue-<id>/gap-analysis.md
+  Recognized: yes is reviewed content, not authorization. Only the immutable,
+  non-reusable human gap-recognition record authorizes implementation-gap.
+  Contract acceptance and unattended mode cannot satisfy this gate.
   devctl check resolution-report --issue <id>
 
 Advisory dependencies:
@@ -191,9 +197,13 @@ Advisory dependencies:
 
 Approval:
   devctl approval prepare --issue draft|<id> --action ACTION --file F [--attachments manifest.json] [--command CMD] [--reviewer NAME] [--force]
+  devctl approval reconcile --issue <id|draft> --approval-id <id> --outcome no-effect|success --confirm XFLOW_HUMAN_REMOTE_RECONCILED [--target-issue <id>] [--provider-receipt <JSON-object>]
   reviewer defaults to git config user.name/user.email when available
   Prepared by AI or tooling does not mean approved.
   Only the human reviewer may change Approved: no to Approved: yes.
+  Reconcile only after a human checks authoritative remote state. no-effect makes
+  the one-use approval retryable; success seals the supplied remote receipt and
+  completes locally without another provider call.
 
 Task authority v2 and contract closure:
   Run these commands from the repository worktree that owns the task. Portable

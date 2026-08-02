@@ -51,7 +51,11 @@ class RouteRule:
 ROUTE_RULES = {
     "capability-change": RouteRule(True, frozenset(CONTRACT_SEARCH_STATUSES), ("contract-change-proposal.md",)),
     "implementation-gap": RouteRule(False, frozenset({"found"}), ("gap-analysis.md",)),
-    "ui-defect": RouteRule(False, frozenset({"found"}), ("issue-draft.md",)),
+    "ui-defect": RouteRule(
+        False,
+        frozenset(CONTRACT_SEARCH_STATUSES),
+        ("lightweight-route-complete",),
+    ),
     "infrastructure": RouteRule(
         False,
         frozenset(CONTRACT_SEARCH_STATUSES),

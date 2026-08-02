@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
 from xflow import approval
+from xflow import cli, providers
 from xflow.bindings import resolve_bindings
 from xflow.paths import active_task_pointer_file
 from xflow.task_state import TaskState, activate_task, render_task_state
@@ -70,10 +72,10 @@ def task_state(issue: str, branch: str) -> TaskState:
         issue=issue,
         execution_state="S6_PREPARE_COMMIT_AND_MR_DRAFT",
         semantic_phase="classified",
-        classification="capability-change",
+        classification="ui-defect",
         contract="example.contract.approval-binding@0.1.0",
         contract_file="docs/requirements/example/contract.yaml",
-        contract_change_required=True,
+        contract_change_required=False,
         branch=branch,
         base="main",
         allowed_actions=("prepare-verification",),
@@ -337,6 +339,204 @@ def test_unattended_grants_are_per_execution(repo_root: Path, approved_file: Pat
         "approval already consumed",
         lambda: approval.record_consumed_approval(repo_root, first, "success"),
     )
+
+
+def test_local_remote_reservation_snapshot_and_recovery(repo_root: Path, approved_file: Path) -> None:
+    original = approved_file.read_bytes()
+    review = approval.prepare(
+        repo_root,
+        "202",
+        "issue-comment",
+        approved_file,
+        reviewer="human reviewer",
+        force=True,
+    )
+    approve(review)
+    grant = approval.require_remote(repo_root, "issue-comment", approved_file, "202")
+
+    def reserve() -> object:
+        try:
+            return approval.reserve_remote_action(repo_root, grant)
+        except ValueError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(lambda _index: reserve(), range(2)))
+    reservations = [item for item in results if isinstance(item, approval.RemoteActionReservation)]
+    failures = [item for item in results if isinstance(item, ValueError)]
+    assert len(reservations) == len(failures) == 1, results
+    assert "remote approval outcome unresolved" in str(failures[0])
+    reservation = reservations[0]
+    assert reservation.approved_bytes == original
+
+    approved_file.write_bytes(b"mutated after reservation\n")
+    assert reservation.approved_text() == original.decode("utf-8")
+    approval.mark_remote_action_unknown(repo_root, reservation, "simulated provider timeout")
+    assert_value_error(
+        "remote approval outcome unresolved",
+        lambda: approval.reserve_remote_action(repo_root, grant),
+    )
+    approval.reconcile_remote_action(
+        repo_root,
+        grant,
+        outcome="no-effect",
+        confirmation=approval.REMOTE_RECONCILIATION_CONFIRMATION,
+    )
+
+    approved_file.write_bytes(original)
+    retry = approval.reserve_remote_action(repo_root, grant)
+    assert retry.provider_required is True
+    assert retry.attempt == 2
+    approval.confirm_remote_action(
+        repo_root,
+        retry,
+        target_issue="202",
+        provider_receipt={"comment": "confirmed"},
+    )
+
+    recovered = approval.reserve_remote_action(repo_root, grant)
+    assert recovered.provider_required is False
+    record = approval.complete_remote_action(repo_root, recovered)
+    payload = yaml.safe_load(record.read_text(encoding="utf-8"))
+    assert payload["approvedSnapshotSha256"] == grant.approved_sha256
+    assert (repo_root / payload["approvedSnapshotFile"]).read_bytes() == original
+    assert payload["providerReceipt"] == '{"comment":"confirmed"}'
+    assert len(tuple(record.parent.glob("*-issue-comment-*.yaml"))) == 1
+    assert_value_error("approval already consumed", lambda: approval.reserve_remote_action(repo_root, grant))
+    assert not tuple((repo_root / ".git" / "xflow" / "runtime" / "remote-approvals").rglob("*.lock"))
+
+
+def test_issue_comment_provider_consumes_reserved_bytes(repo_root: Path, approved_file: Path) -> None:
+    original = b"# Exact approved comment\n\nProvider must receive these bytes.\n"
+    approved_file.write_bytes(original)
+    review = approval.prepare(
+        repo_root,
+        "202",
+        "issue-comment",
+        approved_file,
+        reviewer="human reviewer",
+        force=True,
+    )
+    approve(review)
+    captured: dict[str, str] = {}
+    original_reserve = approval.reserve_remote_action
+
+    def reserve_then_mutate(root: Path, grant: approval.ApprovalGrant) -> approval.RemoteActionReservation:
+        reservation = original_reserve(root, grant)
+        approved_file.write_bytes(b"unapproved mutation after reservation\n")
+        return reservation
+
+    def comment_provider(
+        root: Path,
+        issue: str,
+        body: str,
+        env: object,
+    ) -> dict[str, object]:
+        del root, env
+        captured[issue] = body
+        return {"html_url": "https://example.invalid/comment/1"}
+
+    with (
+        patch.dict(
+            os.environ,
+            {
+                "DEVCTL_REPO_ROOT": str(repo_root),
+                "DEVCTL_TOOL_ROOT": str(OPS_ROOT),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            clear=False,
+        ),
+        patch.object(approval, "reserve_remote_action", side_effect=reserve_then_mutate),
+        patch.object(providers, "comment_issue", side_effect=comment_provider),
+    ):
+        os.environ.pop("DEVCTL_SKIP_PROVIDER_LOAD", None)
+        assert cli.main(["issue", "comment", "202", "--body-file", str(approved_file)]) == 0
+
+    assert captured["202"].encode("utf-8") == original
+    history = repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history"
+    record = next(history.glob("*-issue-comment-*.yaml"))
+    payload = yaml.safe_load(record.read_text(encoding="utf-8"))
+    assert (repo_root / payload["approvedSnapshotFile"]).read_bytes() == original
+
+
+def test_remote_reconciliation_cli_requires_exact_human_confirmation(
+    repo_root: Path,
+    approved_file: Path,
+) -> None:
+    review = approval.prepare(
+        repo_root,
+        "202",
+        "issue-comment",
+        approved_file,
+        reviewer="human reviewer",
+        force=True,
+    )
+    approve(review)
+    grant = approval.require_remote(repo_root, "issue-comment", approved_file, "202")
+    reservation = approval.reserve_remote_action(repo_root, grant)
+    approval.mark_remote_action_unknown(repo_root, reservation, "simulated provider timeout")
+
+    rejected = run_devctl(
+        repo_root,
+        {},
+        "approval",
+        "reconcile",
+        "--issue",
+        "202",
+        "--approval-id",
+        grant.approval_id,
+        "--outcome",
+        "no-effect",
+        "--confirm",
+        "wrong",
+        expect=1,
+    )
+    assert approval.REMOTE_RECONCILIATION_CONFIRMATION in rejected.stderr
+
+    run_devctl(
+        repo_root,
+        {},
+        "approval",
+        "reconcile",
+        "--issue",
+        "202",
+        "--approval-id",
+        grant.approval_id,
+        "--outcome",
+        "no-effect",
+        "--confirm",
+        approval.REMOTE_RECONCILIATION_CONFIRMATION,
+    )
+    retry = approval.reserve_remote_action(repo_root, grant)
+    assert retry.provider_required is True
+    assert retry.attempt == 2
+
+
+def test_reserved_mr_history_can_parent_confirmed_backfill(
+    repo_root: Path,
+    approved_file: Path,
+) -> None:
+    original = b"# Approved MR body\n\nExact parent snapshot.\n"
+    approved_file.write_bytes(original)
+    review = approval.prepare(repo_root, "202", "git-mr", approved_file, reviewer="human reviewer", force=True)
+    approve(review)
+    grant = approval.require_remote(repo_root, "git-mr", approved_file, "202")
+    reservation = approval.reserve_remote_action(repo_root, grant)
+    approved_file.write_bytes(b"changed after provider reservation\n")
+    confirmed = approval.confirm_remote_action(
+        repo_root,
+        reservation,
+        target_issue=None,
+        provider_receipt={"number": "42", "html_url": "https://example.invalid/pulls/42"},
+    )
+    parent = approval.complete_remote_action(repo_root, confirmed)
+    effect = approval.record_subordinate_effect(repo_root, grant, "git-state-backfill", "success")
+
+    parent_payload = yaml.safe_load(parent.read_text(encoding="utf-8"))
+    effect_payload = yaml.safe_load(effect.read_text(encoding="utf-8"))
+    assert (repo_root / parent_payload["approvedSnapshotFile"]).read_bytes() == original
+    assert effect_payload["parentApprovalId"] == grant.approval_id
+    assert effect_payload["parentAction"] == "git-mr"
 
 
 def test_skipped_backfill_has_no_effect(repo_root: Path, approved_file: Path) -> None:
@@ -662,6 +862,14 @@ def main() -> None:
         test_skipped_git_push_has_no_history(skipped_repo, skipped_file)
         unattended_repo, unattended_file = init_active_repo(root, "unattended-grants")
         test_unattended_grants_are_per_execution(unattended_repo, unattended_file)
+        reservation_repo, reservation_file = init_active_repo(root, "remote-reservation")
+        test_local_remote_reservation_snapshot_and_recovery(reservation_repo, reservation_file)
+        provider_repo, provider_file = init_active_repo(root, "remote-provider-snapshot")
+        test_issue_comment_provider_consumes_reserved_bytes(provider_repo, provider_file)
+        reconcile_repo, reconcile_file = init_active_repo(root, "remote-reconcile-cli")
+        test_remote_reconciliation_cli_requires_exact_human_confirmation(reconcile_repo, reconcile_file)
+        backfill_repo, backfill_file = init_active_repo(root, "remote-mr-backfill")
+        test_reserved_mr_history_can_parent_confirmed_backfill(backfill_repo, backfill_file)
         skipped_backfill_repo, skipped_backfill_file = init_active_repo(root, "skipped-backfill")
         test_skipped_backfill_has_no_effect(skipped_backfill_repo, skipped_backfill_file)
         final_repo, final_file = init_active_repo(root, "final-issue-effect")

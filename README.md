@@ -11,6 +11,9 @@ Core rules:
 - A local human approval file is required before issue creation, comments,
   issue close, branch publication, and PR/MR creation unless a matching
   task-scoped unattended state is active.
+- Ordinary local-review remote actions reserve the approval ID and seal exact
+  approved bytes before provider execution. Provider bodies consume only that
+  snapshot; bodyless writes still consume one reservation.
 - The active approval file is
   `.xflow/issues/issue-<id>/approvals/local-review.md`.
 - Issue ids are provider identifiers. GitHub usually uses numeric ids such as
@@ -40,7 +43,9 @@ devctl check gap-analysis --issue 1
 devctl check resolution-report --issue 1
 devctl check dependencies --issue IK152D
 devctl check commit-msg --file .xflow/local/commit-message.txt --issue IK152D
-devctl task activate --issue IK3RR6
+devctl approval prepare --issue IK3RR6 --action task-branch-start --file .xflow/issues/issue-IK3RR6/task-state.md
+devctl git start <slug> --issue IK3RR6 --file .xflow/issues/issue-IK3RR6/task-state.md
+devctl task status
 devctl task status
 devctl task list
 devctl task migrate-current
@@ -77,7 +82,9 @@ use the repository-local `./devctl.ps1` in place of each leading `devctl`:
 devctl task activate --issue IK3RR6
 
 # Native Windows PowerShell
-.\devctl.ps1 task activate --issue IK3RR6
+.\devctl.ps1 approval prepare --issue IK3RR6 --action task-branch-start --file .xflow/issues/issue-IK3RR6/task-state.md
+.\devctl.ps1 git start <slug> --issue IK3RR6 --file .xflow/issues/issue-IK3RR6/task-state.md
+.\devctl.ps1 task status
 ```
 
 Task authority v2 is shared by the Git repository but bound to the active
@@ -119,6 +126,12 @@ The native Windows PowerShell equivalent is:
 .\devctl.ps1 trace check --issue IK3RR6 --contract docs/requirements/composed-activity/contract.yaml --matrix .xflow/issues/issue-IK3RR6/traceability-matrix.yaml
 ```
 
+The `task-branch-start` approval is a one-time local identity gate. It binds
+the base branch, exact task-state bytes, and final branch; `git start` creates
+and activates that branch but does not implement, push, or perform any other
+remote write. Contract acceptance then occurs on the final branch, followed by
+a separate human development-start gate.
+
 The mechanical commands may be used by a user or AI to validate and compare
 artifacts:
 
@@ -133,6 +146,11 @@ Classification, lint, diff, and trace checks are mechanical. lint does not appro
 Passing these commands provides review evidence; it does not make a design or
 contract acceptable.
 
+For `ui-defect`, both `contractSearch.status: found` and `not-found` are valid,
+and the only terminal `nextArtifact` sentinel is
+`lightweight-route-complete`. It names no follow-up file and must not be
+replaced with `issue-draft.md`.
+
 Contract acceptance is a human-only boundary:
 
 ```text
@@ -146,7 +164,20 @@ review or run the mechanical checks but cannot perform this acceptance.
 contract acceptance never supports unattended mode. On success devctl writes
 sealed, non-reusable approval history under
 `.xflow/issues/issue-<id>/approvals/history/`; do not edit, reuse, or manually
-create those history records.
+create those history records. The history also seals the exact accepted
+contract bytes. Historical task checks use this snapshot rather than requiring
+the current canonical path to retain the old version or `accepted-design`
+status.
+Finalizer locks live only under Git common-dir
+`xflow/runtime/contract-acceptance/<worktree>/` and are removed after success,
+failure, concurrent rejection, or recovery. They are never Issue history
+artifacts and must not appear in `git status`.
+
+Stable contract IDs use lowercase ASCII letters and digits separated by one
+dot or hyphen. They must match
+`^(?!(?:na|none|placeholder|tbd|todo|unknown)(?![\s\S]))[a-z0-9]+(?:[.-][a-z0-9]+)*(?![\s\S])`.
+The schema, semantic lint, internal references, `supersedes`, and
+contract-acceptance `acceptedObjects` enforce the same rule.
 
 ## Compatibility And Issue Workspace Migration
 
@@ -277,6 +308,21 @@ and `git config user.email` when available. Pass `--reviewer` to override it.
 Prepared by AI or tooling does not mean approved. Only the human reviewer may
 change `Approved: no` to `Approved: yes`; if AI made that edit, the approval is
 invalid.
+Each ordinary local-review remote command persists a one-use claim with states
+`reserved`, `outcome-unknown`, `retryable`, `remote-confirmed`, and `completed`.
+Concurrent execution cannot claim the same approval twice. A provider exception
+blocks silent retry; a provider success sealed before a local crash is completed
+from its receipt without another remote call. After a human checks authoritative
+remote state, reconcile exactly one result:
+
+```text
+devctl approval reconcile --issue <id|draft> --approval-id <id> --outcome no-effect --confirm XFLOW_HUMAN_REMOTE_RECONCILED
+devctl approval reconcile --issue <id|draft> --approval-id <id> --outcome success --target-issue <created-id-if-needed> --provider-receipt '<JSON object>' --confirm XFLOW_HUMAN_REMOTE_RECONCILED
+```
+
+The exact confirmation and outcome must come from the human's current message.
+This recovery protocol applies only to ordinary local review and does not
+expand or alter task-scoped unattended authorization.
 When an issue, comment, or PR/MR body references approved non-image files,
 prepare the attachment manifest first and pass `--attachments <manifest>` to
 `approval prepare`, `check local-review`, and the final remote-write command.
@@ -317,7 +363,14 @@ Run:
 
 ```text
 devctl check gap-analysis --issue <id>
+devctl approval prepare --issue <id> --action gap-recognition --file .xflow/issues/issue-<id>/gap-analysis.md
+devctl gap recognize --issue <id> --file .xflow/issues/issue-<id>/gap-analysis.md
 ```
+
+`Recognized: yes` is reviewed content, not authorization. The exact local
+human `gap-recognition` action archives the approved review and analysis bytes
+and creates one immutable, non-reusable history record. Contract acceptance
+and task-scoped unattended mode cannot satisfy this gate.
 
 After implementation, write `.xflow/issues/issue-<id>/resolution-report.md`
 with fresh, numbered verification evidence for each claimed criterion and a

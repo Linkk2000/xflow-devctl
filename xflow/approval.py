@@ -15,12 +15,13 @@ from typing import Iterator, Literal, Sequence
 
 import yaml
 
-from .bindings import GitBindings, resolve_bindings
+from .bindings import GitBindings, git_path, resolve_bindings
 from .classification import _decode_classification_bytes, _load_yaml, _read_stable_bytes
 from .io import read_text
 from .local_artifacts import MAX_TEXT_ARTIFACT_BYTES, StableFileSnapshot, capture_stable_file
-from .paths import default_approval_file, issue_dir, normalized_issue
+from .paths import default_approval_file, issue_dir, normalized_issue, task_state_file
 from .project_config import require_safe_repo_path
+from .stable_ids import is_stable_id
 from .unattended import require_active
 
 
@@ -34,10 +35,17 @@ UNATTENDED_ACTIONS = {
 }
 APPROVAL_ACTIONS = UNATTENDED_ACTIONS | {
     "contract-acceptance",
+    "gap-recognition",
+    "task-branch-start",
     "git-cleanup",
     "git-cleanup-force",
 }
-HISTORY_ACTIONS = UNATTENDED_ACTIONS | {"contract-acceptance", "git-state-backfill"}
+HISTORY_ACTIONS = UNATTENDED_ACTIONS | {
+    "contract-acceptance",
+    "gap-recognition",
+    "task-branch-start",
+    "git-state-backfill",
+}
 REQUIRED_TEXT = (
     "# Local Review Approval",
     "Issue:",
@@ -59,12 +67,30 @@ HISTORY_COMMON_FIELDS = {
 HISTORY_EFFECT_FIELDS = HISTORY_COMMON_FIELDS | {"parentAction", "parentApprovalId"}
 HISTORY_CONTRACT_FIELDS = HISTORY_COMMON_FIELDS | {
     "contractId", "contractVersion", "contractSha256", "acceptedObjects", "semanticDecision",
-    "approvedReviewFile", "approvedReviewSha256", "approvalClaimFile",
+    "approvedReviewFile", "approvedReviewSha256", "contractSnapshotFile",
+    "contractSnapshotSha256", "approvalClaimFile",
+}
+HISTORY_GAP_FIELDS = HISTORY_COMMON_FIELDS | {
+    "semanticDecision",
+    "approvedReviewFile",
+    "approvedReviewSha256",
+    "gapSnapshotFile",
+    "gapSnapshotSha256",
+}
+HISTORY_BRANCH_FIELDS = HISTORY_COMMON_FIELDS | {"targetBranch"}
+HISTORY_REMOTE_FIELDS = HISTORY_COMMON_FIELDS | {
+    "approvedReviewFile",
+    "approvedReviewSha256",
+    "approvedSnapshotFile",
+    "approvedSnapshotSha256",
+    "remoteClaimFile",
+    "providerReceipt",
 }
 CONTRACT_CLAIM_FIELD_ORDER = (
     "version", "reusable", "approvalId", "repository", "worktree", "branch", "issue", "action",
     "approvedFile", "approvedSha256", "contractId", "contractVersion", "contractSha256",
     "acceptedObjects", "semanticDecision", "approvedReviewFile", "approvedReviewSha256",
+    "contractSnapshotFile", "contractSnapshotSha256",
     "claimedAt", "recordedAt", "historyFile", "historySha256",
 )
 CONTRACT_CLAIM_FIELDS = set(CONTRACT_CLAIM_FIELD_ORDER)
@@ -83,6 +109,17 @@ CREDENTIAL_PATTERNS = (
     re.compile(r"(?i)(?:^|[^A-Za-z0-9])api[_-]?key\s*[:=]"),
     re.compile(r"(?i)(?:^|[^A-Za-z0-9])(?:token|secret|password|credential|access[_-]?key)\s*[:=]"),
 )
+REMOTE_RECONCILIATION_CONFIRMATION = "XFLOW_HUMAN_REMOTE_RECONCILED"
+REMOTE_CLAIM_STATES = {"reserved", "outcome-unknown", "retryable", "remote-confirmed", "completed"}
+REMOTE_CLAIM_FIELD_ORDER = (
+    "version", "approvalId", "repository", "worktree", "branch", "approvalIssue", "action",
+    "approvedFile", "approvedSha256", "reviewerSummary", "approvedReviewFile",
+    "approvedReviewSha256", "approvedSnapshotFile", "approvedSnapshotSha256", "remoteClaimFile",
+    "state", "attempt",
+    "reservedAt", "updatedAt", "targetIssue", "providerReceipt", "failureReason", "recordedAt",
+    "historyFile", "historySha256",
+)
+REMOTE_CLAIM_FIELDS = set(REMOTE_CLAIM_FIELD_ORDER)
 
 
 @dataclass(frozen=True)
@@ -98,6 +135,25 @@ class ApprovalGrant:
     approved_sha256: str
     reviewer_summary: str
     accepted_objects: tuple[str, ...] = ()
+    target_branch: str = ""
+
+
+@dataclass(frozen=True)
+class RemoteActionReservation:
+    grant: ApprovalGrant
+    claim_path: Path
+    approved_snapshot_path: Path
+    approved_bytes: bytes
+    attempt: int
+    provider_required: bool
+    target_issue: str = ""
+    provider_receipt: str = ""
+
+    def approved_text(self) -> str:
+        try:
+            return self.approved_bytes.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ValueError("approved remote body snapshot must be valid UTF-8") from exc
 
 
 def validate_action(action: str, *, history: bool = False) -> str:
@@ -112,7 +168,7 @@ def normalize_accepted_objects(object_ids: Sequence[str] | None) -> tuple[str, .
         raise ValueError("contract-acceptance requires accepted object IDs")
     normalized: list[str] = []
     for item in object_ids:
-        if not isinstance(item, str) or not item or item != item.strip() or any(char.isspace() for char in item):
+        if not is_stable_id(item):
             raise ValueError("contract-acceptance requires valid accepted object IDs")
         normalized.append(item)
     if not normalized:
@@ -222,6 +278,10 @@ def suggested_command(
         return f"devctl git done --force --issue {issue} --file {path}"
     if action == "contract-acceptance":
         return f"devctl contract accept --issue {issue} --file {path} --objects {','.join(accepted_objects)}"
+    if action == "gap-recognition":
+        return f"devctl gap recognize --issue {issue} --file {path}"
+    if action == "task-branch-start":
+        return f"devctl git start <slug> --issue {issue} --file {path}"
     return f"devctl <remote-write-command> --body-file {path}"
 
 
@@ -513,11 +573,22 @@ def _parse_history_snapshot(
         raise ValueError(f"approval history integrity error in {path}: expected a mapping")
     source = payload.get("source")
     action = payload.get("action")
+    remote_snapshot_history = (
+        source == "local-review"
+        and action in UNATTENDED_ACTIONS
+        and "approvedSnapshotFile" in payload
+    )
     expected_fields = (
         HISTORY_EFFECT_FIELDS
         if source == "effect"
         else HISTORY_CONTRACT_FIELDS
         if action == "contract-acceptance"
+        else HISTORY_GAP_FIELDS
+        if action == "gap-recognition"
+        else HISTORY_BRANCH_FIELDS
+        if action == "task-branch-start"
+        else HISTORY_REMOTE_FIELDS
+        if remote_snapshot_history
         else HISTORY_COMMON_FIELDS
     )
     if set(payload) != expected_fields:
@@ -583,19 +654,64 @@ def _parse_history_snapshot(
                 for name in (
                     "approvedReviewFile",
                     "approvedReviewSha256",
+                    "contractSnapshotFile",
+                    "contractSnapshotSha256",
                     "approvalClaimFile",
                 ):
                     if not isinstance(payload[name], str) or not payload[name]:
                         raise ValueError(f"invalid {name}")
-                for name in ("approvedReviewSha256",):
+                for name in ("approvedReviewSha256", "contractSnapshotSha256"):
                     if not FINGERPRINT_RE.fullmatch(str(payload[name])):
                         raise ValueError(f"invalid {name}")
+                if payload["contractSnapshotSha256"] != payload["contractSha256"]:
+                    raise ValueError("contract snapshot SHA256 must match accepted contract SHA256")
+            elif payload["action"] == "gap-recognition":
+                if source != "local-review" or payload["semanticDecision"] != "gap-recognized":
+                    raise ValueError("gap recognition must be a local human decision")
+                for name in ("approvedReviewFile", "gapSnapshotFile"):
+                    if not isinstance(payload[name], str) or not payload[name]:
+                        raise ValueError(f"invalid {name}")
+                for name in ("approvedReviewSha256", "gapSnapshotSha256"):
+                    if not isinstance(payload[name], str) or not FINGERPRINT_RE.fullmatch(payload[name]):
+                        raise ValueError(f"invalid {name}")
+                _canonical_utc_timestamp(payload["recordedAt"], "recordedAt", microseconds=True)
+            elif payload["action"] == "task-branch-start":
+                if source != "local-review":
+                    raise ValueError("task branch identity approval must use local-review")
+                if (
+                    not isinstance(payload["targetBranch"], str)
+                    or not payload["targetBranch"]
+                    or payload["targetBranch"] == payload["branch"]
+                ):
+                    raise ValueError("invalid targetBranch")
+                _canonical_utc_timestamp(payload["recordedAt"], "recordedAt", microseconds=True)
+            elif remote_snapshot_history:
+                for name in ("approvedReviewFile", "approvedSnapshotFile", "remoteClaimFile", "providerReceipt"):
+                    if not isinstance(payload[name], str) or not payload[name]:
+                        raise ValueError(f"invalid {name}")
+                for name in ("approvedReviewSha256", "approvedSnapshotSha256"):
+                    if not isinstance(payload[name], str) or not FINGERPRINT_RE.fullmatch(payload[name]):
+                        raise ValueError(f"invalid {name}")
+                if payload["approvedSnapshotSha256"] != payload["approvedSha256"]:
+                    raise ValueError("approved snapshot SHA256 mismatch")
+                receipt = json.dumps(
+                    json.loads(str(payload["providerReceipt"])),
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                if receipt != payload["providerReceipt"]:
+                    raise ValueError("providerReceipt must be canonical JSON")
+                _canonical_utc_timestamp(payload["recordedAt"], "recordedAt", microseconds=True)
         expected_path = _history_path(
             repo_root,
             str(payload["issue"]),
             str(payload["action"]),
             str(payload["recordedAt"]),
-            str(payload["approvalId"]) if payload["action"] == "contract-acceptance" else None,
+            str(payload["approvalId"])
+            if payload["action"] in {"contract-acceptance", "gap-recognition", "task-branch-start"}
+            or remote_snapshot_history
+            else None,
         )
         if path.resolve() != expected_path:
             raise ValueError("history path does not match record Issue, action, and timestamp")
@@ -662,11 +778,38 @@ def reject_consumed_approval(repo_root: Path, approval_id: str) -> None:
             raise ValueError(f"approval already consumed: {approval_id}")
 
 
-def check_reviewed_task_binding(repo_root: Path, issue: str, action: str) -> None:
+def task_binding_evidence_exists(repo_root: Path) -> bool:
+    from .bindings import resolve_bindings
+    from .task_state import _pointer_snapshots, task_authority_issues
+
+    root = repo_root.resolve()
+    bindings = resolve_bindings(root)
+    pointer, legacy_pointer = _pointer_snapshots(root, bindings)
+    if pointer.exists or legacy_pointer.exists or task_authority_issues(root):
+        return True
+    if (root / ".xflow" / "current-task.md").is_file():
+        return True
+    issues = root / ".xflow" / "issues"
+    return issues.is_dir() and any(
+        candidate.is_file()
+        for pattern in ("issue-*/task-state.md", "issue-*/classification.yaml", "issue-*/traceability-matrix.yaml")
+        for candidate in issues.glob(pattern)
+    )
+
+
+def check_reviewed_task_binding(repo_root: Path, issue: str | None, action: str) -> None:
     # This preserves legacy current-task.md workflows while using strict task bindings whenever present.
     from .checks import check_current_task
+    from .semantic_routes import require_route_semantics
+    from .bindings import resolve_bindings
+    from .task_state import _pointer_snapshots, check_task_binding
 
-    check_current_task(repo_root, issue, check_stale_pr=not (issue == "draft" and action == "issue-create"))
+    is_draft_create = issue is not None and normalized_issue(issue) == "draft" and action == "issue-create"
+    check_current_task(repo_root, issue, check_stale_pr=not is_draft_create)
+    bindings = resolve_bindings(repo_root)
+    pointer, legacy_pointer = _pointer_snapshots(repo_root, bindings)
+    if not is_draft_create and (pointer.exists or legacy_pointer.exists):
+        require_route_semantics(check_task_binding(repo_root, issue), action)
 
 
 def _validate_grant(grant: ApprovalGrant) -> None:
@@ -694,7 +837,93 @@ def _validate_grant(grant: ApprovalGrant) -> None:
             raise ValueError("contract acceptance grant has invalid accepted object IDs")
     elif grant.accepted_objects:
         raise ValueError("accepted object IDs are only valid for contract-acceptance")
+    if grant.action == "task-branch-start":
+        if grant.source != "local-review":
+            raise ValueError("task branch identity approval requires local-review")
+        if not grant.target_branch or grant.target_branch == grant.branch:
+            raise ValueError("task branch identity approval requires a distinct target branch")
+    elif grant.target_branch:
+        raise ValueError("target branch is only valid for task-branch-start")
     reject_credentials(json.dumps(asdict(grant), ensure_ascii=True, sort_keys=True))
+
+
+def require_task_branch_start(
+    repo_root: Path,
+    issue: str,
+    approved_file: Path,
+    target_branch: str,
+    base_branch: str,
+) -> ApprovalGrant:
+    from .task_state import parse_task_state_text
+
+    root = repo_root.resolve()
+    issue = normalized_issue(issue)
+    issue_root = issue_dir(root, issue)
+    approved_path = resolve_path(root, approved_file)
+    expected_path = task_state_file(root, issue).resolve()
+    if approved_path != expected_path:
+        raise ValueError("task branch identity approval requires the canonical Issue task-state.md")
+    state_snapshot = capture_stable_file(
+        root,
+        approved_path,
+        issue_root,
+        "task branch identity state",
+        max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+    )
+    try:
+        state_text = (state_snapshot.content or b"").decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError("task-state must be valid UTF-8") from exc
+    state = parse_task_state_text(
+        approved_path,
+        state_text,
+        binding_mode="recorded",
+        validate_acceptance=False,
+    )
+    if state.issue != issue or state.classification != "capability-change":
+        raise ValueError("task branch identity approval is only valid for this capability-change Issue")
+    if state.execution_state != "S2_REMOTE_ISSUE_CREATED":
+        raise ValueError("task branch identity approval requires S2_REMOTE_ISSUE_CREATED")
+    if state.semantic_phase not in {"classified", "declaring"}:
+        raise ValueError("task branch identity approval requires classified or declaring")
+    if state.branch != target_branch or state.base != base_branch:
+        raise ValueError("task branch identity does not match task-state Branch and Base")
+
+    review_file = default_approval_file(root, issue)
+    if not review_file.is_file():
+        raise ValueError(f"local review approval required: {review_file}")
+    review_bytes = _stable_approval_bytes(root, review_file, issue_root, "approval review")
+    review_text = _decode_approval_bytes(review_bytes, review_file, "approval review")
+    if field(review_text, "Approved Action") != "task-branch-start":
+        raise ValueError("action mismatch: expected exact task-branch-start")
+    bindings = resolve_bindings(root)
+    if bindings.branch != base_branch:
+        raise ValueError(f"task branch identity approval requires active base branch {base_branch}")
+    approved_path, approved_hash = _validate_review_text(
+        root,
+        issue,
+        approved_path,
+        None,
+        review_text,
+        bindings,
+        hashlib.sha256(state_snapshot.content or b"").hexdigest(),
+    )
+    grant = ApprovalGrant(
+        source="local-review",
+        approval_id=field(review_text, "Approval ID"),
+        repository=bindings.repository,
+        worktree=bindings.worktree,
+        branch=bindings.branch,
+        approval_issue=issue,
+        action="task-branch-start",
+        approved_file=display_path(root, approved_path),
+        approved_sha256=approved_hash,
+        reviewer_summary=safe_reviewer_summary(field(review_text, "Reviewer")),
+        target_branch=target_branch,
+    )
+    _validate_grant(grant)
+    reject_consumed_approval(root, grant.approval_id)
+    return grant
 
 
 def _contract_local_grant(
@@ -824,9 +1053,9 @@ def require_remote_or_unattended(
     attachment_manifest: Path | None = None,
     request_unattended: bool = False,
 ) -> ApprovalGrant:
-    if action == "contract-acceptance":
+    if action in {"contract-acceptance", "gap-recognition"}:
         if request_unattended:
-            raise ValueError("contract-acceptance is not eligible for unattended mode")
+            raise ValueError(f"{action} is not eligible for unattended mode")
         return require_exact_remote(repo_root, action, approved_file, issue)
     if action not in UNATTENDED_ACTIONS:
         raise ValueError(f"remote action {action} is not eligible for unattended mode")
@@ -841,6 +1070,9 @@ def require_remote_or_unattended(
         if request_unattended:
             raise ValueError("--no-local-review requires active task-scoped unattended mode") from None
         return require_remote(repo_root, action, approved_file, issue, attachment_manifest)
+
+    if normalized_issue(issue) != "draft" and task_binding_evidence_exists(repo_root):
+        check_reviewed_task_binding(repo_root, issue, action)
 
     print(f"[UNATTENDED] Human approval gate bypassed for current task {state.issue}.")
     bindings = resolve_bindings(repo_root)
@@ -898,13 +1130,15 @@ def _history_path(
 ) -> Path:
     issue = normalized_issue(issue)
     action = validate_action(action, history=True)
-    if action == "contract-acceptance":
+    if action in {"contract-acceptance", "gap-recognition", "task-branch-start"} or (
+        action in UNATTENDED_ACTIONS and approval_id is not None
+    ):
         if not isinstance(approval_id, str) or not APPROVAL_ID_RE.fullmatch(approval_id):
-            raise ValueError("contract acceptance history requires a valid approval ID")
+            raise ValueError(f"{action} history requires a valid approval ID")
         approval_suffix = f"-{approval_id}"
     else:
         if approval_id is not None:
-            raise ValueError("approval ID filename suffix is reserved for contract acceptance history")
+            raise ValueError("approval ID filename suffix is reserved for one-time decision history")
         approval_suffix = ""
     issue_root = issue_dir(repo_root.resolve(), issue).resolve()
     history_root = (issue_root / "approvals" / "history").resolve()
@@ -931,15 +1165,26 @@ def _contract_artifact_path(repo_root: Path, issue: str, category: str, name: st
     return target
 
 
-@contextmanager
-def _contract_claim_lock(repo_root: Path, claim_path: Path, approval_id: str) -> Iterator[None]:
-    lock_path = require_safe_repo_path(
-        repo_root,
-        claim_path.with_suffix(".lock"),
-        "contract acceptance finalizer lock",
+def _contract_claim_lock_path(repo_root: Path, approval_id: str) -> Path:
+    if not APPROVAL_ID_RE.fullmatch(approval_id):
+        raise ValueError("contract acceptance finalizer requires a valid approval ID")
+    bindings = resolve_bindings(repo_root)
+    return (
+        git_path(repo_root, "--git-common-dir")
+        / "xflow"
+        / "runtime"
+        / "contract-acceptance"
+        / bindings.worktree
+        / f"{approval_id}.lock"
     )
+
+
+@contextmanager
+def _contract_claim_lock(repo_root: Path, approval_id: str) -> Iterator[None]:
+    lock_path = _contract_claim_lock_path(repo_root, approval_id)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+b")
+    acquired = False
     try:
         handle.seek(0, os.SEEK_END)
         if handle.tell() == 0:
@@ -958,6 +1203,7 @@ def _contract_claim_lock(repo_root: Path, claim_path: Path, approval_id: str) ->
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             raise ValueError(f"approval already claimed: {approval_id}") from None
+        acquired = True
         try:
             yield
         finally:
@@ -972,6 +1218,12 @@ def _contract_claim_lock(repo_root: Path, claim_path: Path, approval_id: str) ->
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     finally:
         handle.close()
+        if acquired:
+            try:
+                lock_path.unlink(missing_ok=True)
+            except PermissionError:
+                # A Windows contender may still have this runtime lock open.
+                pass
 
 
 def _record_payload(
@@ -1029,13 +1281,23 @@ def record_consumed_approval(
         raise ValueError("consumed approval records require confirmed success")
     if grant.action == "contract-acceptance":
         raise ValueError("contract-acceptance must use contract acceptance history")
+    if grant.action == "gap-recognition":
+        raise ValueError("gap-recognition must use gap recognition history")
     repo_root = repo_root.resolve()
     _validate_grant(grant)
     reject_consumed_approval(repo_root, grant.approval_id)
     recorded_at = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
     issue = _record_target_issue(grant, target_issue)
-    history_file = _history_path(repo_root, issue, grant.action, recorded_at)
+    history_file = _history_path(
+        repo_root,
+        issue,
+        grant.action,
+        recorded_at,
+        grant.approval_id if grant.action == "task-branch-start" else None,
+    )
     payload = _record_payload(grant, issue, recorded_at)
+    if grant.action == "task-branch-start":
+        payload["targetBranch"] = grant.target_branch
     content = yaml.safe_dump(payload, sort_keys=False, allow_unicode=False)
     reject_credentials(content)
     _write_history_atomic(history_file, content)
@@ -1070,6 +1332,8 @@ def _contract_history_payload(
     accepted_objects: tuple[str, ...],
     approved_review_file: str,
     approved_review_sha256: str,
+    contract_snapshot_file: str,
+    contract_snapshot_sha256: str,
     approval_claim_file: str,
 ) -> dict[str, object]:
     payload = _record_payload(grant, issue, recorded_at)
@@ -1082,6 +1346,8 @@ def _contract_history_payload(
             "semanticDecision": "accepted-design",
             "approvedReviewFile": approved_review_file,
             "approvedReviewSha256": approved_review_sha256,
+            "contractSnapshotFile": contract_snapshot_file,
+            "contractSnapshotSha256": contract_snapshot_sha256,
             "approvalClaimFile": approval_claim_file,
         }
     )
@@ -1098,6 +1364,8 @@ def _contract_claim_payload(
     accepted_objects: tuple[str, ...],
     approved_review_file: str,
     approved_review_sha256: str,
+    contract_snapshot_file: str,
+    contract_snapshot_sha256: str,
     claimed_at: str,
     recorded_at: str,
     history_file: str,
@@ -1121,6 +1389,8 @@ def _contract_claim_payload(
         "semanticDecision": "accepted-design",
         "approvedReviewFile": approved_review_file,
         "approvedReviewSha256": approved_review_sha256,
+        "contractSnapshotFile": contract_snapshot_file,
+        "contractSnapshotSha256": contract_snapshot_sha256,
         "claimedAt": claimed_at,
         "recordedAt": recorded_at,
         "historyFile": history_file,
@@ -1154,6 +1424,507 @@ def _publish_exact_artifact(
         return False
 
 
+def _replace_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def _remote_action_lock(repo_root: Path, approval_id: str) -> Iterator[None]:
+    bindings = resolve_bindings(repo_root)
+    lock_path = (
+        git_path(repo_root, "--git-common-dir")
+        / "xflow"
+        / "runtime"
+        / "remote-approvals"
+        / bindings.worktree
+        / f"{approval_id}.lock"
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    try:
+        if handle.seek(0, os.SEEK_END) == 0:
+            handle.write(b"0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            raise ValueError(f"remote approval reservation is busy: {approval_id}") from None
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+        try:
+            lock_path.unlink(missing_ok=True)
+        except PermissionError:
+            # Another Windows waiter already opened the same lock; the last closer removes it.
+            pass
+
+
+def _remote_claim_path(repo_root: Path, issue: str, approval_id: str) -> Path:
+    return _contract_artifact_path(repo_root, issue, "claims", f"{approval_id}-remote.yaml")
+
+
+def _remote_snapshot_path(repo_root: Path, issue: str, grant: ApprovalGrant) -> Path:
+    return _contract_artifact_path(
+        repo_root,
+        issue,
+        "consumed",
+        f"{grant.approval_id}-{grant.action}-approved.snapshot",
+    )
+
+
+def _remote_review_path(repo_root: Path, issue: str, grant: ApprovalGrant) -> Path:
+    return _contract_artifact_path(
+        repo_root,
+        issue,
+        "consumed",
+        f"{grant.approval_id}-{grant.action}-local-review.md",
+    )
+
+
+def _remote_claim_bytes(payload: dict[str, object]) -> bytes:
+    return _yaml_bytes({name: payload[name] for name in REMOTE_CLAIM_FIELD_ORDER})
+
+
+def _parse_remote_claim(repo_root: Path, path: Path, issue: str) -> dict[str, object]:
+    issue_root = issue_dir(repo_root, issue)
+    raw_bytes = _stable_approval_bytes(repo_root, path, issue_root, "remote approval claim")
+    payload = _load_yaml(_decode_approval_bytes(raw_bytes, path, "remote approval claim"))
+    if not isinstance(payload, dict) or set(payload) != REMOTE_CLAIM_FIELDS:
+        raise ValueError("remote approval claim has unexpected or missing fields")
+    if payload["version"] != "0.1.0" or payload["state"] not in REMOTE_CLAIM_STATES:
+        raise ValueError("remote approval claim has invalid fixed fields")
+    for name in ("repository", "worktree", "approvedSha256", "approvedReviewSha256", "approvedSnapshotSha256"):
+        if not isinstance(payload[name], str) or not FINGERPRINT_RE.fullmatch(payload[name]):
+            raise ValueError(f"remote approval claim has invalid {name}")
+    if payload["approvedSha256"] != payload["approvedSnapshotSha256"]:
+        raise ValueError("remote approval claim snapshot SHA256 mismatch")
+    if not isinstance(payload["approvalId"], str) or not APPROVAL_ID_RE.fullmatch(payload["approvalId"]):
+        raise ValueError("remote approval claim has invalid approvalId")
+    if payload["approvalIssue"] != normalized_issue(payload["approvalIssue"]):
+        raise ValueError("remote approval claim has invalid approvalIssue")
+    if payload["action"] not in UNATTENDED_ACTIONS:
+        raise ValueError("remote approval claim has invalid action")
+    if type(payload["attempt"]) is not int or payload["attempt"] < 1:
+        raise ValueError("remote approval claim has invalid attempt")
+    for name in (
+        "branch", "approvedFile", "reviewerSummary", "approvedReviewFile", "approvedSnapshotFile", "remoteClaimFile",
+        "reservedAt", "updatedAt", "targetIssue", "providerReceipt", "failureReason", "recordedAt",
+        "historyFile", "historySha256",
+    ):
+        if not isinstance(payload[name], str) or not payload[name]:
+            raise ValueError(f"remote approval claim has invalid {name}")
+    _canonical_utc_timestamp(payload["reservedAt"], "reservedAt", microseconds=True)
+    _canonical_utc_timestamp(payload["updatedAt"], "updatedAt", microseconds=True)
+    if payload["state"] in {"remote-confirmed", "completed"}:
+        if payload["targetIssue"] == "none" or payload["providerReceipt"] == "none":
+            raise ValueError("remote approval claim is missing provider confirmation")
+        normalized_issue(payload["targetIssue"])
+        _canonical_utc_timestamp(payload["recordedAt"], "recordedAt", microseconds=True)
+        if not FINGERPRINT_RE.fullmatch(payload["historySha256"]):
+            raise ValueError("remote approval claim has invalid historySha256")
+    elif any(payload[name] != "none" for name in ("targetIssue", "providerReceipt", "recordedAt", "historyFile", "historySha256")):
+        raise ValueError("unconfirmed remote approval claim contains provider outcome fields")
+    if raw_bytes != _remote_claim_bytes(payload):
+        raise ValueError("remote approval claim bytes are not canonical")
+    return payload
+
+
+def _grant_from_remote_claim(claim: dict[str, object]) -> ApprovalGrant:
+    grant = ApprovalGrant(
+        source="local-review",
+        approval_id=str(claim["approvalId"]),
+        repository=str(claim["repository"]),
+        worktree=str(claim["worktree"]),
+        branch=str(claim["branch"]),
+        approval_issue=str(claim["approvalIssue"]),
+        action=str(claim["action"]),
+        approved_file=str(claim["approvedFile"]),
+        approved_sha256=str(claim["approvedSha256"]),
+        reviewer_summary=str(claim["reviewerSummary"]),
+    )
+    _validate_grant(grant)
+    return grant
+
+
+def _validate_remote_claim_grant(claim: dict[str, object], grant: ApprovalGrant) -> None:
+    expected = {
+        "approvalId": grant.approval_id,
+        "repository": grant.repository,
+        "worktree": grant.worktree,
+        "branch": grant.branch,
+        "approvalIssue": grant.approval_issue,
+        "action": grant.action,
+        "approvedFile": grant.approved_file,
+        "approvedSha256": grant.approved_sha256,
+        "reviewerSummary": grant.reviewer_summary,
+    }
+    if any(claim.get(name) != value for name, value in expected.items()):
+        raise ValueError("remote approval claim does not match exact local approval")
+
+
+def _remote_snapshot_from_claim(repo_root: Path, claim: dict[str, object]) -> tuple[Path, bytes]:
+    path = require_safe_repo_path(
+        repo_root,
+        repo_root / Path(str(claim["approvedSnapshotFile"])),
+        "approved remote snapshot",
+    )
+    content = _stable_approval_bytes(repo_root, path, repo_root, "approved remote snapshot")
+    if hashlib.sha256(content).hexdigest() != claim["approvedSnapshotSha256"]:
+        raise ValueError("approved remote snapshot SHA256 mismatch")
+    return path, content
+
+
+def _reservation_from_claim(repo_root: Path, claim_path: Path, claim: dict[str, object]) -> RemoteActionReservation:
+    grant = _grant_from_remote_claim(claim)
+    snapshot_path, approved_bytes = _remote_snapshot_from_claim(repo_root, claim)
+    return RemoteActionReservation(
+        grant=grant,
+        claim_path=claim_path,
+        approved_snapshot_path=snapshot_path,
+        approved_bytes=approved_bytes,
+        attempt=int(claim["attempt"]),
+        provider_required=claim["state"] != "remote-confirmed",
+        target_issue="" if claim["targetIssue"] == "none" else str(claim["targetIssue"]),
+        provider_receipt="" if claim["providerReceipt"] == "none" else str(claim["providerReceipt"]),
+    )
+
+
+def reserve_remote_action(repo_root: Path, grant: ApprovalGrant) -> RemoteActionReservation:
+    from .local_artifacts import revalidate_snapshots
+
+    root = repo_root.resolve()
+    _validate_grant(grant)
+    if grant.source != "local-review" or grant.action not in UNATTENDED_ACTIONS:
+        raise ValueError("persistent remote reservation requires an ordinary local-review remote action")
+    issue = normalized_issue(grant.approval_issue)
+    claim_path = _remote_claim_path(root, issue, grant.approval_id)
+    with _remote_action_lock(root, grant.approval_id):
+        if claim_path.is_file():
+            claim = _parse_remote_claim(root, claim_path, issue)
+            _validate_remote_claim_grant(claim, grant)
+            if claim["state"] == "completed":
+                raise ValueError(f"approval already consumed: {grant.approval_id}")
+            if claim["state"] == "remote-confirmed":
+                return _reservation_from_claim(root, claim_path, claim)
+            if claim["state"] != "retryable":
+                raise ValueError(f"remote approval outcome unresolved: {grant.approval_id}")
+        else:
+            claim = None
+
+        issue_root = issue_dir(root, issue)
+        approved_path = resolve_path(root, Path(grant.approved_file))
+        approved_snapshot = capture_stable_file(
+            root,
+            approved_path,
+            root,
+            "approved remote file",
+            max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+        )
+        approved_bytes = approved_snapshot.content or b""
+        if hashlib.sha256(approved_bytes).hexdigest() != grant.approved_sha256:
+            raise ValueError("approved remote file changed before reservation")
+        review_path = default_approval_file(root, issue)
+        review_snapshot = capture_stable_file(
+            root,
+            review_path,
+            issue_root,
+            "approval review",
+            max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+        )
+        review_bytes = review_snapshot.content or b""
+        review_text = _decode_approval_bytes(review_bytes, review_path, "approval review")
+        if field(review_text, "Approval ID") != grant.approval_id or field(review_text, "Approved Action") != grant.action:
+            raise ValueError("active local review no longer matches remote approval")
+        _validate_review_text(
+            root,
+            issue,
+            approved_path,
+            None,
+            review_text,
+            resolve_bindings(root),
+            grant.approved_sha256,
+        )
+        revalidate_snapshots(root, (approved_snapshot, review_snapshot), "remote approval reservation")
+        snapshot_path = _remote_snapshot_path(root, issue, grant)
+        archived_review = _remote_review_path(root, issue, grant)
+        _publish_exact_artifact(
+            root,
+            issue_root,
+            snapshot_path,
+            approved_bytes,
+            label="approved remote snapshot",
+            collision_message="approved remote snapshot collision",
+        )
+        _publish_exact_artifact(
+            root,
+            issue_root,
+            archived_review,
+            review_bytes,
+            label="approved remote review",
+            collision_message="approved remote review collision",
+        )
+        now = _canonical_utc_now()
+        payload: dict[str, object] = {
+            "version": "0.1.0",
+            "approvalId": grant.approval_id,
+            "repository": grant.repository,
+            "worktree": grant.worktree,
+            "branch": grant.branch,
+            "approvalIssue": issue,
+            "action": grant.action,
+            "approvedFile": grant.approved_file,
+            "approvedSha256": grant.approved_sha256,
+            "reviewerSummary": grant.reviewer_summary,
+            "approvedReviewFile": archived_review.relative_to(root).as_posix(),
+            "approvedReviewSha256": hashlib.sha256(review_bytes).hexdigest(),
+            "approvedSnapshotFile": snapshot_path.relative_to(root).as_posix(),
+            "approvedSnapshotSha256": grant.approved_sha256,
+            "remoteClaimFile": claim_path.relative_to(root).as_posix(),
+            "state": "reserved",
+            "attempt": 1 if claim is None else int(claim["attempt"]) + 1,
+            "reservedAt": now if claim is None else claim["reservedAt"],
+            "updatedAt": now,
+            "targetIssue": "none",
+            "providerReceipt": "none",
+            "failureReason": "none",
+            "recordedAt": "none",
+            "historyFile": "none",
+            "historySha256": "none",
+        }
+        if claim is None:
+            _write_immutable_bytes(claim_path, _remote_claim_bytes(payload), "remote approval claim collision")
+        else:
+            _replace_bytes(claim_path, _remote_claim_bytes(payload))
+        return _reservation_from_claim(root, claim_path, payload)
+
+
+def mark_remote_action_unknown(
+    repo_root: Path,
+    reservation: RemoteActionReservation,
+    reason: str,
+) -> None:
+    root = repo_root.resolve()
+    summary = " ".join(str(reason).split())[:200] or "provider outcome unknown"
+    reject_credentials(summary)
+    with _remote_action_lock(root, reservation.grant.approval_id):
+        claim = _parse_remote_claim(root, reservation.claim_path, reservation.grant.approval_issue)
+        _validate_remote_claim_grant(claim, reservation.grant)
+        if claim["state"] != "reserved" or claim["attempt"] != reservation.attempt:
+            raise ValueError("remote approval reservation is not active")
+        claim.update({"state": "outcome-unknown", "failureReason": summary, "updatedAt": _canonical_utc_now()})
+        _replace_bytes(reservation.claim_path, _remote_claim_bytes(claim))
+
+
+def mark_remote_action_retryable(
+    repo_root: Path,
+    reservation: RemoteActionReservation,
+    reason: str,
+) -> None:
+    root = repo_root.resolve()
+    summary = " ".join(str(reason).split())[:200] or "no remote effect"
+    reject_credentials(summary)
+    with _remote_action_lock(root, reservation.grant.approval_id):
+        claim = _parse_remote_claim(root, reservation.claim_path, reservation.grant.approval_issue)
+        _validate_remote_claim_grant(claim, reservation.grant)
+        if claim["state"] != "reserved" or claim["attempt"] != reservation.attempt:
+            raise ValueError("remote approval reservation is not active")
+        claim.update({"state": "retryable", "failureReason": summary, "updatedAt": _canonical_utc_now()})
+        _replace_bytes(reservation.claim_path, _remote_claim_bytes(claim))
+
+
+def reconcile_remote_action(
+    repo_root: Path,
+    grant: ApprovalGrant,
+    *,
+    outcome: Literal["no-effect", "success"],
+    confirmation: str,
+    target_issue: str | None = None,
+    provider_receipt: dict[str, object] | None = None,
+) -> RemoteActionReservation | Path:
+    if confirmation != REMOTE_RECONCILIATION_CONFIRMATION:
+        raise ValueError(
+            "remote reconciliation requires exact human confirmation: "
+            f"{REMOTE_RECONCILIATION_CONFIRMATION}"
+        )
+    root = repo_root.resolve()
+    claim_path = _remote_claim_path(root, grant.approval_issue, grant.approval_id)
+    with _remote_action_lock(root, grant.approval_id):
+        claim = _parse_remote_claim(root, claim_path, grant.approval_issue)
+        _validate_remote_claim_grant(claim, grant)
+        if claim["state"] not in {"reserved", "outcome-unknown"}:
+            raise ValueError("remote approval claim is not awaiting reconciliation")
+        if outcome == "no-effect":
+            claim.update(
+                {
+                    "state": "retryable",
+                    "failureReason": "human confirmed no remote effect",
+                    "updatedAt": _canonical_utc_now(),
+                }
+            )
+            _replace_bytes(claim_path, _remote_claim_bytes(claim))
+            return _reservation_from_claim(root, claim_path, claim)
+    reservation = _reservation_from_claim(root, claim_path, claim)
+    confirm_remote_action(
+        root,
+        reservation,
+        target_issue=target_issue,
+        provider_receipt=provider_receipt or {},
+        reconciled=True,
+    )
+    return complete_remote_action(root, _reservation_from_claim(root, claim_path, _parse_remote_claim(root, claim_path, grant.approval_issue)))
+
+
+def reconcile_remote_action_by_id(
+    repo_root: Path,
+    issue: str,
+    approval_id: str,
+    *,
+    outcome: Literal["no-effect", "success"],
+    confirmation: str,
+    target_issue: str | None = None,
+    provider_receipt: dict[str, object] | None = None,
+) -> RemoteActionReservation | Path:
+    normalized = normalized_issue(issue)
+    if not APPROVAL_ID_RE.fullmatch(approval_id):
+        raise ValueError("remote reconciliation requires a valid approval ID")
+    root = repo_root.resolve()
+    claim_path = _remote_claim_path(root, normalized, approval_id)
+    with _remote_action_lock(root, approval_id):
+        claim = _parse_remote_claim(root, claim_path, normalized)
+        grant = _grant_from_remote_claim(claim)
+    return reconcile_remote_action(
+        root,
+        grant,
+        outcome=outcome,
+        confirmation=confirmation,
+        target_issue=target_issue,
+        provider_receipt=provider_receipt,
+    )
+
+
+def _canonical_provider_receipt(receipt: dict[str, object]) -> str:
+    if not isinstance(receipt, dict) or not receipt:
+        raise ValueError("provider receipt must be a non-empty mapping")
+    text = json.dumps(receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    reject_credentials(text)
+    if len(text) > 4096:
+        raise ValueError("provider receipt is too large")
+    return text
+
+
+def _remote_history_payload(claim: dict[str, object]) -> dict[str, object]:
+    grant = _grant_from_remote_claim(claim)
+    payload = _record_payload(grant, str(claim["targetIssue"]), str(claim["recordedAt"]))
+    payload.update(
+        {
+            "approvedReviewFile": claim["approvedReviewFile"],
+            "approvedReviewSha256": claim["approvedReviewSha256"],
+            "approvedSnapshotFile": claim["approvedSnapshotFile"],
+            "approvedSnapshotSha256": claim["approvedSnapshotSha256"],
+            "remoteClaimFile": claim["remoteClaimFile"],
+            "providerReceipt": claim["providerReceipt"],
+        }
+    )
+    return payload
+
+
+def confirm_remote_action(
+    repo_root: Path,
+    reservation: RemoteActionReservation,
+    *,
+    target_issue: str | None,
+    provider_receipt: dict[str, object],
+    reconciled: bool = False,
+) -> RemoteActionReservation:
+    root = repo_root.resolve()
+    grant = reservation.grant
+    target = _record_target_issue(grant, target_issue)
+    receipt = _canonical_provider_receipt(provider_receipt)
+    with _remote_action_lock(root, grant.approval_id):
+        claim = _parse_remote_claim(root, reservation.claim_path, grant.approval_issue)
+        _validate_remote_claim_grant(claim, grant)
+        allowed = {"reserved", "outcome-unknown"} if reconciled else {"reserved"}
+        if claim["state"] not in allowed or claim["attempt"] != reservation.attempt:
+            raise ValueError("remote approval reservation is not active")
+        recorded_at = _canonical_utc_now()
+        history_path = _history_path(root, target, grant.action, recorded_at, grant.approval_id)
+        claim.update(
+            {
+                "state": "remote-confirmed",
+                "targetIssue": target,
+                "providerReceipt": receipt,
+                "failureReason": "none",
+                "recordedAt": recorded_at,
+                "historyFile": history_path.relative_to(root).as_posix(),
+                "updatedAt": recorded_at,
+            }
+        )
+        history_bytes = _yaml_bytes(_remote_history_payload(claim))
+        claim["historySha256"] = hashlib.sha256(history_bytes).hexdigest()
+        _replace_bytes(reservation.claim_path, _remote_claim_bytes(claim))
+        return _reservation_from_claim(root, reservation.claim_path, claim)
+
+
+def complete_remote_action(repo_root: Path, reservation: RemoteActionReservation) -> Path:
+    root = repo_root.resolve()
+    grant = reservation.grant
+    with _remote_action_lock(root, grant.approval_id):
+        claim = _parse_remote_claim(root, reservation.claim_path, grant.approval_issue)
+        _validate_remote_claim_grant(claim, grant)
+        if claim["state"] == "completed":
+            raise ValueError(f"approval already consumed: {grant.approval_id}")
+        if claim["state"] != "remote-confirmed":
+            raise ValueError("remote approval has not been provider-confirmed")
+        history_path = require_safe_repo_path(root, root / Path(str(claim["historyFile"])), "remote approval history")
+        target_root = issue_dir(root, str(claim["targetIssue"]))
+        if history_path.parent != target_root / "approvals" / "history":
+            raise ValueError("remote approval history path does not match target Issue")
+        history_bytes = _yaml_bytes(_remote_history_payload(claim))
+        if hashlib.sha256(history_bytes).hexdigest() != claim["historySha256"]:
+            raise ValueError("remote approval claim does not seal exact history")
+        _publish_exact_artifact(
+            root,
+            target_root,
+            history_path,
+            history_bytes,
+            label="remote approval history",
+            collision_message="remote approval history collision",
+        )
+        claim.update({"state": "completed", "updatedAt": _canonical_utc_now()})
+        _replace_bytes(reservation.claim_path, _remote_claim_bytes(claim))
+        return history_path
+
+
 def _validate_acceptance_chronology(review_bytes: bytes, review_path: Path, claim: dict[str, object]) -> None:
     review_text = _decode_approval_bytes(review_bytes, review_path, "archived approved review")
     approved_at = _canonical_utc_timestamp(field(review_text, "Approved At"), "Approved At", microseconds=False)
@@ -1168,6 +1939,7 @@ def _finalize_contract_acceptance(
     issue: str,
     grant: ApprovalGrant,
     review_bytes: bytes,
+    contract_bytes: bytes,
     *,
     contract_id: str,
     contract_version: str,
@@ -1176,6 +1948,9 @@ def _finalize_contract_acceptance(
 ) -> Path:
     issue_root = issue_dir(repo_root, issue)
     review_sha256 = hashlib.sha256(review_bytes).hexdigest()
+    snapshot_sha256 = hashlib.sha256(contract_bytes).hexdigest()
+    if snapshot_sha256 != contract_sha256:
+        raise ValueError("contract snapshot bytes do not match accepted contract SHA256")
     claim_path = _contract_artifact_path(repo_root, issue, "claims", f"{grant.approval_id}.yaml")
     archived_review = _contract_artifact_path(
         repo_root,
@@ -1183,12 +1958,22 @@ def _finalize_contract_acceptance(
         "consumed",
         f"{grant.approval_id}-local-review.md",
     )
+    archived_contract = _contract_artifact_path(
+        repo_root,
+        issue,
+        "consumed",
+        f"{grant.approval_id}-contract.yaml",
+    )
     approved_review_file = archived_review.relative_to(issue_root).as_posix()
+    contract_snapshot_file = archived_contract.relative_to(issue_root).as_posix()
     approval_claim_file = claim_path.relative_to(issue_root).as_posix()
     claim_preexisting = claim_path.is_file()
 
     if claim_preexisting:
-        claim, _ = _parse_contract_claim(repo_root, claim_path, issue_root)
+        try:
+            claim, _ = _parse_contract_claim(repo_root, claim_path, issue_root)
+        except ValueError as exc:
+            raise ValueError(f"contract acceptance claim replay or tampering: {exc}") from exc
         expected_claim = {
             "approvalId": grant.approval_id,
             "repository": grant.repository,
@@ -1205,6 +1990,8 @@ def _finalize_contract_acceptance(
             "semanticDecision": "accepted-design",
             "approvedReviewFile": approved_review_file,
             "approvedReviewSha256": review_sha256,
+            "contractSnapshotFile": contract_snapshot_file,
+            "contractSnapshotSha256": snapshot_sha256,
         }
         if any(claim.get(name) != value for name, value in expected_claim.items()):
             raise ValueError("contract acceptance claim replay or tampering")
@@ -1223,6 +2010,8 @@ def _finalize_contract_acceptance(
             accepted_objects=normalized_objects,
             approved_review_file=approved_review_file,
             approved_review_sha256=review_sha256,
+            contract_snapshot_file=contract_snapshot_file,
+            contract_snapshot_sha256=snapshot_sha256,
             approval_claim_file=approval_claim_file,
         )
         history_bytes = _yaml_bytes(history_payload)
@@ -1244,6 +2033,8 @@ def _finalize_contract_acceptance(
             accepted_objects=normalized_objects,
             approved_review_file=approved_review_file,
             approved_review_sha256=review_sha256,
+            contract_snapshot_file=contract_snapshot_file,
+            contract_snapshot_sha256=snapshot_sha256,
             approval_claim_file=approval_claim_file,
         )
         history_bytes = _yaml_bytes(history_payload)
@@ -1256,6 +2047,8 @@ def _finalize_contract_acceptance(
             accepted_objects=normalized_objects,
             approved_review_file=approved_review_file,
             approved_review_sha256=review_sha256,
+            contract_snapshot_file=contract_snapshot_file,
+            contract_snapshot_sha256=snapshot_sha256,
             claimed_at=claimed_at,
             recorded_at=recorded_at,
             history_file=history_relative,
@@ -1272,7 +2065,20 @@ def _finalize_contract_acceptance(
             if existing_claim != claim_bytes:
                 raise ValueError(f"approval already claimed: {grant.approval_id}") from None
 
-    complete_before_retry = claim_preexisting and archived_review.is_file() and history_file.is_file()
+    complete_before_retry = (
+        claim_preexisting
+        and archived_review.is_file()
+        and archived_contract.is_file()
+        and history_file.is_file()
+    )
+    _publish_exact_artifact(
+        repo_root,
+        issue_root,
+        archived_contract,
+        contract_bytes,
+        label="archived contract snapshot",
+        collision_message="archived contract snapshot collision",
+    )
     _publish_exact_artifact(
         repo_root,
         issue_root,
@@ -1303,6 +2109,7 @@ def consume_contract_acceptance(
     contract_version: str,
     contract_sha256: str,
     accepted_objects: tuple[str, ...],
+    contract_bytes: bytes,
 ) -> Path:
     repo_root = repo_root.resolve()
     issue = normalized_issue(issue)
@@ -1313,6 +2120,8 @@ def consume_contract_acceptance(
     normalized_objects = normalize_accepted_objects(accepted_objects)
     if normalized_objects != accepted_objects:
         raise ValueError("contract acceptance requires a normalized accepted object set")
+    if not isinstance(contract_bytes, bytes) or hashlib.sha256(contract_bytes).hexdigest() != contract_sha256:
+        raise ValueError("contract acceptance requires exact contract snapshot bytes")
     grant, _, review_bytes = _contract_local_grant(
         repo_root,
         approved_file,
@@ -1321,17 +2130,345 @@ def consume_contract_acceptance(
         expected_objects=normalized_objects,
     )
     claim_path = _contract_artifact_path(repo_root, issue, "claims", f"{grant.approval_id}.yaml")
-    with _contract_claim_lock(repo_root, claim_path, grant.approval_id):
+    with _contract_claim_lock(repo_root, grant.approval_id):
         return _finalize_contract_acceptance(
             repo_root,
             issue,
             grant,
             review_bytes,
+            contract_bytes,
             contract_id=contract_id,
             contract_version=contract_version,
             contract_sha256=contract_sha256,
             normalized_objects=normalized_objects,
         )
+
+
+@contextmanager
+def _gap_recognition_lock(repo_root: Path, approval_id: str) -> Iterator[None]:
+    bindings = resolve_bindings(repo_root)
+    common_dir = git_path(repo_root, "--git-common-dir")
+    lock_path = (
+        common_dir
+        / "xflow"
+        / "runtime"
+        / "gap-recognition"
+        / bindings.worktree
+        / f"{approval_id}.lock"
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    try:
+        if handle.seek(0, os.SEEK_END) == 0:
+            handle.write(b"0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise ValueError(f"approval already claimed: {approval_id}") from None
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+        lock_path.unlink(missing_ok=True)
+
+
+def _gap_local_grant(
+    repo_root: Path,
+    issue: str,
+    gap_path: Path,
+    expected_sha256: str,
+) -> tuple[ApprovalGrant, bytes]:
+    issue_root = issue_dir(repo_root, issue)
+    review_file = default_approval_file(repo_root, issue)
+    if not review_file.is_file():
+        raise ValueError(f"local review approval required: {review_file}")
+    review_bytes = _stable_approval_bytes(repo_root, review_file, issue_root, "approval review")
+    text = _decode_approval_bytes(review_bytes, review_file, "approval review")
+    if field(text, "Approved Action") != "gap-recognition":
+        raise ValueError(
+            f"action mismatch: expected exact gap-recognition, got {field(text, 'Approved Action')}"
+        )
+    bindings = resolve_bindings(repo_root)
+    approved_path, approved_hash = _validate_review_text(
+        repo_root,
+        issue,
+        gap_path,
+        None,
+        text,
+        bindings,
+        expected_sha256,
+    )
+    check_reviewed_task_binding(repo_root, issue, "gap-recognition")
+    grant = ApprovalGrant(
+        source="local-review",
+        approval_id=field(text, "Approval ID"),
+        repository=bindings.repository,
+        worktree=bindings.worktree,
+        branch=bindings.branch,
+        approval_issue=issue,
+        action="gap-recognition",
+        approved_file=display_path(repo_root, approved_path),
+        approved_sha256=approved_hash,
+        reviewer_summary=safe_reviewer_summary(field(text, "Reviewer")),
+    )
+    _validate_grant(grant)
+    return grant, review_bytes
+
+
+def consume_gap_recognition(repo_root: Path, issue: str, gap_file: Path) -> Path:
+    from .checks import validate_gap_analysis_snapshot
+    from .local_artifacts import revalidate_snapshots
+
+    root = repo_root.resolve()
+    issue = normalized_issue(issue)
+    issue_root = issue_dir(root, issue)
+    expected_gap = issue_root / "gap-analysis.md"
+    gap_path = resolve_path(root, gap_file)
+    if gap_path != expected_gap:
+        raise ValueError("gap recognition requires the canonical Issue gap-analysis.md")
+    gap_snapshot = capture_stable_file(
+        root,
+        gap_path,
+        issue_root,
+        "gap analysis",
+        max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+    )
+    supporting = validate_gap_analysis_snapshot(root, issue, gap_snapshot)
+    gap_bytes = gap_snapshot.content or b""
+    gap_sha256 = hashlib.sha256(gap_bytes).hexdigest()
+    grant, review_bytes = _gap_local_grant(root, issue, gap_path, gap_sha256)
+    review_sha256 = hashlib.sha256(review_bytes).hexdigest()
+
+    with _gap_recognition_lock(root, grant.approval_id):
+        reject_consumed_approval(root, grant.approval_id)
+        revalidate_snapshots(root, (gap_snapshot, *supporting), "gap recognition")
+        recorded_at = _canonical_utc_now()
+        history_file = _history_path(root, issue, "gap-recognition", recorded_at, grant.approval_id)
+        archived_review = _contract_artifact_path(
+            root,
+            issue,
+            "consumed",
+            f"{grant.approval_id}-gap-recognition-local-review.md",
+        )
+        archived_gap = _contract_artifact_path(
+            root,
+            issue,
+            "consumed",
+            f"{grant.approval_id}-gap-analysis.md",
+        )
+        payload = _record_payload(grant, issue, recorded_at)
+        payload.update(
+            {
+                "semanticDecision": "gap-recognized",
+                "approvedReviewFile": archived_review.relative_to(issue_root).as_posix(),
+                "approvedReviewSha256": review_sha256,
+                "gapSnapshotFile": archived_gap.relative_to(issue_root).as_posix(),
+                "gapSnapshotSha256": gap_sha256,
+            }
+        )
+        history_bytes = _yaml_bytes(payload)
+        _publish_exact_artifact(
+            root,
+            issue_root,
+            archived_review,
+            review_bytes,
+            label="archived gap review",
+            collision_message="archived gap approval collision",
+        )
+        _publish_exact_artifact(
+            root,
+            issue_root,
+            archived_gap,
+            gap_bytes,
+            label="archived gap analysis",
+            collision_message="archived gap analysis collision",
+        )
+        _publish_exact_artifact(
+            root,
+            issue_root,
+            history_file,
+            history_bytes,
+            label="gap recognition history",
+            collision_message="gap recognition history collision",
+        )
+        return history_file
+
+
+def validate_gap_recognition_history(
+    repo_root: Path,
+    path: Path,
+    *,
+    history_snapshot: StableFileSnapshot | None = None,
+) -> tuple[dict[str, object], tuple[StableFileSnapshot, ...]]:
+    root = repo_root.resolve()
+    record, _ = _parse_history_snapshot(
+        root,
+        path,
+        history_snapshot.content if history_snapshot is not None else None,
+    )
+    if record.get("action") != "gap-recognition" or record.get("source") != "local-review":
+        raise ValueError("record is not a local gap recognition")
+    issue = normalized_issue(str(record["issue"]))
+    issue_root = issue_dir(root, issue)
+    approval_id = str(record["approvalId"])
+    review_path = _contract_history_artifact(
+        root,
+        issue_root,
+        record["approvedReviewFile"],
+        "consumed",
+        f"{approval_id}-gap-recognition-local-review.md",
+    )
+    review_snapshot = capture_stable_file(
+        root,
+        review_path,
+        issue_root,
+        "archived gap review",
+        max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+    )
+    review_bytes = review_snapshot.content or b""
+    if hashlib.sha256(review_bytes).hexdigest() != record["approvedReviewSha256"]:
+        raise ValueError("archived gap review SHA256 mismatch")
+    review_text = _decode_approval_bytes(review_bytes, review_path, "archived gap review")
+    if field(review_text, "Approved Action") != "gap-recognition":
+        raise ValueError("archived gap review action mismatch")
+    if field(review_text, "Approval ID") != approval_id:
+        raise ValueError("archived gap review approval ID mismatch")
+    bindings = GitBindings(
+        repository=str(record["repository"]),
+        worktree=str(record["worktree"]),
+        branch=str(record["branch"]),
+    )
+    _validate_review_text(
+        root,
+        issue,
+        Path(str(record["approvedFile"])),
+        None,
+        review_text,
+        bindings,
+        str(record["approvedSha256"]),
+    )
+
+    gap_snapshot_path = _contract_history_artifact(
+        root,
+        issue_root,
+        record["gapSnapshotFile"],
+        "consumed",
+        f"{approval_id}-gap-analysis.md",
+    )
+    gap_snapshot = capture_stable_file(
+        root,
+        gap_snapshot_path,
+        issue_root,
+        "archived gap analysis",
+        max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+    )
+    if hashlib.sha256(gap_snapshot.content or b"").hexdigest() != record["gapSnapshotSha256"]:
+        raise ValueError("archived gap analysis SHA256 mismatch")
+    if record["gapSnapshotSha256"] != record["approvedSha256"]:
+        raise ValueError("gap recognition snapshot does not match approved bytes")
+    return record, (review_snapshot, gap_snapshot)
+
+
+def validate_task_gap_recognition(
+    repo_root: Path,
+    issue: str,
+    approval_reference: str,
+    *,
+    binding_mode: str = "current",
+    recorded_branch: str | None = None,
+) -> None:
+    validate_task_gap_recognition_snapshots(
+        repo_root,
+        issue,
+        approval_reference,
+        binding_mode=binding_mode,
+        recorded_branch=recorded_branch,
+    )
+
+
+def validate_task_gap_recognition_snapshots(
+    repo_root: Path,
+    issue: str,
+    approval_reference: str,
+    *,
+    binding_mode: str = "current",
+    recorded_branch: str | None = None,
+) -> tuple[StableFileSnapshot, ...]:
+    from .checks import validate_gap_analysis_snapshot
+
+    root = repo_root.resolve()
+    issue = normalized_issue(issue)
+    issue_root = issue_dir(root, issue)
+    history_path = require_safe_repo_path(root, issue_root / Path(approval_reference), "Human Approval Ref")
+    try:
+        history_path.relative_to(issue_root / "approvals" / "history")
+    except ValueError as exc:
+        raise ValueError("missing matching human gap recognition") from exc
+    try:
+        history_snapshot = capture_stable_file(
+            root,
+            history_path,
+            issue_root,
+            "gap recognition reference",
+            max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+        )
+        record, support = validate_gap_recognition_history(
+            root,
+            history_path,
+            history_snapshot=history_snapshot,
+        )
+        current_gap = capture_stable_file(
+            root,
+            issue_root / "gap-analysis.md",
+            issue_root,
+            "gap analysis",
+            max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+        )
+        evidence = validate_gap_analysis_snapshot(root, issue, current_gap)
+    except ValueError as exc:
+        raise ValueError(f"missing matching human gap recognition: {exc}") from exc
+    bindings = resolve_bindings(root)
+    expected: dict[str, object] = {
+        "repository": bindings.repository,
+        "issue": issue,
+        "approvalIssue": issue,
+        "action": "gap-recognition",
+        "source": "local-review",
+        "semanticDecision": "gap-recognized",
+        "approvedFile": display_path(root, issue_root / "gap-analysis.md"),
+        "approvedSha256": hashlib.sha256(current_gap.content or b"").hexdigest(),
+    }
+    if binding_mode == "current":
+        expected.update({"worktree": bindings.worktree, "branch": bindings.branch})
+    elif binding_mode == "recorded":
+        if not recorded_branch:
+            raise ValueError("missing matching human gap recognition: missing recorded task branch")
+        expected["branch"] = recorded_branch
+    else:
+        raise ValueError(f"invalid gap recognition binding mode: {binding_mode}")
+    if any(record.get(name) != value for name, value in expected.items()):
+        raise ValueError("missing matching human gap recognition")
+    return (current_gap, history_snapshot, *support, *evidence)
 
 
 def parse_contract_acceptance_history(repo_root: Path, path: Path) -> dict[str, object]:
@@ -1379,7 +2516,15 @@ def _parse_contract_claim(
         raise ValueError("contract acceptance claim has unexpected or missing fields")
     if payload["version"] != "0.1.0" or payload["reusable"] is not False:
         raise ValueError("contract acceptance claim has invalid fixed fields")
-    for name in ("repository", "worktree", "approvedSha256", "contractSha256", "approvedReviewSha256", "historySha256"):
+    for name in (
+        "repository",
+        "worktree",
+        "approvedSha256",
+        "contractSha256",
+        "approvedReviewSha256",
+        "contractSnapshotSha256",
+        "historySha256",
+    ):
         if not isinstance(payload[name], str) or not FINGERPRINT_RE.fullmatch(payload[name]):
             raise ValueError(f"contract acceptance claim has invalid {name}")
     if not isinstance(payload["approvalId"], str) or not APPROVAL_ID_RE.fullmatch(payload["approvalId"]):
@@ -1394,10 +2539,13 @@ def _parse_contract_claim(
         "contractId",
         "contractVersion",
         "approvedReviewFile",
+        "contractSnapshotFile",
         "historyFile",
     ):
         if not isinstance(payload[name], str) or not payload[name]:
             raise ValueError(f"contract acceptance claim has invalid {name}")
+    if payload["contractSnapshotSha256"] != payload["contractSha256"]:
+        raise ValueError("contract acceptance claim snapshot SHA256 mismatch")
     _canonical_utc_timestamp(payload["claimedAt"], "claimedAt", microseconds=True)
     _canonical_utc_timestamp(payload["recordedAt"], "recordedAt", microseconds=True)
     accepted = payload["acceptedObjects"]
@@ -1475,6 +2623,28 @@ def validate_contract_acceptance_history(
     if safe_reviewer_summary(field(review_text, "Reviewer")) != record["reviewerSummary"]:
         raise ValueError("archived approved review reviewer mismatch")
 
+    contract_snapshot_path = _contract_history_artifact(
+        repo_root,
+        issue_root,
+        record["contractSnapshotFile"],
+        "consumed",
+        f"{approval_id}-contract.yaml",
+    )
+    contract_snapshot = capture_stable_file(
+        repo_root,
+        contract_snapshot_path,
+        issue_root,
+        "archived contract snapshot",
+        max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+    )
+    snapshot_sha256 = hashlib.sha256(contract_snapshot.content or b"").hexdigest()
+    if (
+        snapshot_sha256 != record["contractSnapshotSha256"]
+        or snapshot_sha256 != record["contractSha256"]
+        or snapshot_sha256 != record["approvedSha256"]
+    ):
+        raise ValueError("archived contract snapshot SHA256 mismatch")
+
     claim_path = _contract_history_artifact(
         repo_root,
         issue_root,
@@ -1506,6 +2676,8 @@ def validate_contract_acceptance_history(
         "semanticDecision": record["semanticDecision"],
         "approvedReviewFile": record["approvedReviewFile"],
         "approvedReviewSha256": record["approvedReviewSha256"],
+        "contractSnapshotFile": record["contractSnapshotFile"],
+        "contractSnapshotSha256": record["contractSnapshotSha256"],
     }
     if any(claim.get(name) != value for name, value in inherited.items()):
         raise ValueError("contract acceptance claim does not match history")
@@ -1518,7 +2690,7 @@ def validate_contract_acceptance_history(
         raise ValueError("contract acceptance claim does not seal exact history")
     _validate_acceptance_chronology(review_bytes, review_path, claim)
     if return_snapshots:
-        return record, (review_snapshot, claim_snapshot)
+        return record, (review_snapshot, contract_snapshot, claim_snapshot)
     return record
 
 
@@ -1548,7 +2720,9 @@ def record_subordinate_effect(
         parent_grant.approval_issue,
         str(parent_records[0]["recordedAt"]),
     )
-    if len(parent_records) != 1 or parent_records[0] != expected_parent:
+    if len(parent_records) != 1 or any(
+        parent_records[0].get(name) != value for name, value in expected_parent.items()
+    ):
         raise ValueError("git-state-backfill parent approval snapshot mismatch")
     if any(
         record["source"] == "effect"

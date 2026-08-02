@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -35,7 +36,7 @@ from .collaboration import (
 from .env import RuntimeContext, load_env_files, python_version, token_status_lines
 from .dependencies import check_dependencies
 from .migration import apply_issue_workspace_migration, inspect, inspect_issue_workspace_migration, write_wrappers
-from .paths import default_issue_file, normalized_issue
+from .paths import default_issue_file, normalized_issue, task_state_file
 from .task_state import (
     TaskState,
     _capture_file,
@@ -47,6 +48,7 @@ from .task_state import (
     load_active_task,
     load_active_task_snapshot,
     migrate_legacy_current_task,
+    parse_task_state,
     task_authority_issues,
 )
 
@@ -185,6 +187,12 @@ def build_parser() -> argparse.ArgumentParser:
     contract_diff.add_argument("--old", required=True, type=Path)
     contract_diff.add_argument("--new", required=True, type=Path)
 
+    gap = sub.add_parser("gap")
+    gap_sub = gap.add_subparsers(dest="gap_command", required=True)
+    gap_recognize = gap_sub.add_parser("recognize")
+    gap_recognize.add_argument("--issue", required=True)
+    gap_recognize.add_argument("--file", required=True, type=Path)
+
     trace = sub.add_parser("trace")
     trace_sub = trace.add_subparsers(dest="trace_command", required=True)
     trace_check = trace_sub.add_parser("check")
@@ -243,10 +251,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     git = sub.add_parser("git")
     git_sub = git.add_subparsers(dest="git_command")
-    git_start = git_sub.add_parser("start")
+    git_start = git_sub.add_parser(
+        "start",
+        help="create and activate an approved final task branch without implementation or remote write",
+    )
     git_start.add_argument("slug")
     git_start.add_argument("--issue")
     git_start.add_argument("--base")
+    git_start.add_argument(
+        "--file",
+        type=Path,
+        help="canonical task-state.md approved for task-branch-start",
+    )
     git_commit_msg = git_sub.add_parser("commit-msg")
     git_commit_msg.add_argument("-a", "--all", action="store_true")
     git_commit_msg.add_argument("-c", "--commit", action="store_true")
@@ -289,6 +305,13 @@ def build_parser() -> argparse.ArgumentParser:
     approval_prepare.add_argument("--force", action="store_true")
     approval_prepare.add_argument("--attachments", type=Path)
     approval_prepare.add_argument("--objects")
+    approval_reconcile = approval_sub.add_parser("reconcile")
+    approval_reconcile.add_argument("--issue", required=True)
+    approval_reconcile.add_argument("--approval-id", required=True)
+    approval_reconcile.add_argument("--outcome", choices=("no-effect", "success"), required=True)
+    approval_reconcile.add_argument("--confirm", required=True)
+    approval_reconcile.add_argument("--target-issue")
+    approval_reconcile.add_argument("--provider-receipt")
 
     attachment_parser = sub.add_parser("attachment")
     attachment_sub = attachment_parser.add_subparsers(dest="attachment_command")
@@ -463,6 +486,9 @@ def run_hook(args: argparse.Namespace) -> int:
     if args.hook_command != "task-status":
         raise ValueError(f"unknown hook subcommand: {args.hook_command}")
     bindings, state = load_active_task_snapshot(context().repo_root)
+    from .semantic_routes import require_route_semantics
+
+    require_route_semantics(state, "commit")
     _print_task_status(bindings, state)
     return 0
 
@@ -485,6 +511,15 @@ def run_contract(args: argparse.Namespace) -> int:
         print(f"[INFO] contract acceptance recorded: {record}")
         return 0
     raise ValueError(f"unknown contract subcommand: {args.contract_command}")
+
+
+def run_gap(args: argparse.Namespace) -> int:
+    if args.gap_command != "recognize":
+        raise ValueError(f"unknown gap subcommand: {args.gap_command}")
+    ctx = context()
+    record = approval.consume_gap_recognition(ctx.repo_root, args.issue, args.file)
+    print(f"[INFO] gap recognition recorded: {record}")
+    return 0
 
 
 def run_trace(args: argparse.Namespace) -> int:
@@ -600,6 +635,55 @@ def check_action_current_task(repo_root: Path, issue: str) -> None:
         check_current_task(repo_root, issue)
 
 
+def begin_remote_action(
+    repo_root: Path,
+    grant: approval.ApprovalGrant,
+) -> tuple[approval.RemoteActionReservation | None, dict[str, object] | None]:
+    if grant.source != "local-review":
+        return None, None
+    reservation = approval.reserve_remote_action(repo_root, grant)
+    if reservation.provider_required:
+        return reservation, None
+    receipt = json.loads(reservation.provider_receipt)
+    if not isinstance(receipt, dict):
+        raise ValueError("confirmed provider receipt must be a mapping")
+    approval.complete_remote_action(repo_root, reservation)
+    return reservation, receipt
+
+
+def finish_remote_action(
+    repo_root: Path,
+    grant: approval.ApprovalGrant,
+    reservation: approval.RemoteActionReservation | None,
+    *,
+    target_issue: str | None,
+    provider_receipt: dict[str, object],
+) -> None:
+    if reservation is None:
+        approval.record_consumed_approval(repo_root, grant, "success", target_issue=target_issue)
+        return
+    confirmed = approval.confirm_remote_action(
+        repo_root,
+        reservation,
+        target_issue=target_issue,
+        provider_receipt=provider_receipt,
+    )
+    approval.complete_remote_action(repo_root, confirmed)
+
+
+def mark_remote_outcome_unknown(
+    repo_root: Path,
+    reservation: approval.RemoteActionReservation | None,
+    exc: BaseException,
+) -> None:
+    if reservation is None:
+        return
+    try:
+        approval.mark_remote_action_unknown(repo_root, reservation, str(exc))
+    except ValueError:
+        pass
+
+
 def run_issue(args: argparse.Namespace) -> int:
     ctx = context()
     if args.issue_command == "list":
@@ -637,8 +721,23 @@ def run_issue(args: argparse.Namespace) -> int:
         if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
             print("[INFO] issue-comment gate passed; provider skipped")
             return 0
-        result = providers.comment_issue(ctx.repo_root, issue_id, body, os.environ)
-        approval.record_consumed_approval(ctx.repo_root, grant, "success")
+        reservation, recovered = begin_remote_action(ctx.repo_root, grant)
+        if recovered is None:
+            provider_body = reservation.approved_text() if reservation is not None else body
+            try:
+                result = providers.comment_issue(ctx.repo_root, issue_id, provider_body, os.environ)
+            except BaseException as exc:
+                mark_remote_outcome_unknown(ctx.repo_root, reservation, exc)
+                raise
+            finish_remote_action(
+                ctx.repo_root,
+                grant,
+                reservation,
+                target_issue=None,
+                provider_receipt={"html_url": str(result.get("html_url", "")), "issue": issue_id},
+            )
+        else:
+            result = recovered
         print(f"[INFO] Comment posted on Issue #{issue_id}")
         if result.get("html_url"):
             print(f"[INFO] {result['html_url']}")
@@ -651,8 +750,22 @@ def run_issue(args: argparse.Namespace) -> int:
         if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
             print("[INFO] issue-close gate passed; provider skipped")
             return 0
-        result = providers.close_issue(ctx.repo_root, issue_id, os.environ)
-        approval.record_consumed_approval(ctx.repo_root, grant, "success")
+        reservation, recovered = begin_remote_action(ctx.repo_root, grant)
+        if recovered is None:
+            try:
+                result = providers.close_issue(ctx.repo_root, issue_id, os.environ)
+            except BaseException as exc:
+                mark_remote_outcome_unknown(ctx.repo_root, reservation, exc)
+                raise
+            finish_remote_action(
+                ctx.repo_root,
+                grant,
+                reservation,
+                target_issue=None,
+                provider_receipt={"issue": issue_id, "state": str(result.get("state", "closed"))},
+            )
+        else:
+            result = recovered
         unattended.disable(ctx.repo_root)
         print(f"[INFO] Issue #{result.get('number', issue_id)} closed")
         return 0
@@ -674,9 +787,25 @@ def run_issue(args: argparse.Namespace) -> int:
     if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
         print("[INFO] issue-create gate passed; provider skipped")
         return 0
-    result = providers.create_issue(ctx.repo_root, args.title, body, args.labels, os.environ)
-    created_issue = normalized_issue(result.number)
-    approval.record_consumed_approval(ctx.repo_root, grant, "success", target_issue=created_issue)
+    reservation, recovered = begin_remote_action(ctx.repo_root, grant)
+    if recovered is None:
+        provider_body = reservation.approved_text() if reservation is not None else body
+        try:
+            result = providers.create_issue(ctx.repo_root, args.title, provider_body, args.labels, os.environ)
+        except BaseException as exc:
+            mark_remote_outcome_unknown(ctx.repo_root, reservation, exc)
+            raise
+        created_issue = normalized_issue(result.number)
+        finish_remote_action(
+            ctx.repo_root,
+            grant,
+            reservation,
+            target_issue=created_issue,
+            provider_receipt={"html_url": result.html_url, "number": created_issue},
+        )
+    else:
+        created_issue = normalized_issue(str(recovered["number"]))
+        result = providers.IssueResult(created_issue, str(recovered.get("html_url", "")))
     if grant.source == "unattended":
         unattended.migrate_issue(ctx.repo_root, issue_id, result.number)
     print(f"[INFO] Issue #{result.number} created")
@@ -1032,11 +1161,28 @@ def run_git_push(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     if branch == base:
         raise ValueError(f"current branch is {base}; start a task branch before pushing")
     grant = approval.require_remote_or_unattended(ctx.repo_root, "git-push", approved_file, issue)
-    push_result = push_branch(ctx.repo_root, branch)
+    reservation, recovered = begin_remote_action(ctx.repo_root, grant)
+    if recovered is not None:
+        push_result = PushResult(performed=True, success=True)
+    else:
+        try:
+            push_result = push_branch(ctx.repo_root, branch)
+        except BaseException as exc:
+            mark_remote_outcome_unknown(ctx.repo_root, reservation, exc)
+            raise
     if push_result.performed and push_result.success:
-        approval.record_consumed_approval(ctx.repo_root, grant, "success")
+        if recovered is None:
+            finish_remote_action(
+                ctx.repo_root,
+                grant,
+                reservation,
+                target_issue=None,
+                provider_receipt={"branch": branch, "result": "pushed"},
+            )
         print(f"[INFO] pushed {branch}")
     else:
+        if reservation is not None:
+            approval.mark_remote_action_retryable(ctx.repo_root, reservation, "git push was skipped before remote effect")
         print(f"[INFO] push skipped for {branch}")
     return 0
 
@@ -1044,8 +1190,38 @@ def run_git_push(ctx: RuntimeContext, args: argparse.Namespace) -> int:
 def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     base = args.base or default_base(ctx.repo_root)
     branch = branch_name_from_slug(args.slug, args.issue)
-    require_clean_worktree(ctx.repo_root)
+    branch_grant: approval.ApprovalGrant | None = None
+    issue = normalized_issue(args.issue) if args.issue else None
+    state_path = task_state_file(ctx.repo_root, issue) if issue else None
+    if state_path is not None and state_path.is_file():
+        state = parse_task_state(state_path, binding_mode="recorded")
+        classification = check_classification(ctx.repo_root, issue)
+        if state.classification != classification.classification:
+            raise ValueError("task-state Classification does not match canonical classification")
+        if state.classification == "capability-change":
+            if args.file is None:
+                raise ValueError("first capability task branch requires --file with canonical task-state.md")
+            allowed_prefix = f".xflow/issues/issue-{issue}/"
+            unexpected = [path for path in changed_paths(ctx.repo_root) if not path.startswith(allowed_prefix)]
+            if unexpected:
+                raise ValueError(
+                    "task branch identity step may only change the matching Issue workspace; "
+                    f"found {unexpected}"
+                )
+            branch_grant = approval.require_task_branch_start(
+                ctx.repo_root,
+                issue,
+                args.file,
+                branch,
+                base,
+            )
+        else:
+            require_clean_worktree(ctx.repo_root)
+    else:
+        require_clean_worktree(ctx.repo_root)
     current = current_branch(ctx.repo_root)
+    if branch_grant is not None and current != base:
+        raise ValueError(f"task branch identity approval requires active base branch {base}")
     if current != base:
         print(f"[INFO] checkout {base}")
         git_run(ctx.repo_root, ["checkout", base])
@@ -1060,6 +1236,9 @@ def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
         set_branch_meta(ctx.repo_root, "issue", args.issue)
     set_branch_meta(ctx.repo_root, "base", base)
     unattended.disable(ctx.repo_root)
+    if branch_grant is not None:
+        activate_task(ctx.repo_root, issue)
+        approval.record_consumed_approval(ctx.repo_root, branch_grant, "success")
     print("[INFO] ready")
     return 0
 
@@ -1102,6 +1281,9 @@ def run_git_commit_msg(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     print(f"  {message}")
     print()
     if args.commit:
+        issue = branch_meta(ctx.repo_root, "issue")
+        if approval.task_binding_evidence_exists(ctx.repo_root):
+            approval.check_reviewed_task_binding(ctx.repo_root, issue, "commit")
         git_run(ctx.repo_root, ["commit", "-m", message])
         print("[INFO] committed")
     else:
@@ -1194,15 +1376,33 @@ def _run_git(ctx: RuntimeContext, args: argparse.Namespace) -> int:
         if remote_pr.base != base:
             raise ValueError(f"pull request base branch mismatch: expected {base}, got {remote_pr.base}")
         grant = approval.require_remote_or_unattended(ctx.repo_root, "git-pr-merge", approved_file, issue)
-        result = providers.merge_pull_request(
-            ctx.repo_root,
-            requested_pr,
-            args.method,
-            args.commit_title,
-            args.commit_message,
-            os.environ,
-        )
-        approval.record_consumed_approval(ctx.repo_root, grant, "success")
+        reservation, recovered = begin_remote_action(ctx.repo_root, grant)
+        if recovered is None:
+            try:
+                result = providers.merge_pull_request(
+                    ctx.repo_root,
+                    requested_pr,
+                    args.method,
+                    args.commit_title,
+                    args.commit_message,
+                    os.environ,
+                )
+            except BaseException as exc:
+                mark_remote_outcome_unknown(ctx.repo_root, reservation, exc)
+                raise
+            finish_remote_action(
+                ctx.repo_root,
+                grant,
+                reservation,
+                target_issue=None,
+                provider_receipt={
+                    "message": str(result.get("message", "")),
+                    "number": requested_pr,
+                    "sha": str(result.get("sha", "")),
+                },
+            )
+        else:
+            result = recovered
         print(f"[INFO] PR #{args.number} merged")
         if result.get("sha"):
             print(f"[INFO] merge sha: {result['sha']}")
@@ -1239,8 +1439,23 @@ def _run_git(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
         print("[INFO] git-mr gate passed; provider skipped")
         return 0
-    result = providers.create_pull_request(ctx.repo_root, title, body_file.read_text(encoding="utf-8"), branch, base, os.environ)
-    approval.record_consumed_approval(ctx.repo_root, grant, "success")
+    reservation, recovered = begin_remote_action(ctx.repo_root, grant)
+    if recovered is None:
+        provider_body = reservation.approved_text() if reservation is not None else body_file.read_text(encoding="utf-8")
+        try:
+            result = providers.create_pull_request(ctx.repo_root, title, provider_body, branch, base, os.environ)
+        except BaseException as exc:
+            mark_remote_outcome_unknown(ctx.repo_root, reservation, exc)
+            raise
+        finish_remote_action(
+            ctx.repo_root,
+            grant,
+            reservation,
+            target_issue=None,
+            provider_receipt={"html_url": result.html_url, "number": result.number},
+        )
+    else:
+        result = providers.PullRequestResult(str(recovered["number"]), str(recovered.get("html_url", "")))
     set_branch_meta(ctx.repo_root, "pr", result.number)
     if result.html_url:
         set_branch_meta(ctx.repo_root, "pr-url", result.html_url)
@@ -1274,6 +1489,32 @@ def run_git(args: argparse.Namespace) -> int:
 
 def run_approval(args: argparse.Namespace) -> int:
     ctx = context()
+    if args.approval_command == "reconcile":
+        provider_receipt: dict[str, object] | None = None
+        if args.outcome == "no-effect":
+            if args.target_issue or args.provider_receipt:
+                raise ValueError("no-effect reconciliation does not accept provider outcome fields")
+        else:
+            if not args.provider_receipt:
+                raise ValueError("success reconciliation requires --provider-receipt JSON")
+            try:
+                decoded_receipt = json.loads(args.provider_receipt)
+            except json.JSONDecodeError as exc:
+                raise ValueError("--provider-receipt must be valid JSON") from exc
+            if not isinstance(decoded_receipt, dict) or not decoded_receipt:
+                raise ValueError("--provider-receipt must be a non-empty JSON object")
+            provider_receipt = decoded_receipt
+        result = approval.reconcile_remote_action_by_id(
+            ctx.repo_root,
+            args.issue,
+            args.approval_id,
+            outcome=args.outcome,
+            confirmation=args.confirm,
+            target_issue=args.target_issue,
+            provider_receipt=provider_receipt,
+        )
+        print(f"[INFO] remote approval reconciled: {result}")
+        return 0
     if args.approval_command != "prepare":
         raise ValueError(f"unknown approval subcommand: {args.approval_command}")
     accepted_objects: tuple[str, ...] | None = None
@@ -1457,6 +1698,8 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         return run_hook(args)
     if args.command == "contract":
         return run_contract(args)
+    if args.command == "gap":
+        return run_gap(args)
     if args.command == "trace":
         return run_trace(args)
     if args.command == "issue":

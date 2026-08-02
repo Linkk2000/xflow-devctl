@@ -190,12 +190,14 @@ def check_current_task(repo_root: Path, issue: str | None = None, *, check_stale
     )
     from .bindings import resolve_bindings
     from .paths import active_task_pointer_file
+    from .semantic_routes import require_route_semantics
 
     bindings = resolve_bindings(repo_root)
     pointer = active_task_pointer_file(repo_root, bindings.worktree)
     pointer_snapshot, legacy_pointer_snapshot = _pointer_snapshots(repo_root, bindings)
     if pointer_snapshot.exists or legacy_pointer_snapshot.exists:
-        check_task_binding(repo_root, issue)
+        state = check_task_binding(repo_root, issue)
+        require_route_semantics(state, "current-task")
         return
     if task_authority_issues(repo_root):
         raise ValueError(f"missing active task pointer: {pointer}")

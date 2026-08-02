@@ -29,7 +29,7 @@
     "id": {
       "type": "string",
       "minLength": 1,
-      "pattern": "^(?!(?:-|[Nn]/[Aa]|[Nn][Aa]|[Nn][Oo][Nn][Ee]|[Pp][Ll][Aa][Cc][Ee][Hh][Oo][Ll][Dd][Ee][Rr]|[Tt][Bb][Dd]|[Tt][Oo][Dd][Oo]|[Uu][Nn][Kk][Nn][Oo][Ww][Nn]|待定|待补充|占位)(?![\\s\\S]))\\S+(?![\\s\\S])"
+      "pattern": "^(?!(?:na|none|placeholder|tbd|todo|unknown)(?![\\s\\S]))[a-z0-9]+(?:[.-][a-z0-9]+)*(?![\\s\\S])"
     },
     "semver": {"type": "string", "pattern": "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?![\\s\\S])"},
     "text": {

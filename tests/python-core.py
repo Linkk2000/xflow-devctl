@@ -1569,7 +1569,7 @@ contractSearch:
 classification: ui-defect
 contractChangeRequired: false
 reason: The implementation must close the existing contract.
-nextArtifact: issue-draft.md
+nextArtifact: lightweight-route-complete
 decisionSource: ai-proposed
 """,
     )
@@ -2242,10 +2242,10 @@ def test_git_push_and_mr_are_separate_with_state_backfill(parent: Path) -> None:
         issue="8",
         execution_state="S6_PREPARE_COMMIT_AND_MR_DRAFT",
         semantic_phase="classified",
-        classification="capability-change",
+        classification="ui-defect",
         contract="example.contract.approval-history@0.1.0",
         contract_file="docs/requirements/example/contract.yaml",
-        contract_change_required=True,
+        contract_change_required=False,
         branch=branch,
         base="main",
         allowed_actions=("prepare-verification",),
@@ -2320,7 +2320,7 @@ Closes #8
         "8",
         expect=1,
     )
-    assert "devctl git push" in mr_before_push.stderr
+    assert "devctl git push" in mr_before_push.stderr, mr_before_push.stderr
     assert branch not in git_text(origin, "branch", "--format=%(refname:short)")
     history = work / ".xflow" / "issues" / "issue-8" / "approvals" / "history"
     assert not tuple(history.glob("*.yaml"))
@@ -2409,6 +2409,7 @@ def test_ai_call_guidance_is_visible(repo: Path) -> None:
     assert "devctl unattended enable --issue <id|draft> --confirm XFLOW_HUMAN_UNATTENDED_ALL" in help_text
     assert "devctl unattended status" in help_text
     assert "devctl unattended disable" in help_text
+    assert "devctl approval reconcile --issue <id|draft> --approval-id <id>" in help_text
     assert "[UNATTENDED] Human approval gate bypassed for current task <id>." in help_text
     assert "--no-local-review alone is invalid" in help_text
     for exclusion in ("force push", "history rewrite", "destructive deletion", "secret or permission changes"):

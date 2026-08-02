@@ -18,6 +18,7 @@ from .paths import (
     task_authority_file,
     task_state_file,
 )
+from .semantic_routes import semantic_reference_kind, validate_classification_phase
 
 
 EXECUTION_STATES = (
@@ -314,15 +315,16 @@ def parse_task_state_text(
     classification = _required(fields["Classification"], "Classification")
     if classification not in CLASSIFICATIONS:
         raise ValueError(f"unknown task-state Classification: {classification}")
+    validate_classification_phase(classification, semantic_phase)
     boolean = _required(fields["Contract Change Required"], "Contract Change Required")
     if boolean not in {"yes", "no"}:
         raise ValueError("Contract Change Required must be yes or no")
     human_gate = _required(fields["Human Gate"], "Human Gate")
     human_approval_ref = _required(fields["Human Approval Ref"], "Human Approval Ref")
-    needs_approval = SEMANTIC_PHASES.index(semantic_phase) >= SEMANTIC_PHASES.index("accepted-design")
-    if needs_approval:
+    reference_kind = semantic_reference_kind(classification, semantic_phase)
+    if reference_kind is not None:
         if human_approval_ref == "none":
-            raise ValueError("Human Approval Ref is required once Semantic Phase is accepted-design or later")
+            raise ValueError(f"Human Approval Ref is required for Semantic Phase {semantic_phase}")
         _validate_relative_approval(human_approval_ref)
     elif human_approval_ref != "none":
         _validate_relative_approval(human_approval_ref)
@@ -341,19 +343,30 @@ def parse_task_state_text(
         human_gate=human_gate,
         human_approval_ref=human_approval_ref,
     )
-    if needs_approval and validate_acceptance:
-        from .contracts import validate_task_contract_acceptance
+    if reference_kind is not None and validate_acceptance:
+        if reference_kind == "contract-acceptance":
+            from .contracts import validate_task_contract_acceptance
 
-        validate_task_contract_acceptance(
-            resolved.parents[3],
-            state.issue,
-            state.contract,
-            state.contract_file,
-            state.human_approval_ref,
-            state.semantic_phase,
-            binding_mode=binding_mode,
-            recorded_branch=state.branch,
-        )
+            validate_task_contract_acceptance(
+                resolved.parents[3],
+                state.issue,
+                state.contract,
+                state.contract_file,
+                state.human_approval_ref,
+                state.semantic_phase,
+                binding_mode=binding_mode,
+                recorded_branch=state.branch,
+            )
+        else:
+            from .approval import validate_task_gap_recognition
+
+            validate_task_gap_recognition(
+                resolved.parents[3],
+                state.issue,
+                state.human_approval_ref,
+                binding_mode=binding_mode,
+                recorded_branch=state.branch,
+            )
     return state
 
 
@@ -393,6 +406,7 @@ def _validate_state(state: TaskState) -> None:
         raise ValueError(f"unknown task-state Semantic Phase: {state.semantic_phase}")
     if state.classification not in CLASSIFICATIONS:
         raise ValueError(f"unknown task-state Classification: {state.classification}")
+    validate_classification_phase(state.classification, state.semantic_phase)
     if not isinstance(state.contract_change_required, bool):
         raise ValueError("Contract Change Required must be yes or no")
     for label, value in (
@@ -408,9 +422,9 @@ def _validate_state(state: TaskState) -> None:
         raise ValueError("task-state action lists must not be empty")
     if any(not item.strip() for item in (*state.allowed_actions, *state.forbidden_actions)):
         raise ValueError("task-state actions must not be empty")
-    needs_approval = SEMANTIC_PHASES.index(state.semantic_phase) >= SEMANTIC_PHASES.index("accepted-design")
-    if needs_approval and state.human_approval_ref == "none":
-        raise ValueError("Human Approval Ref is required once Semantic Phase is accepted-design or later")
+    reference_kind = semantic_reference_kind(state.classification, state.semantic_phase)
+    if reference_kind is not None and state.human_approval_ref == "none":
+        raise ValueError(f"Human Approval Ref is required for Semantic Phase {state.semantic_phase}")
     if state.human_approval_ref != "none":
         _validate_relative_approval(state.human_approval_ref)
 
@@ -722,6 +736,16 @@ def task_authority_issues(repo_root: Path) -> tuple[str, ...]:
     return tuple(issues)
 
 
+def modern_task_authority_exists(repo_root: Path) -> bool:
+    bindings = resolve_bindings(repo_root)
+    for issue in task_authority_issues(repo_root):
+        _, authority = _load_authority(repo_root, bindings, issue, required=True)
+        assert authority is not None
+        if authority.taskMode == "modern-contract":
+            return True
+    return False
+
+
 def _validate_pointer_bindings(pointer: ActiveTaskPointer, bindings: GitBindings) -> None:
     if pointer.repository != bindings.repository:
         raise ValueError("active task repository mismatch")
@@ -1023,8 +1047,8 @@ def load_active_task_snapshot(repo_root: Path) -> tuple[GitBindings, TaskState]:
         legacy_snapshots = (source_snapshot, validated_task_snapshot, authority_snapshot)
 
     acceptance_snapshots: tuple[object, ...] = ()
-    needs_approval = SEMANTIC_PHASES.index(state.semantic_phase) >= SEMANTIC_PHASES.index("accepted-design")
-    if needs_approval:
+    reference_kind = semantic_reference_kind(state.classification, state.semantic_phase)
+    if reference_kind == "contract-acceptance":
         from .contracts import validate_task_contract_acceptance_snapshots
 
         acceptance_snapshots = validate_task_contract_acceptance_snapshots(
@@ -1034,6 +1058,14 @@ def load_active_task_snapshot(repo_root: Path) -> tuple[GitBindings, TaskState]:
             state.contract_file,
             state.human_approval_ref,
             state.semantic_phase,
+        )
+    elif reference_kind == "gap-recognition":
+        from .approval import validate_task_gap_recognition_snapshots
+
+        acceptance_snapshots = validate_task_gap_recognition_snapshots(
+            root,
+            state.issue,
+            state.human_approval_ref,
         )
 
     revalidate_snapshots(common_dir, (current, authority_snapshot), "active task snapshot")
