@@ -19,7 +19,14 @@ from .bindings import GitBindings, git_path, resolve_bindings
 from .classification import _decode_classification_bytes, _load_yaml, _read_stable_bytes
 from .io import read_text
 from .local_artifacts import MAX_TEXT_ARTIFACT_BYTES, StableFileSnapshot, capture_stable_file
-from .paths import default_approval_file, issue_dir, normalized_issue, task_state_file
+from .paths import (
+    active_task_pointer_file,
+    default_approval_file,
+    issue_dir,
+    normalized_issue,
+    task_authority_file,
+    task_state_file,
+)
 from .project_config import require_safe_repo_path
 from .stable_ids import is_stable_id
 from .unattended import require_active
@@ -118,6 +125,7 @@ CREDENTIAL_PATTERNS = (
     re.compile(r"(?i)(?:^|[^A-Za-z0-9])(?:token|secret|password|credential|access[_-]?key)\s*[:=]"),
 )
 REMOTE_RECONCILIATION_CONFIRMATION = "XFLOW_HUMAN_REMOTE_RECONCILED"
+TASK_BRANCH_SUPERSEDE_CONFIRMATION = "XFLOW_HUMAN_SUPERSEDE_TASK_BRANCH_START"
 REMOTE_CLAIM_STATES = {
     "reserved",
     "outcome-unknown",
@@ -135,7 +143,7 @@ REMOTE_CLAIM_FIELD_ORDER = (
     "historyFile", "historySha256",
 )
 REMOTE_CLAIM_FIELDS = set(REMOTE_CLAIM_FIELD_ORDER)
-TASK_BRANCH_CLAIM_STATES = {"reserved", "branch-created", "activated", "completed"}
+TASK_BRANCH_CLAIM_STATES = {"reserved", "branch-created", "activated", "completed", "superseded"}
 TASK_BRANCH_CLAIM_FIELD_ORDER = (
     "version", "approvalId", "repository", "worktree", "branch", "baseBranch", "targetBranch",
     "approvalIssue", "action", "approvedFile", "approvedSha256", "reviewerSummary",
@@ -144,6 +152,11 @@ TASK_BRANCH_CLAIM_FIELD_ORDER = (
     "updatedAt", "recordedAt", "historyFile", "historySha256",
 )
 TASK_BRANCH_CLAIM_FIELDS = set(TASK_BRANCH_CLAIM_FIELD_ORDER)
+TASK_BRANCH_SUPERSEDED_FIELD_ORDER = TASK_BRANCH_CLAIM_FIELD_ORDER + (
+    "supersededAt",
+    "supersededReason",
+)
+TASK_BRANCH_SUPERSEDED_FIELDS = set(TASK_BRANCH_SUPERSEDED_FIELD_ORDER)
 GIT_COMMIT_RE = re.compile(r"[0-9a-f]{40,64}")
 
 
@@ -1528,7 +1541,12 @@ def _task_branch_review_path(repo_root: Path, issue: str, approval_id: str) -> P
 
 
 def _task_branch_claim_bytes(payload: dict[str, object]) -> bytes:
-    return _yaml_bytes({name: payload[name] for name in TASK_BRANCH_CLAIM_FIELD_ORDER})
+    order = (
+        TASK_BRANCH_SUPERSEDED_FIELD_ORDER
+        if payload.get("version") == "0.2.0"
+        else TASK_BRANCH_CLAIM_FIELD_ORDER
+    )
+    return _yaml_bytes({name: payload[name] for name in order})
 
 
 @contextmanager
@@ -1549,7 +1567,7 @@ def _approval_claim_lock(
         / "runtime"
         / runtime_scope
         / bindings.worktree
-        / f"{approval_id}.lock"
+        / "claims.lock"
     )
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+b")
@@ -1584,10 +1602,6 @@ def _approval_claim_lock(
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     finally:
         handle.close()
-        try:
-            lock_path.unlink(missing_ok=True)
-        except PermissionError:
-            pass
 
 
 @contextmanager
@@ -1618,14 +1632,24 @@ def _parse_task_branch_claim(repo_root: Path, path: Path, issue: str) -> dict[st
     issue_root = issue_dir(repo_root, issue)
     raw_bytes = _stable_approval_bytes(repo_root, path, issue_root, "task branch start claim")
     payload = _load_yaml(_decode_approval_bytes(raw_bytes, path, "task branch start claim"))
-    if not isinstance(payload, dict) or set(payload) != TASK_BRANCH_CLAIM_FIELDS:
+    if not isinstance(payload, dict):
+        raise ValueError("task branch start claim has unexpected or missing fields")
+    version = payload.get("version")
+    expected_fields = (
+        TASK_BRANCH_SUPERSEDED_FIELDS
+        if version == "0.2.0"
+        else TASK_BRANCH_CLAIM_FIELDS
+    )
+    if set(payload) != expected_fields:
         raise ValueError("task branch start claim has unexpected or missing fields")
     if (
-        payload["version"] != "0.1.0"
+        version not in {"0.1.0", "0.2.0"}
         or payload["action"] != "task-branch-start"
         or payload["state"] not in TASK_BRANCH_CLAIM_STATES
     ):
         raise ValueError("task branch start claim has invalid fixed fields")
+    if (version == "0.2.0") != (payload["state"] == "superseded"):
+        raise ValueError("task branch start claim has invalid supersede lifecycle")
     for name in (
         "repository",
         "worktree",
@@ -1666,7 +1690,8 @@ def _parse_task_branch_claim(repo_root: Path, path: Path, issue: str) -> dict[st
     if base_commit != "pending" and (not isinstance(base_commit, str) or not GIT_COMMIT_RE.fullmatch(base_commit)):
         raise ValueError("task branch start claim has invalid baseCommit")
     if payload["state"] != "reserved" and base_commit == "pending":
-        raise ValueError("task branch start claim is missing the exact base commit")
+        if payload["state"] != "superseded":
+            raise ValueError("task branch start claim is missing the exact base commit")
     history_names = ("recordedAt", "historyFile", "historySha256")
     history_values = tuple(payload[name] for name in history_names)
     if payload["state"] == "completed" or history_values != ("none", "none", "none"):
@@ -1675,8 +1700,16 @@ def _parse_task_branch_claim(repo_root: Path, path: Path, issue: str) -> dict[st
         _canonical_utc_timestamp(payload["recordedAt"], "recordedAt", microseconds=True)
         if not FINGERPRINT_RE.fullmatch(str(payload["historySha256"])):
             raise ValueError("task branch start claim has invalid historySha256")
-    if payload["state"] in {"reserved", "branch-created"} and history_values != ("none", "none", "none"):
+    if payload["state"] in {"reserved", "branch-created", "superseded"} and history_values != ("none", "none", "none"):
         raise ValueError("task branch start claim records history before activation")
+    if version == "0.2.0":
+        if not isinstance(payload["supersededAt"], str):
+            raise ValueError("task branch start claim has invalid supersededAt")
+        _canonical_utc_timestamp(payload["supersededAt"], "supersededAt", microseconds=True)
+        reason = payload["supersededReason"]
+        if not isinstance(reason, str) or not reason or len(reason) > 200 or reason != " ".join(reason.split()):
+            raise ValueError("task branch start claim has invalid supersededReason")
+        reject_credentials(reason)
     if raw_bytes != _task_branch_claim_bytes(payload):
         raise ValueError("task branch start claim bytes are not canonical")
     return payload
@@ -1789,6 +1822,8 @@ def _task_branch_reservation(
 ) -> TaskBranchStartReservation:
     issue = str(claim["approvalIssue"])
     approval_id = str(claim["approvalId"])
+    if claim["state"] == "superseded":
+        raise ValueError(f"task branch approval claim was superseded: {approval_id}")
     expected_claim = _task_branch_claim_path(repo_root, issue, approval_id)
     if claim_path.resolve() != expected_claim or claim["branchStartClaimFile"] != claim_path.relative_to(repo_root).as_posix():
         raise ValueError("task branch start claim path identity mismatch")
@@ -1819,6 +1854,28 @@ def _task_branch_reservation(
         state=str(claim["state"]),
         base_commit=str(claim["baseCommit"]),
     )
+
+
+def _task_branch_claims_for_target(
+    repo_root: Path,
+    issue: str,
+    target_branch: str,
+) -> list[tuple[Path, dict[str, object]]]:
+    claims_root = _contract_artifact_path(repo_root, issue, "claims", "placeholder").parent
+    if not claims_root.is_dir():
+        return []
+    matches: list[tuple[Path, dict[str, object]]] = []
+    for claim_path in sorted(claims_root.glob("*-task-branch.yaml")):
+        claim = _parse_task_branch_claim(repo_root, claim_path, issue)
+        if claim["targetBranch"] != target_branch:
+            continue
+        expected_path = _task_branch_claim_path(repo_root, issue, str(claim["approvalId"]))
+        expected_relative = claim_path.relative_to(repo_root).as_posix()
+        if claim_path.resolve() != expected_path or claim["branchStartClaimFile"] != expected_relative:
+            raise ValueError("task branch start claim path identity mismatch")
+        if claim["state"] != "superseded":
+            matches.append((claim_path, claim))
+    return matches
 
 
 def _revalidate_task_branch_current(repo_root: Path, reservation: TaskBranchStartReservation) -> None:
@@ -1861,6 +1918,12 @@ def reserve_task_branch_start(repo_root: Path, grant: ApprovalGrant, base_branch
     issue_root = issue_dir(root, issue)
     claim_path = _task_branch_claim_path(root, issue, grant.approval_id)
     with _task_branch_claim_lock(root, grant.approval_id):
+        active_claims = _task_branch_claims_for_target(root, issue, grant.target_branch)
+        conflicts = [claim for _, claim in active_claims if claim["approvalId"] != grant.approval_id]
+        if conflicts:
+            raise ValueError(
+                "existing task branch claim must complete or be human-superseded before a replacement approval"
+            )
         if claim_path.is_file():
             claim = _parse_task_branch_claim(root, claim_path, issue)
             _validate_task_branch_claim_grant(claim, grant)
@@ -1978,14 +2041,8 @@ def resume_task_branch_start(
     root = repo_root.resolve()
     issue = normalized_issue(issue)
     requested_file = display_path(root, approved_file)
-    claims_root = _contract_artifact_path(root, issue, "claims", "placeholder").parent
-    if not claims_root.is_dir():
-        return None
-    matches: list[tuple[Path, dict[str, object]]] = []
-    for claim_path in sorted(claims_root.glob("*-task-branch.yaml")):
-        claim = _parse_task_branch_claim(root, claim_path, issue)
-        if claim["targetBranch"] != target_branch:
-            continue
+    matches = _task_branch_claims_for_target(root, issue, target_branch)
+    for claim_path, claim in matches:
         expected = {
             "approvalIssue": issue,
             "approvedFile": requested_file,
@@ -1995,7 +2052,6 @@ def resume_task_branch_start(
         }
         if any(claim.get(name) != value for name, value in expected.items()):
             raise ValueError("existing task branch claim does not match exact requested bindings")
-        matches.append((claim_path, claim))
     if len(matches) > 1:
         raise ValueError("multiple task branch claims match the requested target branch")
     if not matches:
@@ -2011,6 +2067,119 @@ def resume_task_branch_start(
     reservation = _task_branch_reservation(root, claim_path, claim)
     _revalidate_task_branch_current(root, reservation)
     return reservation
+
+
+def _task_branch_metadata(repo_root: Path) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    for key in ("slug", "issue", "base", "pr", "pr-url"):
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "config", "--get", f"devctl.{key}"],
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            metadata[key] = result.stdout.strip()
+        elif result.returncode not in {0, 1}:
+            raise ValueError(f"cannot verify task branch metadata before supersede: {key}")
+    return metadata
+
+
+def _remote_task_branch_exists(repo_root: Path, branch: str) -> bool:
+    result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            f"refs/heads/{branch}",
+        ],
+        check=False,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode == 0:
+        return bool(result.stdout.strip())
+    if result.returncode == 2:
+        return False
+    raise ValueError("cannot verify remote target branch before supersede")
+
+
+def supersede_task_branch_start_by_id(
+    repo_root: Path,
+    issue: str,
+    approval_id: str,
+    *,
+    reason: str,
+    confirmation: str,
+) -> Path:
+    if confirmation != TASK_BRANCH_SUPERSEDE_CONFIRMATION:
+        raise ValueError(
+            "task branch supersede requires exact human confirmation: "
+            f"{TASK_BRANCH_SUPERSEDE_CONFIRMATION}"
+        )
+    normalized = normalized_issue(issue)
+    if not APPROVAL_ID_RE.fullmatch(approval_id):
+        raise ValueError("task branch supersede requires a valid approval ID")
+    summary = " ".join(str(reason).split())
+    if not summary or len(summary) > 200:
+        raise ValueError("task branch supersede requires a concise reason")
+    reject_credentials(summary)
+    root = repo_root.resolve()
+    claim_path = _task_branch_claim_path(root, normalized, approval_id)
+    with _task_branch_claim_lock(root, approval_id):
+        claim = _parse_task_branch_claim(root, claim_path, normalized)
+        if claim["state"] != "reserved":
+            raise ValueError("task branch claim cannot be superseded after a branch effect")
+        if any(claim[name] != "none" for name in ("recordedAt", "historyFile", "historySha256")):
+            raise ValueError("task branch claim cannot be superseded after a history effect")
+        target_branch = str(claim["targetBranch"])
+        if _git_ref_commit(root, f"refs/heads/{target_branch}") or resolve_bindings(root).branch == target_branch:
+            raise ValueError("task branch claim cannot be superseded after a branch effect")
+        if _remote_task_branch_exists(root, target_branch):
+            raise ValueError("task branch claim cannot be superseded after a remote branch effect")
+        if _task_branch_metadata(root):
+            raise ValueError("task branch claim cannot be superseded after a branch metadata effect")
+        pointer = active_task_pointer_file(root, str(claim["worktree"]))
+        authority = task_authority_file(root, str(claim["worktree"]), normalized)
+        if pointer.exists() or authority.exists():
+            raise ValueError("task branch claim cannot be superseded after a task activation effect")
+        _, sealed_state = _task_branch_artifact_bytes(
+            root,
+            claim,
+            "taskStateSnapshotFile",
+            "approved task-state snapshot",
+        )
+        current_state = capture_stable_file(
+            root,
+            task_state_file(root, normalized),
+            issue_dir(root, normalized),
+            "current task-state before branch supersede",
+            max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+        )
+        if current_state.content != sealed_state:
+            raise ValueError("task branch claim cannot be superseded after a task-state effect")
+        superseded_at = _canonical_utc_now()
+        claim.update(
+            {
+                "version": "0.2.0",
+                "state": "superseded",
+                "updatedAt": superseded_at,
+                "supersededAt": superseded_at,
+                "supersededReason": summary,
+            }
+        )
+        _replace_bytes(claim_path, _task_branch_claim_bytes(claim))
+        return claim_path
 
 
 def _reload_task_branch_reservation(
@@ -2155,11 +2324,23 @@ def complete_task_branch_start(repo_root: Path, reservation: TaskBranchStartRese
             history_bytes = _yaml_bytes(_task_branch_history_payload(claim))
             claim["historySha256"] = hashlib.sha256(history_bytes).hexdigest()
             _replace_bytes(reservation.claim_path, _task_branch_claim_bytes(claim))
+        canonical_history_path = _history_path(
+            root,
+            str(claim["approvalIssue"]),
+            "task-branch-start",
+            str(claim["recordedAt"]),
+            str(claim["approvalId"]),
+        )
+        canonical_history_file = canonical_history_path.relative_to(root).as_posix()
+        if claim["historyFile"] != canonical_history_file:
+            raise ValueError("task branch claim historyFile is not the canonical task branch approval history")
         history_path = require_safe_repo_path(
             root,
             root / Path(str(claim["historyFile"])),
             "task branch approval history",
         )
+        if history_path != canonical_history_path:
+            raise ValueError("task branch approval history path identity mismatch")
         history_bytes = _yaml_bytes(_task_branch_history_payload(claim))
         if hashlib.sha256(history_bytes).hexdigest() != claim["historySha256"]:
             raise ValueError("task branch claim does not seal exact history")
@@ -2321,6 +2502,73 @@ def _reservation_from_claim(repo_root: Path, claim_path: Path, claim: dict[str, 
     )
 
 
+def _remote_claims_for_scope(
+    repo_root: Path,
+    issue: str,
+    action: str,
+    bindings: GitBindings,
+) -> list[tuple[Path, dict[str, object]]]:
+    claims_root = _contract_artifact_path(repo_root, issue, "claims", "placeholder").parent
+    if not claims_root.is_dir():
+        return []
+    scoped: list[tuple[Path, dict[str, object]]] = []
+    for claim_path in sorted(claims_root.glob("*-remote.yaml")):
+        claim = _parse_remote_claim(repo_root, claim_path, issue)
+        scope_matches = (
+            claim["repository"] == bindings.repository
+            and claim["worktree"] == bindings.worktree
+            and claim["branch"] == bindings.branch
+            and claim["approvalIssue"] == issue
+            and claim["action"] == action
+        )
+        if not scope_matches:
+            continue
+        expected_path = _remote_claim_path(repo_root, issue, str(claim["approvalId"]))
+        expected_relative = claim_path.relative_to(repo_root).as_posix()
+        if claim_path.resolve() != expected_path or claim["remoteClaimFile"] != expected_relative:
+            raise ValueError("remote approval claim path identity mismatch")
+        scoped.append((claim_path, claim))
+    return scoped
+
+
+def _arbitrate_remote_claim_scope(
+    repo_root: Path,
+    issue: str,
+    action: str,
+    approved_file: str,
+    bindings: GitBindings,
+) -> tuple[Path, dict[str, object]] | None:
+    claims = _remote_claims_for_scope(repo_root, issue, action, bindings)
+    unresolved = [
+        (path, claim)
+        for path, claim in claims
+        if claim["state"] in {"reserved", "outcome-unknown"}
+    ]
+    if unresolved:
+        identities = ", ".join(str(claim["approvalId"]) for _, claim in unresolved)
+        raise ValueError(
+            "remote approval outcome unresolved; scope-wide human reconciliation is required: "
+            f"{identities}"
+        )
+    confirmed = [
+        (path, claim)
+        for path, claim in claims
+        if claim["state"] in {"post-effects-pending", "remote-confirmed"}
+    ]
+    if len(confirmed) > 1:
+        if action == "git-mr":
+            raise ValueError("multiple matching pending git-mr claims")
+        raise ValueError(f"multiple provider-confirmed remote approval claims for {action}")
+    if not confirmed:
+        return None
+    claim_path, claim = confirmed[0]
+    if claim["approvedFile"] != approved_file:
+        if action == "git-mr":
+            raise ValueError("conflicting pending git-mr claim uses a different approved file")
+        raise ValueError(f"provider-confirmed {action} claim uses a different approved file")
+    return claim_path, claim
+
+
 def resume_pending_remote_action(
     repo_root: Path,
     action: str,
@@ -2333,40 +2581,16 @@ def resume_pending_remote_action(
         raise ValueError("deferred remote recovery is only supported for git-mr")
     requested_file = display_path(root, approved_file)
     bindings = resolve_bindings(root)
-    claims_root = _contract_artifact_path(root, normalized, "claims", "placeholder").parent
-    if not claims_root.is_dir():
+    pending = _arbitrate_remote_claim_scope(
+        root,
+        normalized,
+        action,
+        requested_file,
+        bindings,
+    )
+    if pending is None:
         return None
-
-    matches: list[tuple[Path, dict[str, object]]] = []
-    conflicts: list[Path] = []
-    for claim_path in sorted(claims_root.glob("*-remote.yaml")):
-        claim = _parse_remote_claim(root, claim_path, normalized)
-        if claim["state"] not in {"post-effects-pending", "remote-confirmed"}:
-            continue
-        scope_matches = (
-            claim["repository"] == bindings.repository
-            and claim["worktree"] == bindings.worktree
-            and claim["branch"] == bindings.branch
-            and claim["approvalIssue"] == normalized
-            and claim["action"] == action
-        )
-        if not scope_matches:
-            continue
-        expected_path = _remote_claim_path(root, normalized, str(claim["approvalId"]))
-        if claim_path.resolve() != expected_path or claim["remoteClaimFile"] != claim_path.relative_to(root).as_posix():
-            raise ValueError("pending remote approval claim path identity mismatch")
-        if claim["approvedFile"] != requested_file:
-            conflicts.append(claim_path)
-            continue
-        matches.append((claim_path, claim))
-
-    if conflicts:
-        raise ValueError("conflicting pending git-mr claim uses a different approved file")
-    if len(matches) > 1:
-        raise ValueError("multiple matching pending git-mr claims")
-    if not matches:
-        return None
-    claim_path, claim = matches[0]
+    claim_path, claim = pending
     return _reservation_from_claim(root, claim_path, claim)
 
 
@@ -2380,6 +2604,21 @@ def reserve_remote_action(repo_root: Path, grant: ApprovalGrant) -> RemoteAction
     issue = normalized_issue(grant.approval_issue)
     claim_path = _remote_claim_path(root, issue, grant.approval_id)
     with _remote_action_lock(root, grant.approval_id):
+        pending = _arbitrate_remote_claim_scope(
+            root,
+            issue,
+            grant.action,
+            grant.approved_file,
+            resolve_bindings(root),
+        )
+        if pending is not None:
+            pending_path, pending_claim = pending
+            if pending_claim["approvalId"] != grant.approval_id:
+                raise ValueError(
+                    "provider-confirmed remote approval claim must finish before a replacement approval"
+                )
+            _validate_remote_claim_grant(pending_claim, grant)
+            return _reservation_from_claim(root, pending_path, pending_claim)
         if claim_path.is_file():
             claim = _parse_remote_claim(root, claim_path, issue)
             _validate_remote_claim_grant(claim, grant)

@@ -198,7 +198,14 @@ def build_parser() -> argparse.ArgumentParser:
     trace_sub = trace.add_subparsers(dest="trace_command", required=True)
     trace_check = trace_sub.add_parser("check")
     trace_check.add_argument("--issue", required=True)
-    trace_check.add_argument("--contract", type=Path)
+    trace_check.add_argument(
+        "--contract",
+        type=Path,
+        help=(
+            "non-authoritative fail-closed evolution input; omit only when immutable "
+            "sealed contract-acceptance history is authoritative"
+        ),
+    )
     trace_check.add_argument("--matrix", required=True, type=Path)
 
     unattended_parser = sub.add_parser("unattended")
@@ -313,6 +320,22 @@ def build_parser() -> argparse.ArgumentParser:
     approval_reconcile.add_argument("--confirm", required=True)
     approval_reconcile.add_argument("--target-issue")
     approval_reconcile.add_argument("--provider-receipt")
+    approval_supersede_branch = approval_sub.add_parser(
+        "supersede-branch-start",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Human-only retirement of a reserved task-branch-start claim with no branch, "
+            "metadata, activation, or history effect."
+        ),
+        epilog=(
+            "Human Approval Is Non-Delegable. AI must never run this command or supply "
+            "XFLOW_HUMAN_SUPERSEDE_TASK_BRANCH_START."
+        ),
+    )
+    approval_supersede_branch.add_argument("--issue", required=True)
+    approval_supersede_branch.add_argument("--approval-id", required=True)
+    approval_supersede_branch.add_argument("--reason", required=True)
+    approval_supersede_branch.add_argument("--confirm", required=True)
 
     attachment_parser = sub.add_parser("attachment")
     attachment_sub = attachment_parser.add_subparsers(dest="attachment_command")
@@ -890,6 +913,28 @@ def remote_branch_tip(repo_root: Path, remote: str, branch: str) -> str:
     return commit
 
 
+def validate_task_branch_remote_base(
+    repo_root: Path,
+    base: str,
+    sealed_commit: str,
+) -> str:
+    current_tip = remote_branch_tip(repo_root, "origin", base)
+    try:
+        git_run(repo_root, ["fetch", "--no-tags", "origin", f"refs/heads/{base}"])
+    except ValueError as exc:
+        raise ValueError(
+            "cannot fetch the current remote base to validate the sealed remote base"
+        ) from exc
+    fetched_tip = git_output(repo_root, ["rev-parse", "--verify", "FETCH_HEAD^{commit}"])
+    if fetched_tip != current_tip:
+        raise ValueError("fetched current remote base does not match its advertised tip")
+    if not git_succeeds(repo_root, ["rev-parse", "--verify", f"{sealed_commit}^{{commit}}"]):
+        raise ValueError("sealed remote base is unreachable from the current remote base")
+    if not git_succeeds(repo_root, ["merge-base", "--is-ancestor", sealed_commit, current_tip]):
+        raise ValueError("sealed remote base is no longer contained by the current remote base")
+    return current_tip
+
+
 def synchronize_base_to_commit(repo_root: Path, base: str, sealed_commit: str) -> None:
     if current_branch(repo_root) != base:
         raise ValueError(f"exact base synchronization requires active base branch {base}")
@@ -1398,10 +1443,16 @@ def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
                 branch_reservation,
                 remote_tip,
             )
+        target_commit = git_output(ctx.repo_root, ["rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}"])
+        if not target_commit:
+            validate_task_branch_remote_base(
+                ctx.repo_root,
+                base,
+                branch_reservation.base_commit,
+            )
         if current == base:
             print(f"[INFO] synchronize {base} to {branch_reservation.base_commit}")
             synchronize_base_to_commit(ctx.repo_root, base, branch_reservation.base_commit)
-        target_commit = git_output(ctx.repo_root, ["rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}"])
         if target_commit:
             if target_commit != branch_reservation.base_commit:
                 raise ValueError("task branch exact start point mismatch")
@@ -1419,6 +1470,11 @@ def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
             if base_commit != branch_reservation.base_commit:
                 raise ValueError("task branch exact base commit changed before creation")
             branch_reservation = approval.revalidate_task_branch_start(ctx.repo_root, branch_reservation)
+            validate_task_branch_remote_base(
+                ctx.repo_root,
+                base,
+                branch_reservation.base_commit,
+            )
             print(f"[INFO] create branch {branch}")
             git_run(ctx.repo_root, ["checkout", "-b", branch, branch_reservation.base_commit])
             branch_reservation = approval.mark_task_branch_created(ctx.repo_root, branch_reservation)
@@ -1720,6 +1776,16 @@ def run_git(args: argparse.Namespace) -> int:
 
 def run_approval(args: argparse.Namespace) -> int:
     ctx = context()
+    if args.approval_command == "supersede-branch-start":
+        path = approval.supersede_task_branch_start_by_id(
+            ctx.repo_root,
+            args.issue,
+            args.approval_id,
+            reason=args.reason,
+            confirmation=args.confirm,
+        )
+        print(f"[INFO] task branch approval claim superseded: {path}")
+        return 0
     if args.approval_command == "reconcile":
         provider_receipt: dict[str, object] | None = None
         if args.outcome == "no-effect":

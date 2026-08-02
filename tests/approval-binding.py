@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -20,7 +21,7 @@ sys.path.insert(0, str(OPS_ROOT))
 
 from xflow import approval
 from xflow import cli, providers
-from xflow.bindings import resolve_bindings
+from xflow.bindings import git_path, resolve_bindings
 from xflow.paths import active_task_pointer_file
 from xflow.task_state import TaskState, activate_task, render_task_state
 from xflow.unattended import enable
@@ -66,6 +67,63 @@ def assert_value_error(expected: str, action: object) -> None:
         assert expected in str(exc), str(exc)
     else:
         raise AssertionError(f"expected ValueError containing {expected!r}")
+
+
+def approval_scope_lock_path(repo_root: Path, runtime_scope: str) -> Path:
+    return (
+        git_path(repo_root, "--git-common-dir")
+        / "xflow"
+        / "runtime"
+        / runtime_scope
+        / resolve_bindings(repo_root).worktree
+        / "claims.lock"
+    )
+
+
+def assert_claim_lock_released_and_reacquirable(
+    repo_root: Path,
+    runtime_scope: str,
+    approval_id: str,
+) -> None:
+    lock_path = approval_scope_lock_path(repo_root, runtime_scope)
+    assert lock_path.is_file()
+    assert {path.name for path in lock_path.parent.iterdir()} == {"claims.lock"}
+    script = """
+import sys
+from pathlib import Path
+from xflow import approval
+
+repo = Path(sys.argv[1])
+with approval._approval_claim_lock(repo, sys.argv[2], sys.argv[3], "claim lock is busy"):
+    print("acquired")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(repo_root), approval_id, runtime_scope],
+        cwd=repo_root,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(OPS_ROOT),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "acquired"
+    assert lock_path.is_file()
+    assert {path.name for path in lock_path.parent.iterdir()} == {"claims.lock"}
+
+
+def wait_for_path(path: Path, label: str, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"timed out waiting for {label}: {path}")
 
 
 def task_state(issue: str, branch: str) -> TaskState:
@@ -428,7 +486,115 @@ def test_local_remote_reservation_snapshot_and_recovery(repo_root: Path, approve
     assert payload["providerReceipt"] == '{"comment":"confirmed"}'
     assert len(tuple(record.parent.glob("*-issue-comment-*.yaml"))) == 1
     assert_value_error("approval already consumed", lambda: approval.reserve_remote_action(repo_root, grant))
-    assert not tuple((repo_root / ".git" / "xflow" / "runtime" / "remote-approvals").rglob("*.lock"))
+    assert_claim_lock_released_and_reacquirable(
+        repo_root,
+        "remote-approvals",
+        grant.approval_id,
+    )
+
+
+def test_posix_claim_lock_keeps_third_process_behind_waiter(repo_root: Path) -> None:
+    if os.name == "nt":
+        return
+    worker = """
+import sys
+import time
+from pathlib import Path
+import fcntl
+from xflow import approval
+
+repo = Path(sys.argv[1])
+approval_id = sys.argv[2]
+scope = sys.argv[3]
+attempt = None if sys.argv[4] == "-" else Path(sys.argv[4])
+entered = Path(sys.argv[5])
+release = Path(sys.argv[6])
+original_flock = fcntl.flock
+if attempt is not None:
+    def observed_flock(fd, operation):
+        if operation & fcntl.LOCK_EX:
+            attempt.write_text("attempted\\n", encoding="utf-8")
+        return original_flock(fd, operation)
+    fcntl.flock = observed_flock
+with approval._approval_claim_lock(repo, approval_id, scope, "claim lock is busy"):
+    entered.write_text("entered\\n", encoding="utf-8")
+    while not release.exists():
+        time.sleep(0.01)
+"""
+    root = repo_root.parent / "posix-lock-signals"
+    root.mkdir()
+    approval_id = "a" * 64
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(OPS_ROOT),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    markers = {
+        name: root / name
+        for name in (
+            "a-entered",
+            "a-release",
+            "b-attempt",
+            "b-entered",
+            "b-release",
+            "c-attempt",
+            "c-entered",
+            "c-release",
+        )
+    }
+
+    def launch(attempt: str | None, entered: str, release: str) -> subprocess.Popen[str]:
+        return subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                worker,
+                str(repo_root),
+                approval_id,
+                "remote-approvals",
+                "-" if attempt is None else str(markers[attempt]),
+                str(markers[entered]),
+                str(markers[release]),
+            ],
+            cwd=repo_root,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    processes: list[subprocess.Popen[str]] = []
+    try:
+        first = launch(None, "a-entered", "a-release")
+        processes.append(first)
+        wait_for_path(markers["a-entered"], "first lock owner")
+        waiter = launch("b-attempt", "b-entered", "b-release")
+        processes.append(waiter)
+        wait_for_path(markers["b-attempt"], "waiting process lock attempt")
+        assert not markers["b-entered"].exists()
+        markers["a-release"].write_text("release\n", encoding="utf-8")
+        assert first.wait(timeout=10) == 0, first.stderr.read() if first.stderr else ""
+        wait_for_path(markers["b-entered"], "waiting process entry")
+
+        third = launch("c-attempt", "c-entered", "c-release")
+        processes.append(third)
+        wait_for_path(markers["c-attempt"], "third process lock attempt")
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline and not markers["c-entered"].exists():
+            time.sleep(0.01)
+        assert not markers["c-entered"].exists(), "third process entered while waiter held the stable lock"
+
+        markers["b-release"].write_text("release\n", encoding="utf-8")
+        assert waiter.wait(timeout=10) == 0, waiter.stderr.read() if waiter.stderr else ""
+        wait_for_path(markers["c-entered"], "third process entry after waiter release")
+        markers["c-release"].write_text("release\n", encoding="utf-8")
+        assert third.wait(timeout=10) == 0, third.stderr.read() if third.stderr else ""
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=10)
 
 
 def test_issue_comment_provider_consumes_reserved_bytes(repo_root: Path, approved_file: Path) -> None:
@@ -1024,7 +1190,8 @@ def test_pending_mr_claim_discovery_rejects_multiple_matches(repo_root: Path, ap
     approve(second_review)
     second = approval.require_remote(repo_root, "git-mr", approved_file, "202")
     assert second.approval_id != first.approval_id
-    second_reservation = approval.reserve_remote_action(repo_root, second)
+    with patch.object(approval, "_arbitrate_remote_claim_scope", return_value=None):
+        second_reservation = approval.reserve_remote_action(repo_root, second)
     approval.confirm_remote_action(
         repo_root,
         second_reservation,
@@ -1036,6 +1203,116 @@ def test_pending_mr_claim_discovery_rejects_multiple_matches(repo_root: Path, ap
         "multiple matching pending git-mr claims",
         lambda: approval.resume_pending_remote_action(repo_root, "git-mr", approved_file, "202"),
     )
+
+
+def _prepare_replacement_mr_approval(
+    repo_root: Path,
+    approved_file: Path,
+    previous: approval.ApprovalGrant,
+) -> approval.ApprovalGrant:
+    review = approval.prepare(
+        repo_root,
+        "202",
+        "git-mr",
+        approved_file,
+        reviewer="replacement human reviewer",
+        force=True,
+    )
+    approve(review)
+    grant = approval.require_remote(repo_root, "git-mr", approved_file, "202")
+    assert grant.approval_id != previous.approval_id
+    return grant
+
+
+def test_reserved_mr_claim_blocks_replacement_approval_provider_call(
+    repo_root: Path,
+    approved_file: Path,
+) -> None:
+    first = prepare_replayable_mr(repo_root, approved_file)
+    first_reservation = approval.reserve_remote_action(repo_root, first)
+    replacement = _prepare_replacement_mr_approval(repo_root, approved_file, first)
+    provider_calls: list[str] = []
+
+    assert run_replayable_mr(repo_root, provider_calls) == 1
+    assert provider_calls == []
+    assert yaml.safe_load(first_reservation.claim_path.read_text(encoding="utf-8"))["state"] == "reserved"
+    replacement_claim = approval._remote_claim_path(repo_root, "202", replacement.approval_id)
+    assert not replacement_claim.exists()
+
+
+def test_unknown_mr_claim_blocks_replacement_approval_provider_call(
+    repo_root: Path,
+    approved_file: Path,
+) -> None:
+    first = prepare_replayable_mr(repo_root, approved_file)
+    first_reservation = approval.reserve_remote_action(repo_root, first)
+    approval.mark_remote_action_unknown(repo_root, first_reservation, "provider result was not observed")
+    replacement = _prepare_replacement_mr_approval(repo_root, approved_file, first)
+    provider_calls: list[str] = []
+
+    assert run_replayable_mr(repo_root, provider_calls) == 1
+    assert provider_calls == []
+    assert yaml.safe_load(first_reservation.claim_path.read_text(encoding="utf-8"))["state"] == "outcome-unknown"
+    replacement_claim = approval._remote_claim_path(repo_root, "202", replacement.approval_id)
+    assert not replacement_claim.exists()
+
+
+def test_human_confirmed_no_effect_allows_replacement_mr_approval(
+    repo_root: Path,
+    approved_file: Path,
+) -> None:
+    first = prepare_replayable_mr(repo_root, approved_file)
+    first_reservation = approval.reserve_remote_action(repo_root, first)
+    approval.reconcile_remote_action(
+        repo_root,
+        first,
+        outcome="no-effect",
+        confirmation=approval.REMOTE_RECONCILIATION_CONFIRMATION,
+    )
+    _prepare_replacement_mr_approval(repo_root, approved_file, first)
+    provider_calls: list[str] = []
+
+    assert run_replayable_mr(repo_root, provider_calls) == 0
+    assert provider_calls == ["create"]
+    assert yaml.safe_load(first_reservation.claim_path.read_text(encoding="utf-8"))["state"] == "retryable"
+
+
+def test_confirmed_mr_claim_is_not_selected_while_an_unresolved_claim_exists(
+    repo_root: Path,
+    approved_file: Path,
+) -> None:
+    grant = prepare_replayable_mr(repo_root, approved_file)
+    reservation = approval.reserve_remote_action(repo_root, grant)
+    confirmed = approval.confirm_remote_action(
+        repo_root,
+        reservation,
+        target_issue=None,
+        provider_receipt={"number": "42", "html_url": "https://example.invalid/pulls/42"},
+    )
+    unresolved_id = "f" * 64
+    unresolved_path = approval._remote_claim_path(repo_root, "202", unresolved_id)
+    unresolved = yaml.safe_load(confirmed.claim_path.read_text(encoding="utf-8"))
+    unresolved.update(
+        {
+            "approvalId": unresolved_id,
+            "remoteClaimFile": unresolved_path.relative_to(repo_root).as_posix(),
+            "state": "reserved",
+            "targetIssue": "none",
+            "providerReceipt": "none",
+            "failureReason": "none",
+            "recordedAt": "none",
+            "historyFile": "none",
+            "historySha256": "none",
+        }
+    )
+    unresolved_path.write_bytes(approval._remote_claim_bytes(unresolved))
+    provider_calls: list[str] = []
+
+    assert run_replayable_mr(repo_root, provider_calls) == 1
+    assert provider_calls == []
+    assert not cli.branch_meta(repo_root, "pr")
+    assert yaml.safe_load(confirmed.claim_path.read_text(encoding="utf-8"))["state"] == "post-effects-pending"
+    assert yaml.safe_load(unresolved_path.read_text(encoding="utf-8"))["state"] == "reserved"
 
 
 def test_mr_replay_completes_partial_current_task_fields(repo_root: Path, approved_file: Path) -> None:
@@ -1421,6 +1698,8 @@ def main() -> None:
         test_unattended_grants_are_per_execution(unattended_repo, unattended_file)
         reservation_repo, reservation_file = init_active_repo(root, "remote-reservation")
         test_local_remote_reservation_snapshot_and_recovery(reservation_repo, reservation_file)
+        posix_lock_repo, _ = init_active_repo(root, "posix-claim-lock")
+        test_posix_claim_lock_keeps_third_process_behind_waiter(posix_lock_repo)
         provider_repo, provider_file = init_active_repo(root, "remote-provider-snapshot")
         test_issue_comment_provider_consumes_reserved_bytes(provider_repo, provider_file)
         reconcile_repo, reconcile_file = init_active_repo(root, "remote-reconcile-cli")
@@ -1459,6 +1738,26 @@ def main() -> None:
         test_pending_mr_claim_discovery_rejects_conflicting_body_path(claim_conflict_repo, claim_conflict_file)
         multiple_repo, multiple_file = init_active_repo(root, "remote-mr-multiple-claims")
         test_pending_mr_claim_discovery_rejects_multiple_matches(multiple_repo, multiple_file)
+        reserved_scope_repo, reserved_scope_file = init_active_repo(root, "remote-mr-reserved-scope")
+        test_reserved_mr_claim_blocks_replacement_approval_provider_call(
+            reserved_scope_repo,
+            reserved_scope_file,
+        )
+        unknown_scope_repo, unknown_scope_file = init_active_repo(root, "remote-mr-unknown-scope")
+        test_unknown_mr_claim_blocks_replacement_approval_provider_call(
+            unknown_scope_repo,
+            unknown_scope_file,
+        )
+        retryable_scope_repo, retryable_scope_file = init_active_repo(root, "remote-mr-retryable-scope")
+        test_human_confirmed_no_effect_allows_replacement_mr_approval(
+            retryable_scope_repo,
+            retryable_scope_file,
+        )
+        mixed_scope_repo, mixed_scope_file = init_active_repo(root, "remote-mr-mixed-scope")
+        test_confirmed_mr_claim_is_not_selected_while_an_unresolved_claim_exists(
+            mixed_scope_repo,
+            mixed_scope_file,
+        )
         partial_task_repo, partial_task_file = init_active_repo(root, "remote-mr-partial-task")
         test_mr_replay_completes_partial_current_task_fields(partial_task_repo, partial_task_file)
         task_merge_repo, _task_merge_file = init_active_repo(root, "remote-mr-task-merge")

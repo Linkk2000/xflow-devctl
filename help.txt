@@ -92,6 +92,12 @@ Git:
   same git start command. Replay resumes only the exact claimed branch/start
   point and fails closed on missing or conflicting identity; it does not create
   a new approval or bypass human approval.
+  If current origin/<base> no longer contains the sealed commit, or that commit
+  cannot be fetched, git start fails before a task branch effect. Only a human
+  may retire an uneffected reserved claim with:
+    devctl approval supersede-branch-start --issue <id> --approval-id <id> --reason "<auditable reason>" --confirm XFLOW_HUMAN_SUPERSEDE_TASK_BRANCH_START
+  AI must never run branch-start supersede or supply its exact human confirmation.
+  Supersede persists an audited terminal claim state; never delete a claim.
   Commit messages must be portable, scoped, Chinese-dominant, multi-line, and issue-linked.
   Use first line: type(scope): 中文核心摘要[#Issue编号]
   Require at least two non-empty Chinese-dominant body lines after a blank line.
@@ -207,6 +213,7 @@ Advisory dependencies:
 Approval:
   devctl approval prepare --issue draft|<id> --action ACTION --file F [--attachments manifest.json] [--command CMD] [--reviewer NAME] [--force]
   devctl approval reconcile --issue <id|draft> --approval-id <id> --outcome no-effect|success --confirm XFLOW_HUMAN_REMOTE_RECONCILED [--target-issue <id>] [--provider-receipt <JSON-object>]
+  devctl approval supersede-branch-start --issue <id> --approval-id <id> --reason "<auditable reason>" --confirm XFLOW_HUMAN_SUPERSEDE_TASK_BRANCH_START
   reviewer defaults to git config user.name/user.email when available
   Prepared by AI or tooling does not mean approved.
   Only the human reviewer may change Approved: no to Approved: yes.
@@ -234,20 +241,25 @@ Task authority v2 and contract closure:
     devctl contract lint --file docs/requirements/composed-activity/contract.yaml
     devctl approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
     devctl contract accept --issue IK3RR6 --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
-    devctl trace check --issue IK3RR6 --contract docs/requirements/composed-activity/contract.yaml --matrix .xflow/issues/issue-IK3RR6/traceability-matrix.yaml
+    devctl trace check --issue IK3RR6 --matrix .xflow/issues/issue-IK3RR6/traceability-matrix.yaml
   Native Windows PowerShell recipe:
     .\devctl.ps1 task activate --issue IK3RR6
     .\devctl.ps1 check classification --issue IK3RR6
     .\devctl.ps1 contract lint --file docs/requirements/composed-activity/contract.yaml
     .\devctl.ps1 approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
     .\devctl.ps1 contract accept --issue IK3RR6 --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
-    .\devctl.ps1 trace check --issue IK3RR6 --contract docs/requirements/composed-activity/contract.yaml --matrix .xflow/issues/issue-IK3RR6/traceability-matrix.yaml
+    .\devctl.ps1 trace check --issue IK3RR6 --matrix .xflow/issues/issue-IK3RR6/traceability-matrix.yaml
 
   Mechanical contract commands:
     devctl check classification --issue IK3RR6 [--file .xflow/issues/issue-IK3RR6/classification.yaml]
     devctl contract lint --file docs/requirements/example/contract.yaml
     devctl contract diff --old <old.yaml> --new <new.yaml>
     devctl trace check --issue IK3RR6 --contract <contract.yaml> --matrix <traceability-matrix.yaml>
+    devctl trace check --issue IK3RR6 --matrix <traceability-matrix.yaml>
+  Omit --contract when immutable sealed contract-acceptance history is the authority.
+  An explicit --contract is non-authoritative mechanical fail-closed evolution input.
+  It cannot replace sealed acceptance or create acceptance authority.
+  Non-acceptance routes still require --contract.
   Classification, lint, diff, and trace check are mechanical validation and
   comparison steps. lint does not approve semantic quality. A passing lint,
   diff, or trace check is evidence for review, never a human acceptance.

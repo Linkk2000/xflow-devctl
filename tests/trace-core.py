@@ -1256,7 +1256,10 @@ def test_historical_contract_trace_cli_accepts_moved_evolution_after_root_migrat
     moved_contract = repo / "specifications" / "contract.yaml"
     moved_contract.parent.mkdir(parents=True)
     contract_path.replace(moved_contract)
-    replace(moved_contract, "version: 0.1.0", "version: 0.2.0")
+    moved_text = moved_contract.read_text(encoding="utf-8")
+    moved_text = moved_text.replace("version: 0.1.0", "version: 0.1.1", 1)
+    moved_text = moved_text.replace("note: 非规范性背景", "note: 非规范性背景（迁移后路径）", 1)
+    write(moved_contract, moved_text)
     write(repo / ".xflow" / "xflow.json", '{"contracts":{"root":"specifications"}}\n')
 
     completed = _run_trace_cli(repo, path, "specifications/contract.yaml")
@@ -1284,6 +1287,95 @@ def test_historical_contract_trace_rejects_invalid_supplied_evolution(repo: Path
         completed = _run_trace_cli(repo, path, "contracts/candidate.yaml")
         assert completed.returncode != 0
         assert expected in completed.stderr, completed.stderr
+
+
+def test_historical_contract_trace_allows_same_version_status_lifecycle(repo: Path) -> None:
+    path, contract_path, _ = _prepare_historical_contract_trace(repo)
+    candidate_path = contract_path.with_name("active-status.yaml")
+    candidate = contract_path.read_text(encoding="utf-8").replace(
+        "status: accepted-design",
+        "status: active",
+        1,
+    )
+    write(candidate_path, candidate)
+
+    completed = _run_trace_cli(repo, path, "contracts/active-status.yaml")
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_historical_contract_trace_rejects_breaking_change_with_minor_bump(repo: Path) -> None:
+    path, contract_path, _ = _prepare_historical_contract_trace(repo)
+    candidate_path = contract_path.with_name("breaking-minor.yaml")
+    candidate = contract_path.read_text(encoding="utf-8")
+    candidate = candidate.replace("version: 0.1.0", "version: 0.2.0", 1)
+    candidate = candidate.replace(
+        "  version: 0.1.0\n  purpose: 参与者可依赖的业务价值和边界",
+        "  version: 1.0.0\n  purpose: 参与者不再获得原有可观察结果",
+        1,
+    )
+    write(candidate_path, candidate)
+
+    completed = _run_trace_cli(repo, path, "contracts/breaking-minor.yaml")
+    assert completed.returncode != 0
+    assert "under-bumped contract root" in completed.stderr, completed.stderr
+
+
+def test_historical_contract_trace_rejects_replacement_without_supersedes(repo: Path) -> None:
+    path, contract_path, _ = _prepare_historical_contract_trace(repo)
+    candidate_path = contract_path.with_name("missing-supersedes.yaml")
+    candidate = contract_path.read_text(encoding="utf-8")
+    candidate = candidate.replace("version: 0.1.0", "version: 1.0.0", 1)
+    candidate = candidate.replace(
+        "id: example.verify.case.operation-success",
+        "id: example.verify.case.operation-success-v2",
+        1,
+    )
+    write(candidate_path, candidate)
+
+    completed = _run_trace_cli(repo, path, "contracts/missing-supersedes.yaml")
+    assert completed.returncode != 0
+    assert "one-to-one supersedes" in completed.stderr, completed.stderr
+
+
+def test_historical_contract_trace_rejects_human_review_ambiguity(repo: Path) -> None:
+    path, contract_path, _ = _prepare_historical_contract_trace(repo)
+    candidate_path = contract_path.with_name("human-review.yaml")
+    candidate = contract_path.read_text(encoding="utf-8")
+    candidate = candidate.replace("version: 0.1.0", "version: 0.1.1", 1)
+    candidate = candidate.replace(
+        "  - kind: issue\n    target: issue-101\n    note: 能力来源记录",
+        "  - kind: issue\n    target: issue-101\n    note: 能力来源记录\n"
+        "  - kind: issue\n    target: issue-102\n    note: 后续审查来源",
+        1,
+    )
+    write(candidate_path, candidate)
+
+    completed = _run_trace_cli(repo, path, "contracts/human-review.yaml")
+    assert completed.returncode != 0
+    assert "requires new human acceptance authority" in completed.stderr, completed.stderr
+    assert "[WARN] changed contract references require human review" in completed.stderr, completed.stderr
+
+
+def test_supplied_contract_is_revalidated_at_trace_closure(repo: Path) -> None:
+    path, contract_path, _ = _prepare_historical_contract_trace(repo)
+    candidate_path = contract_path.with_name("closure-race.yaml")
+    candidate_text = contract_path.read_text(encoding="utf-8")
+    candidate_text = candidate_text.replace("version: 0.1.0", "version: 0.1.1", 1)
+    candidate_text = candidate_text.replace("note: 非规范性背景", "note: 非规范性背景（补充说明）", 1)
+    write(candidate_path, candidate_text)
+    candidate = load_contract(repo, candidate_path)
+    original_verify_closure = traceability_module._verify_closure
+
+    def mutate_supplied_contract(*args: object, **kwargs: object) -> object:
+        result = original_verify_closure(*args, **kwargs)
+        write(candidate_path, candidate_text + "\n")
+        return result
+
+    with patch.object(traceability_module, "_verify_closure", side_effect=mutate_supplied_contract):
+        assert_error(
+            "supplied contract changed during closure validation",
+            lambda: check_traceability(repo, "101", candidate, path),
+        )
 
 
 def _sealed_acceptance_fixture(
@@ -1792,6 +1884,11 @@ def main() -> None:
         test_historical_contract_trace_cli_survives_deleted_current_contract(repo)
         test_historical_contract_trace_cli_accepts_moved_evolution_after_root_migration(repo)
         test_historical_contract_trace_rejects_invalid_supplied_evolution(repo)
+        test_historical_contract_trace_allows_same_version_status_lifecycle(repo)
+        test_historical_contract_trace_rejects_breaking_change_with_minor_bump(repo)
+        test_historical_contract_trace_rejects_replacement_without_supersedes(repo)
+        test_historical_contract_trace_rejects_human_review_ambiguity(repo)
+        test_supplied_contract_is_revalidated_at_trace_closure(repo)
         test_sealed_acceptance_loader_rejects_missing_duplicate_and_schema(repo)
         test_sealed_acceptance_loader_rejects_status_and_objects(repo)
         test_historical_contract_trace_uses_sealed_acceptance(repo)

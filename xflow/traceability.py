@@ -31,6 +31,8 @@ from .contracts import (
     _identifier as contract_identifier,
     _parse_contract_yaml,
     _validate_contract_schema,
+    contract_diff_exit_code,
+    diff_contracts,
     normalize_verification_type,
 )
 from .local_artifacts import (
@@ -293,6 +295,19 @@ def _validate_supplied_contract_evolution(
             raise ValueError(
                 "supplied ContractDocument must not change contract semantics without a version advance"
             )
+        return
+    diff = diff_contracts(sealed_contract, supplied_contract)
+    if contract_diff_exit_code(diff) != 0 or diff.required_bump == "human-review":
+        blocking = tuple(
+            impact
+            for impact in diff.review_impacts
+            if impact.startswith("[ERROR]") or impact.startswith("[WARN]")
+        )
+        detail = "; ".join(blocking) or f"required bump is {diff.required_bump}"
+        raise ValueError(
+            "supplied ContractDocument evolution requires new human acceptance authority: "
+            f"{detail}"
+        )
 
 
 def _optional_snapshot(
@@ -398,6 +413,23 @@ def _load_context(
             (matrix_snapshot, "traceability matrix"),
         )
     )
+    captured_supplied: ContractDocument | None = None
+    if supplied_contract is not None:
+        supplied_snapshot, captured_supplied = _load_contract_snapshot(
+            root,
+            str(supplied_contract.path),
+        )
+        if (
+            captured_supplied.path != supplied_contract.path.resolve(strict=False)
+            or captured_supplied.sha256 != supplied_contract.sha256
+            or captured_supplied.raw_bytes != supplied_contract.raw_bytes
+            or captured_supplied.raw != supplied_contract.raw
+            or captured_supplied.objects_by_id != supplied_contract.objects_by_id
+        ):
+            raise ValueError(
+                "supplied ContractDocument path/hash does not match its exact on-disk snapshot"
+            )
+        tracked.append((supplied_snapshot, "supplied contract"))
 
     local_contract_signal = (
         task_snapshot.exists
@@ -567,8 +599,8 @@ def _load_context(
             raise ValueError(
                 "accepted contract reference does not match the current repository/worktree/branch/Issue and sealed contract bytes/path"
             )
-        if supplied_contract is not None:
-            _validate_supplied_contract_evolution(contract, supplied_contract)
+        if captured_supplied is not None:
+            _validate_supplied_contract_evolution(contract, captured_supplied)
     else:
         if require_task_state and supplied_contract is None:
             raise ValueError("non-acceptance trace check requires --contract")
@@ -577,8 +609,8 @@ def _load_context(
         expected_contract = f"{contract.raw['id']}@{contract.raw['version']}"
         if state.contract != expected_contract:
             raise ValueError("task-state Contract does not match matrix contract")
-        if supplied_contract is not None and (
-            supplied_contract.path != contract.path or supplied_contract.sha256 != contract.sha256
+        if captured_supplied is not None and (
+            captured_supplied.path != contract.path or captured_supplied.sha256 != contract.sha256
         ):
             raise ValueError("supplied ContractDocument bytes/path do not match the task-state contract")
     if reference_kind == "gap-recognition":

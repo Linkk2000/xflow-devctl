@@ -54,6 +54,7 @@ devctl contract lint --file docs/requirements/example/contract.yaml
 devctl contract accept --issue IK3RR6 --file docs/requirements/example/contract.yaml --objects <id,id,...>
 devctl contract diff --old <old.yaml> --new <new.yaml>
 devctl trace check --issue IK3RR6 --contract <contract.yaml> --matrix <traceability-matrix.yaml>
+devctl trace check --issue IK3RR6 --matrix <traceability-matrix.yaml>
 devctl migrate issue-workspace --mode tracked --check
 devctl migrate issue-workspace --mode local --check
 devctl git push --issue 1 --file .xflow/issues/issue-1/walkthrough.md
@@ -112,7 +113,7 @@ devctl check classification --issue IK3RR6
 devctl contract lint --file docs/requirements/composed-activity/contract.yaml
 devctl approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
 devctl contract accept --issue IK3RR6 --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
-devctl trace check --issue IK3RR6 --contract docs/requirements/composed-activity/contract.yaml --matrix .xflow/issues/issue-IK3RR6/traceability-matrix.yaml
+devctl trace check --issue IK3RR6 --matrix .xflow/issues/issue-IK3RR6/traceability-matrix.yaml
 ```
 
 The native Windows PowerShell equivalent is:
@@ -123,7 +124,7 @@ The native Windows PowerShell equivalent is:
 .\devctl.ps1 contract lint --file docs/requirements/composed-activity/contract.yaml
 .\devctl.ps1 approval prepare --issue IK3RR6 --action contract-acceptance --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
 .\devctl.ps1 contract accept --issue IK3RR6 --file docs/requirements/composed-activity/contract.yaml --objects <approved-id-list>
-.\devctl.ps1 trace check --issue IK3RR6 --contract docs/requirements/composed-activity/contract.yaml --matrix .xflow/issues/issue-IK3RR6/traceability-matrix.yaml
+.\devctl.ps1 trace check --issue IK3RR6 --matrix .xflow/issues/issue-IK3RR6/traceability-matrix.yaml
 ```
 
 The `task-branch-start` approval is a one-time local identity gate. It binds
@@ -145,6 +146,20 @@ approval bypass. `git start` does not implement, push, or perform any other
 remote write. Contract acceptance then occurs on the final branch, followed by
 a separate human development-start gate.
 
+If the current remote base no longer contains the sealed commit, or the sealed
+commit cannot be fetched, `git start` fails before a task branch effect. A
+human may retire an uneffected `reserved` claim with the exact command below
+after verifying that no target branch, task metadata, activation, or history
+effect exists:
+
+```text
+devctl approval supersede-branch-start --issue <id> --approval-id <id> --reason "<auditable reason>" --confirm XFLOW_HUMAN_SUPERSEDE_TASK_BRANCH_START
+```
+
+AI must never run branch-start supersede or supply its exact human confirmation.
+The command persists the `superseded` transition in the claim; deleting a claim
+is not a recovery protocol. Any detected branch or task effect fails closed.
+
 The mechanical commands may be used by a user or AI to validate and compare
 artifacts:
 
@@ -153,7 +168,14 @@ devctl check classification --issue IK3RR6 [--file .xflow/issues/issue-IK3RR6/cl
 devctl contract lint --file docs/requirements/example/contract.yaml
 devctl contract diff --old <old.yaml> --new <new.yaml>
 devctl trace check --issue IK3RR6 --contract <contract.yaml> --matrix <traceability-matrix.yaml>
+devctl trace check --issue IK3RR6 --matrix <traceability-matrix.yaml>
 ```
+
+Omit --contract when immutable sealed contract-acceptance history is the authority.
+An explicit --contract is non-authoritative mechanical fail-closed evolution input.
+It must match the sealed contract identity and pass version, object-version, and
+`supersedes` evolution checks; it never replaces the sealed acceptance or
+creates new acceptance authority. Non-acceptance routes still require --contract.
 
 Classification, lint, diff, and trace checks are mechanical. lint does not approve semantic quality.
 Passing these commands provides review evidence; it does not make a design or

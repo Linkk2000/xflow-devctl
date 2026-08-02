@@ -595,6 +595,46 @@ def task_branch_claim(repo_root: Path, issue: str) -> tuple[Path, dict[str, obje
     return claims[0], yaml.safe_load(claims[0].read_text(encoding="utf-8"))
 
 
+def assert_task_branch_claim_lock_reacquirable(repo_root: Path, approval_id: str) -> None:
+    lock_path = (
+        git_path(repo_root, "--git-common-dir")
+        / "xflow"
+        / "runtime"
+        / "task-branch-start"
+        / resolve_bindings(repo_root).worktree
+        / "claims.lock"
+    )
+    assert lock_path.is_file()
+    assert {path.name for path in lock_path.parent.iterdir()} == {"claims.lock"}
+    script = """
+import sys
+from pathlib import Path
+from xflow import approval
+
+repo = Path(sys.argv[1])
+with approval._approval_claim_lock(repo, sys.argv[2], "task-branch-start", "claim lock is busy"):
+    print("acquired")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(repo_root), approval_id],
+        cwd=repo_root,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(OPS_ROOT),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "acquired"
+    assert lock_path.is_file()
+    assert {path.name for path in lock_path.parent.iterdir()} == {"claims.lock"}
+
+
 def invoke_git_start_cli(repo_root: Path, args: SimpleNamespace) -> SimpleNamespace:
     argv = [
         "git",
@@ -647,6 +687,47 @@ def advance_origin(root: Path, origin: Path, name: str, content: str) -> str:
     ).stdout.strip()
     git(updater, "push", "origin", "main", "-q")
     return commit
+
+
+def replace_origin_history(root: Path, origin: Path, name: str, content: str) -> str:
+    replacement = root / name
+    git(root, "init", "-q", str(replacement))
+    git(replacement, "config", "user.email", "test@example.com")
+    git(replacement, "config", "user.name", "Test User")
+    git(replacement, "checkout", "-b", "main", "-q")
+    write(replacement / "README.md", content)
+    git(replacement, "add", "README.md")
+    git(replacement, "commit", "-m", f"test: {name}", "-q")
+    commit = subprocess.run(
+        ["git", "-C", str(replacement), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    git(replacement, "remote", "add", "origin", str(origin))
+    git(replacement, "push", "--force", "origin", "main", "-q")
+    return commit
+
+
+def reserve_task_branch_before_effect(
+    repo: Path,
+    args: SimpleNamespace,
+) -> tuple[Path, dict[str, object]]:
+    def stop_before_base_effect(_repo_root: Path, _base: str, _sealed_commit: str) -> None:
+        raise RuntimeError("injected stop before task branch base effect")
+
+    with patch.object(cli_module, "synchronize_base_to_commit", side_effect=stop_before_base_effect):
+        try:
+            invoke_git_start_cli(repo, args)
+        except RuntimeError as exc:
+            assert "before task branch base effect" in str(exc)
+        else:
+            raise AssertionError("expected injected stop before task branch base effect")
+    claim_path, claim = task_branch_claim(repo, args.issue)
+    assert claim["state"] == "reserved"
+    assert claim["baseCommit"] != "pending"
+    return claim_path, claim
 
 
 def assert_task_branch_start_revalidates_exact_bytes_after_pull(
@@ -743,6 +824,170 @@ def test_task_branch_start_replays_the_first_sealed_remote_tip(root: Path) -> No
     assert target_tip == sealed_tip
 
 
+def test_task_branch_start_rejects_force_pushed_remote_before_effect(root: Path) -> None:
+    issue = "718"
+    name = "branch-force-push"
+    repo, _, _, target, _, args = capability_branch_start_fixture(
+        root,
+        name,
+        issue,
+        "force-push",
+    )
+    origin = root / f"{name}-origin.git"
+    _, claim = reserve_task_branch_before_effect(repo, args)
+    replacement_tip = replace_origin_history(
+        root,
+        origin,
+        "branch-force-push-replacement",
+        "# replacement remote history\n",
+    )
+    assert replacement_tip != claim["baseCommit"]
+
+    replay = invoke_git_start_cli(repo, args)
+    assert replay.returncode == 1, replay.stdout
+    assert "sealed remote base" in replay.stderr and "current remote" in replay.stderr, replay.stderr
+    assert resolve_bindings(repo).branch == "main"
+    assert subprocess.run(
+        ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{target}"],
+        check=False,
+    ).returncode != 0
+    _, unchanged = task_branch_claim(repo, issue)
+    assert unchanged["state"] == "reserved"
+
+
+def test_human_supersede_unblocks_new_approval_after_sealed_sha_is_unreachable(root: Path) -> None:
+    issue = "719"
+    name = "branch-unreachable-supersede"
+    repo, state_path, _, target, _, args = capability_branch_start_fixture(
+        root,
+        name,
+        issue,
+        "unreachable-supersede",
+    )
+    origin = root / f"{name}-origin.git"
+    sealed_tip = advance_origin(root, origin, "branch-unreachable-sealed", "# sealed but unfetched tip\n")
+    claim_path, claim = reserve_task_branch_before_effect(repo, args)
+    assert claim["baseCommit"] == sealed_tip
+    replacement_tip = replace_origin_history(
+        root,
+        origin,
+        "branch-unreachable-replacement",
+        "# authoritative replacement tip\n",
+    )
+    git(origin, "reflog", "expire", "--expire=now", "--all")
+    git(origin, "gc", "--prune=now")
+    assert subprocess.run(
+        ["git", "-C", str(origin), "cat-file", "-e", f"{sealed_tip}^{{commit}}"],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ).returncode != 0
+
+    unreachable = invoke_git_start_cli(repo, args)
+    assert unreachable.returncode == 1, unreachable.stdout
+    assert subprocess.run(
+        ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{target}"],
+        check=False,
+    ).returncode != 0
+
+    replacement_review = approval.prepare(
+        repo,
+        issue,
+        "task-branch-start",
+        state_path,
+        reviewer="replacement human reviewer",
+        force=True,
+    )
+    write(
+        replacement_review,
+        replacement_review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"),
+    )
+    replacement_grant = approval.require_task_branch_start(repo, issue, state_path, target, "main")
+    assert replacement_grant.approval_id != claim["approvalId"]
+    shadowed = invoke_git_start_cli(repo, args)
+    assert shadowed.returncode == 1, shadowed.stdout
+    assert not approval._task_branch_claim_path(repo, issue, replacement_grant.approval_id).exists()
+
+    superseded = run_devctl_result(
+        repo,
+        "approval",
+        "supersede-branch-start",
+        "--issue",
+        issue,
+        "--approval-id",
+        str(claim["approvalId"]),
+        "--reason",
+        "sealed remote base is no longer reachable",
+        "--confirm",
+        "XFLOW_HUMAN_SUPERSEDE_TASK_BRANCH_START",
+    )
+    assert superseded.returncode == 0, superseded.stderr
+    retired_claim = yaml.safe_load(claim_path.read_text(encoding="utf-8"))
+    assert retired_claim["state"] == "superseded"
+    assert retired_claim["supersededReason"] == "sealed remote base is no longer reachable"
+
+    git(repo, "fetch", "origin", "main", "-q")
+    git(repo, "reset", "--hard", "FETCH_HEAD", "-q")
+    replay = invoke_git_start_cli(repo, args)
+    assert replay.returncode == 0, replay.stderr
+    claims = tuple(claim_path.parent.glob("*-task-branch.yaml"))
+    assert len(claims) == 2
+    states = {yaml.safe_load(path.read_text(encoding="utf-8"))["state"] for path in claims}
+    assert states == {"superseded", "completed"}
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", target],
+        check=True,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+    ).stdout.strip() == replacement_tip
+
+
+def test_task_branch_supersede_requires_exact_confirmation_and_no_effects(root: Path) -> None:
+    issue = "720"
+    repo, _, _, target, _, args = capability_branch_start_fixture(
+        root,
+        "branch-supersede-guard",
+        issue,
+        "supersede-guard",
+    )
+    claim_path, claim = reserve_task_branch_before_effect(repo, args)
+    wrong = run_devctl_result(
+        repo,
+        "approval",
+        "supersede-branch-start",
+        "--issue",
+        issue,
+        "--approval-id",
+        str(claim["approvalId"]),
+        "--reason",
+        "remote base was replaced",
+        "--confirm",
+        "WRONG_CONFIRMATION",
+    )
+    assert wrong.returncode == 1, wrong.stdout
+    assert "exact human confirmation" in wrong.stderr
+    assert yaml.safe_load(claim_path.read_text(encoding="utf-8"))["state"] == "reserved"
+
+    git(repo, "branch", target, str(claim["baseCommit"]))
+    effected = run_devctl_result(
+        repo,
+        "approval",
+        "supersede-branch-start",
+        "--issue",
+        issue,
+        "--approval-id",
+        str(claim["approvalId"]),
+        "--reason",
+        "remote base was replaced",
+        "--confirm",
+        "XFLOW_HUMAN_SUPERSEDE_TASK_BRANCH_START",
+    )
+    assert effected.returncode == 1, effected.stdout
+    assert "branch effect" in effected.stderr
+    assert yaml.safe_load(claim_path.read_text(encoding="utf-8"))["state"] == "reserved"
+
+
 def test_task_branch_start_recovers_after_branch_creation(root: Path) -> None:
     issue = "713"
     repo, _, _, target, ctx, args = capability_branch_start_fixture(
@@ -777,9 +1022,7 @@ def test_task_branch_start_recovers_after_branch_creation(root: Path) -> None:
     assert resolve_bindings(repo).branch == target
     records = tuple((repo / ".xflow" / "issues" / f"issue-{issue}" / "approvals" / "history").glob("*-task-branch-start-*.yaml"))
     assert len(records) == 1
-    assert not tuple(
-        (git_path(repo, "--git-common-dir") / "xflow" / "runtime" / "task-branch-start").rglob("*.lock")
-    )
+    assert_task_branch_claim_lock_reacquirable(repo, str(completed["approvalId"]))
 
 
 def test_task_branch_start_recovers_after_activation(root: Path) -> None:
@@ -819,6 +1062,71 @@ def test_task_branch_start_recovers_after_activation(root: Path) -> None:
     assert authority.read_bytes() == authority_bytes
     records = tuple((repo / ".xflow" / "issues" / f"issue-{issue}" / "approvals" / "history").glob("*-task-branch-start-*.yaml"))
     assert len(records) == 1
+
+
+def activated_task_branch_claim_before_history(
+    root: Path,
+    name: str,
+    issue: str,
+    slug: str,
+) -> tuple[Path, SimpleNamespace, Path, dict[str, object]]:
+    repo, _, _, _, _, args = capability_branch_start_fixture(root, name, issue, slug)
+
+    def fail_history(_path: Path, _content: str) -> None:
+        raise RuntimeError("injected stop after task branch history identity")
+
+    with patch.object(approval, "_write_history_atomic", side_effect=fail_history):
+        try:
+            invoke_git_start_cli(repo, args)
+        except RuntimeError as exc:
+            assert "after task branch history identity" in str(exc)
+        else:
+            raise AssertionError("expected injected task branch history failure")
+    claim_path, claim = task_branch_claim(repo, issue)
+    assert claim["state"] == "activated"
+    assert claim["recordedAt"] != "none"
+    assert claim["historyFile"] != "none"
+    assert not (repo / Path(str(claim["historyFile"]))).exists()
+    return repo, args, claim_path, claim
+
+
+def test_task_branch_completion_rejects_noncanonical_history_paths(root: Path) -> None:
+    cases = (
+        ("cross-issue", "721"),
+        ("wrong-filename", "722"),
+        ("arbitrary-safe", "723"),
+    )
+    for kind, issue in cases:
+        repo, args, claim_path, claim = activated_task_branch_claim_before_history(
+            root,
+            f"branch-history-{kind}",
+            issue,
+            f"history-{kind}",
+        )
+        canonical = repo / Path(str(claim["historyFile"]))
+        if kind == "cross-issue":
+            redirected = (
+                repo
+                / ".xflow"
+                / "issues"
+                / "issue-OTHER"
+                / "approvals"
+                / "history"
+                / canonical.name
+            )
+        elif kind == "wrong-filename":
+            redirected = canonical.with_name("wrong-task-branch-start-history.yaml")
+        else:
+            redirected = repo / ".xflow" / "audit" / f"branch-start-{issue}.yaml"
+        claim["historyFile"] = redirected.relative_to(repo).as_posix()
+        claim_path.write_bytes(approval._task_branch_claim_bytes(claim))
+
+        replay = invoke_git_start_cli(repo, args)
+        assert replay.returncode == 1, (kind, replay.stdout)
+        assert "canonical task branch approval history" in replay.stderr, (kind, replay.stderr)
+        persisted = yaml.safe_load(claim_path.read_text(encoding="utf-8"))
+        assert persisted["state"] == "activated"
+        assert not redirected.exists()
 
 
 def test_task_branch_start_rejects_unclaimed_or_wrong_start_point(root: Path) -> None:
@@ -1675,8 +1983,12 @@ def main() -> None:
         test_task_branch_start_revalidates_exact_task_state_after_pull(root)
         test_task_branch_start_revalidates_exact_local_review_after_pull(root)
         test_task_branch_start_replays_the_first_sealed_remote_tip(root)
+        test_task_branch_start_rejects_force_pushed_remote_before_effect(root)
+        test_human_supersede_unblocks_new_approval_after_sealed_sha_is_unreachable(root)
+        test_task_branch_supersede_requires_exact_confirmation_and_no_effects(root)
         test_task_branch_start_recovers_after_branch_creation(root)
         test_task_branch_start_recovers_after_activation(root)
+        test_task_branch_completion_rejects_noncanonical_history_paths(root)
         test_task_branch_start_rejects_unclaimed_or_wrong_start_point(root)
         test_git_hook_devctl_reentry(root)
         test_git_hook_requires_retained_contract_acceptance(root)
