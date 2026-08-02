@@ -110,7 +110,14 @@ CREDENTIAL_PATTERNS = (
     re.compile(r"(?i)(?:^|[^A-Za-z0-9])(?:token|secret|password|credential|access[_-]?key)\s*[:=]"),
 )
 REMOTE_RECONCILIATION_CONFIRMATION = "XFLOW_HUMAN_REMOTE_RECONCILED"
-REMOTE_CLAIM_STATES = {"reserved", "outcome-unknown", "retryable", "remote-confirmed", "completed"}
+REMOTE_CLAIM_STATES = {
+    "reserved",
+    "outcome-unknown",
+    "retryable",
+    "post-effects-pending",
+    "remote-confirmed",
+    "completed",
+}
 REMOTE_CLAIM_FIELD_ORDER = (
     "version", "approvalId", "repository", "worktree", "branch", "approvalIssue", "action",
     "approvedFile", "approvedSha256", "reviewerSummary", "approvedReviewFile",
@@ -775,6 +782,16 @@ def _history_records(repo_root: Path) -> tuple[dict[str, object], ...]:
 def reject_consumed_approval(repo_root: Path, approval_id: str) -> None:
     for record in _history_records(repo_root):
         if record["source"] in {"local-review", "unattended"} and record["approvalId"] == approval_id:
+            remote_claim_file = record.get("remoteClaimFile")
+            if record["source"] == "local-review" and isinstance(remote_claim_file, str):
+                claim_path = require_safe_repo_path(
+                    repo_root,
+                    repo_root / Path(remote_claim_file),
+                    "remote approval claim",
+                )
+                claim = _parse_remote_claim(repo_root, claim_path, str(record["approvalIssue"]))
+                if claim["state"] != "completed" and _remote_history_payload(claim) == record:
+                    continue
             raise ValueError(f"approval already consumed: {approval_id}")
 
 
@@ -1545,7 +1562,7 @@ def _parse_remote_claim(repo_root: Path, path: Path, issue: str) -> dict[str, ob
             raise ValueError(f"remote approval claim has invalid {name}")
     _canonical_utc_timestamp(payload["reservedAt"], "reservedAt", microseconds=True)
     _canonical_utc_timestamp(payload["updatedAt"], "updatedAt", microseconds=True)
-    if payload["state"] in {"remote-confirmed", "completed"}:
+    if payload["state"] in {"post-effects-pending", "remote-confirmed", "completed"}:
         if payload["targetIssue"] == "none" or payload["providerReceipt"] == "none":
             raise ValueError("remote approval claim is missing provider confirmation")
         normalized_issue(payload["targetIssue"])
@@ -1613,7 +1630,7 @@ def _reservation_from_claim(repo_root: Path, claim_path: Path, claim: dict[str, 
         approved_snapshot_path=snapshot_path,
         approved_bytes=approved_bytes,
         attempt=int(claim["attempt"]),
-        provider_required=claim["state"] != "remote-confirmed",
+        provider_required=claim["state"] not in {"post-effects-pending", "remote-confirmed"},
         target_issue="" if claim["targetIssue"] == "none" else str(claim["targetIssue"]),
         provider_receipt="" if claim["providerReceipt"] == "none" else str(claim["providerReceipt"]),
     )
@@ -1634,7 +1651,7 @@ def reserve_remote_action(repo_root: Path, grant: ApprovalGrant) -> RemoteAction
             _validate_remote_claim_grant(claim, grant)
             if claim["state"] == "completed":
                 raise ValueError(f"approval already consumed: {grant.approval_id}")
-            if claim["state"] == "remote-confirmed":
+            if claim["state"] in {"post-effects-pending", "remote-confirmed"}:
                 return _reservation_from_claim(root, claim_path, claim)
             if claim["state"] != "retryable":
                 raise ValueError(f"remote approval outcome unresolved: {grant.approval_id}")
@@ -1794,14 +1811,16 @@ def reconcile_remote_action(
             _replace_bytes(claim_path, _remote_claim_bytes(claim))
             return _reservation_from_claim(root, claim_path, claim)
     reservation = _reservation_from_claim(root, claim_path, claim)
-    confirm_remote_action(
+    confirmed = confirm_remote_action(
         root,
         reservation,
         target_issue=target_issue,
         provider_receipt=provider_receipt or {},
         reconciled=True,
     )
-    return complete_remote_action(root, _reservation_from_claim(root, claim_path, _parse_remote_claim(root, claim_path, grant.approval_issue)))
+    if grant.action == "git-mr":
+        return confirmed
+    return complete_remote_action(root, confirmed)
 
 
 def reconcile_remote_action_by_id(
@@ -1880,7 +1899,7 @@ def confirm_remote_action(
         history_path = _history_path(root, target, grant.action, recorded_at, grant.approval_id)
         claim.update(
             {
-                "state": "remote-confirmed",
+                "state": "post-effects-pending" if grant.action == "git-mr" else "remote-confirmed",
                 "targetIssue": target,
                 "providerReceipt": receipt,
                 "failureReason": "none",
@@ -1895,6 +1914,60 @@ def confirm_remote_action(
         return _reservation_from_claim(root, reservation.claim_path, claim)
 
 
+def _publish_remote_action_history(root: Path, claim: dict[str, object]) -> Path:
+    history_path = require_safe_repo_path(root, root / Path(str(claim["historyFile"])), "remote approval history")
+    target_root = issue_dir(root, str(claim["targetIssue"]))
+    if history_path.parent != target_root / "approvals" / "history":
+        raise ValueError("remote approval history path does not match target Issue")
+    history_bytes = _yaml_bytes(_remote_history_payload(claim))
+    if hashlib.sha256(history_bytes).hexdigest() != claim["historySha256"]:
+        raise ValueError("remote approval claim does not seal exact history")
+    _publish_exact_artifact(
+        root,
+        target_root,
+        history_path,
+        history_bytes,
+        label="remote approval history",
+        collision_message="remote approval history collision",
+    )
+    return history_path
+
+
+def publish_remote_action_history(repo_root: Path, reservation: RemoteActionReservation) -> Path:
+    root = repo_root.resolve()
+    grant = reservation.grant
+    with _remote_action_lock(root, grant.approval_id):
+        claim = _parse_remote_claim(root, reservation.claim_path, grant.approval_issue)
+        _validate_remote_claim_grant(claim, grant)
+        if claim["state"] not in {"post-effects-pending", "remote-confirmed"}:
+            raise ValueError("remote approval has not been provider-confirmed")
+        return _publish_remote_action_history(root, claim)
+
+
+def mark_remote_post_effects_complete(
+    repo_root: Path,
+    reservation: RemoteActionReservation,
+) -> RemoteActionReservation:
+    root = repo_root.resolve()
+    grant = reservation.grant
+    if grant.action != "git-mr":
+        raise ValueError("deferred remote post-effects are only supported for git-mr")
+    with _remote_action_lock(root, grant.approval_id):
+        claim = _parse_remote_claim(root, reservation.claim_path, grant.approval_issue)
+        _validate_remote_claim_grant(claim, grant)
+        if claim["state"] == "remote-confirmed":
+            return _reservation_from_claim(root, reservation.claim_path, claim)
+        if claim["state"] != "post-effects-pending":
+            raise ValueError("remote approval post-effects are not pending")
+        history_path = require_safe_repo_path(root, root / Path(str(claim["historyFile"])), "remote approval history")
+        history_bytes = _stable_approval_bytes(root, history_path, issue_dir(root, str(claim["targetIssue"])), "remote approval history")
+        if hashlib.sha256(history_bytes).hexdigest() != claim["historySha256"]:
+            raise ValueError("remote approval post-effects require exact published history")
+        claim.update({"state": "remote-confirmed", "updatedAt": _canonical_utc_now()})
+        _replace_bytes(reservation.claim_path, _remote_claim_bytes(claim))
+        return _reservation_from_claim(root, reservation.claim_path, claim)
+
+
 def complete_remote_action(repo_root: Path, reservation: RemoteActionReservation) -> Path:
     root = repo_root.resolve()
     grant = reservation.grant
@@ -1903,23 +1976,11 @@ def complete_remote_action(repo_root: Path, reservation: RemoteActionReservation
         _validate_remote_claim_grant(claim, grant)
         if claim["state"] == "completed":
             raise ValueError(f"approval already consumed: {grant.approval_id}")
+        if claim["state"] == "post-effects-pending":
+            raise ValueError("remote approval post-effects are not complete")
         if claim["state"] != "remote-confirmed":
             raise ValueError("remote approval has not been provider-confirmed")
-        history_path = require_safe_repo_path(root, root / Path(str(claim["historyFile"])), "remote approval history")
-        target_root = issue_dir(root, str(claim["targetIssue"]))
-        if history_path.parent != target_root / "approvals" / "history":
-            raise ValueError("remote approval history path does not match target Issue")
-        history_bytes = _yaml_bytes(_remote_history_payload(claim))
-        if hashlib.sha256(history_bytes).hexdigest() != claim["historySha256"]:
-            raise ValueError("remote approval claim does not seal exact history")
-        _publish_exact_artifact(
-            root,
-            target_root,
-            history_path,
-            history_bytes,
-            label="remote approval history",
-            collision_message="remote approval history collision",
-        )
+        history_path = _publish_remote_action_history(root, claim)
         claim.update({"state": "completed", "updatedAt": _canonical_utc_now()})
         _replace_bytes(reservation.claim_path, _remote_claim_bytes(claim))
         return history_path
@@ -2699,6 +2760,8 @@ def record_subordinate_effect(
     parent_grant: ApprovalGrant,
     action: Literal["git-state-backfill"],
     result: Literal["success"],
+    *,
+    idempotent: bool = False,
 ) -> Path:
     if result != "success":
         raise ValueError("subordinate effect records require confirmed success")
@@ -2724,12 +2787,23 @@ def record_subordinate_effect(
         parent_records[0].get(name) != value for name, value in expected_parent.items()
     ):
         raise ValueError("git-state-backfill parent approval snapshot mismatch")
-    if any(
-        record["source"] == "effect"
-        and record["parentApprovalId"] == parent_grant.approval_id
-        and record["action"] == action
-        for record in records
-    ):
+    existing_effect = next(
+        (
+            path
+            for path in sorted(
+                (repo_root / ".xflow" / "issues" / f"issue-{parent_grant.approval_issue}" / "approvals" / "history").glob(
+                    "*.yaml"
+                )
+            )
+            if (record := _parse_history(repo_root, path))["source"] == "effect"
+            and record["parentApprovalId"] == parent_grant.approval_id
+            and record["action"] == action
+        ),
+        None,
+    )
+    if existing_effect is not None:
+        if idempotent:
+            return existing_effect
         raise ValueError("git-state-backfill effect already recorded")
     recorded_at = datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
     payload: dict[str, object] = {

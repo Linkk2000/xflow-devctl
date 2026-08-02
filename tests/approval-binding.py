@@ -529,14 +529,214 @@ def test_reserved_mr_history_can_parent_confirmed_backfill(
         target_issue=None,
         provider_receipt={"number": "42", "html_url": "https://example.invalid/pulls/42"},
     )
-    parent = approval.complete_remote_action(repo_root, confirmed)
-    effect = approval.record_subordinate_effect(repo_root, grant, "git-state-backfill", "success")
+    assert_value_error(
+        "post-effects are not complete",
+        lambda: approval.complete_remote_action(repo_root, confirmed),
+    )
+    parent = approval.publish_remote_action_history(repo_root, confirmed)
+    effect = approval.record_subordinate_effect(
+        repo_root,
+        grant,
+        "git-state-backfill",
+        "success",
+        idempotent=True,
+    )
+    assert approval.record_subordinate_effect(
+        repo_root,
+        grant,
+        "git-state-backfill",
+        "success",
+        idempotent=True,
+    ) == effect
+    ready = approval.mark_remote_post_effects_complete(repo_root, confirmed)
+    assert approval.complete_remote_action(repo_root, ready) == parent
 
     parent_payload = yaml.safe_load(parent.read_text(encoding="utf-8"))
     effect_payload = yaml.safe_load(effect.read_text(encoding="utf-8"))
     assert (repo_root / parent_payload["approvedSnapshotFile"]).read_bytes() == original
     assert effect_payload["parentApprovalId"] == grant.approval_id
     assert effect_payload["parentAction"] == "git-mr"
+
+
+def prepare_replayable_mr(repo_root: Path, approved_file: Path) -> approval.ApprovalGrant:
+    write(
+        repo_root / ".xflow" / "current-task.md",
+        """# XFlow Current Task
+
+Issue: 202
+State: G5_APPROVE_MR_CREATE
+
+## Allowed Actions
+- Create the approved MR.
+
+## Forbidden Actions
+- Change implementation after approval.
+""",
+    )
+    write(
+        approved_file,
+        """<!-- xflow: mr-draft -->
+
+Closes #202
+
+## Summary
+- Exercise replay after provider confirmation.
+
+## Test Plan
+- python tests/approval-binding.py
+
+## Risk
+- Low.
+
+## Review Request
+- Review the recovered local metadata.
+""",
+    )
+    review = approval.prepare(repo_root, "202", "git-mr", approved_file, reviewer="human reviewer", force=True)
+    approve(review)
+    return approval.require_remote(repo_root, "git-mr", approved_file, "202")
+
+
+def run_replayable_mr(
+    repo_root: Path,
+    provider_calls: list[str],
+    *,
+    set_meta: object | None = None,
+) -> int:
+    body_file = repo_root / ".xflow" / "issues" / "issue-202" / "walkthrough.md"
+    def create_pull_request(*_args: object, **_kwargs: object) -> providers.PullRequestResult:
+        provider_calls.append("create")
+        return providers.PullRequestResult("42", "https://example.invalid/pulls/42")
+
+    patches = [
+        patch.dict(
+            os.environ,
+            {
+                "DEVCTL_REPO_ROOT": str(repo_root),
+                "DEVCTL_TOOL_ROOT": str(OPS_ROOT),
+                "DEVCTL_OPS_ROOT": str(OPS_ROOT),
+                "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            clear=False,
+        ),
+        patch.object(cli, "require_branch_ready_for_mr"),
+        patch.object(cli, "require_branch_contains_remote_base"),
+        patch.object(providers, "create_pull_request", side_effect=create_pull_request),
+        patch.object(
+            cli,
+            "commit_and_push_pr_backfill",
+            return_value=cli.PushResult(performed=True, success=True),
+        ),
+    ]
+    if set_meta is not None:
+        patches.append(patch.object(cli, "set_branch_meta", side_effect=set_meta))
+    with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        if len(patches) == 6:
+            with patches[5]:
+                return cli.main(
+                    ["git", "mr", "--title", "Replay MR", "--body-file", str(body_file), "--issue", "202"]
+                )
+        return cli.main(
+            ["git", "mr", "--title", "Replay MR", "--body-file", str(body_file), "--issue", "202"]
+        )
+
+
+def test_mr_replay_after_provider_confirmation_finishes_local_effects(
+    repo_root: Path,
+    approved_file: Path,
+) -> None:
+    grant = prepare_replayable_mr(repo_root, approved_file)
+    provider_calls: list[str] = []
+
+    def fail_before_pr_meta(_repo_root: Path, key: str, _value: str) -> None:
+        if key == "pr":
+            raise RuntimeError("injected failure before PR metadata")
+        raise AssertionError(f"unexpected metadata key before injected failure: {key}")
+
+    try:
+        run_replayable_mr(repo_root, provider_calls, set_meta=fail_before_pr_meta)
+    except RuntimeError as exc:
+        assert "injected failure" in str(exc)
+    else:
+        raise AssertionError("expected post-provider metadata failure")
+
+    claim_path = next(
+        (repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history" / "claims").glob("*-remote.yaml")
+    )
+    claim = yaml.safe_load(claim_path.read_text(encoding="utf-8"))
+    assert claim["approvalId"] == grant.approval_id
+    assert claim["state"] == "post-effects-pending"
+    assert provider_calls == ["create"]
+
+    assert run_replayable_mr(repo_root, provider_calls) == 0
+    assert provider_calls == ["create"]
+    assert cli.branch_meta(repo_root, "pr") == "42"
+    assert cli.branch_meta(repo_root, "pr-url") == "https://example.invalid/pulls/42"
+    suggestion = repo_root / ".xflow" / "issues" / "issue-202" / "state-update-suggestion.md"
+    assert "PR: 42" in suggestion.read_text(encoding="utf-8")
+    assert "PR URL: https://example.invalid/pulls/42" in suggestion.read_text(encoding="utf-8")
+    current_task = (repo_root / ".xflow" / "current-task.md").read_text(encoding="utf-8")
+    assert "State: S9_REMOTE_REVIEW_AND_CI" in current_task
+    assert "PR: 42" in current_task
+
+    history = repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history"
+    records = [yaml.safe_load(path.read_text(encoding="utf-8")) for path in history.glob("*.yaml")]
+    assert len([record for record in records if record["action"] == "git-mr"]) == 1
+    assert len([record for record in records if record["action"] == "git-state-backfill"]) == 1
+    assert yaml.safe_load(claim_path.read_text(encoding="utf-8"))["state"] == "completed"
+
+
+def test_mr_replay_converges_after_partial_metadata(repo_root: Path, approved_file: Path) -> None:
+    prepare_replayable_mr(repo_root, approved_file)
+    provider_calls: list[str] = []
+    original_set_branch_meta = cli.set_branch_meta
+
+    def fail_after_pr_meta(root: Path, key: str, value: str) -> None:
+        if key == "pr-url":
+            raise RuntimeError("injected failure after PR number metadata")
+        original_set_branch_meta(root, key, value)
+
+    try:
+        run_replayable_mr(repo_root, provider_calls, set_meta=fail_after_pr_meta)
+    except RuntimeError as exc:
+        assert "injected failure" in str(exc)
+    else:
+        raise AssertionError("expected partial metadata failure")
+    assert cli.branch_meta(repo_root, "pr") == "42"
+    assert not cli.branch_meta(repo_root, "pr-url")
+
+    assert run_replayable_mr(repo_root, provider_calls) == 0
+    assert provider_calls == ["create"]
+    history = repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history"
+    actions = [yaml.safe_load(path.read_text(encoding="utf-8"))["action"] for path in history.glob("*.yaml")]
+    assert actions.count("git-mr") == 1
+    assert actions.count("git-state-backfill") == 1
+
+
+def test_mr_replay_rejects_conflicting_pr_identity(repo_root: Path, approved_file: Path) -> None:
+    prepare_replayable_mr(repo_root, approved_file)
+    provider_calls: list[str] = []
+
+    def fail_before_pr_meta(_repo_root: Path, key: str, _value: str) -> None:
+        if key == "pr":
+            raise RuntimeError("injected failure before PR metadata")
+
+    try:
+        run_replayable_mr(repo_root, provider_calls, set_meta=fail_before_pr_meta)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected post-provider metadata failure")
+    cli.set_branch_meta(repo_root, "pr", "99")
+
+    assert run_replayable_mr(repo_root, provider_calls) == 1
+    assert provider_calls == ["create"]
+    assert cli.branch_meta(repo_root, "pr") == "99"
+    claim_path = next(
+        (repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history" / "claims").glob("*-remote.yaml")
+    )
+    assert yaml.safe_load(claim_path.read_text(encoding="utf-8"))["state"] == "post-effects-pending"
 
 
 def test_skipped_backfill_has_no_effect(repo_root: Path, approved_file: Path) -> None:
@@ -870,6 +1070,12 @@ def main() -> None:
         test_remote_reconciliation_cli_requires_exact_human_confirmation(reconcile_repo, reconcile_file)
         backfill_repo, backfill_file = init_active_repo(root, "remote-mr-backfill")
         test_reserved_mr_history_can_parent_confirmed_backfill(backfill_repo, backfill_file)
+        replay_repo, replay_file = init_active_repo(root, "remote-mr-replay")
+        test_mr_replay_after_provider_confirmation_finishes_local_effects(replay_repo, replay_file)
+        partial_repo, partial_file = init_active_repo(root, "remote-mr-partial")
+        test_mr_replay_converges_after_partial_metadata(partial_repo, partial_file)
+        conflict_repo, conflict_file = init_active_repo(root, "remote-mr-conflict")
+        test_mr_replay_rejects_conflicting_pr_identity(conflict_repo, conflict_file)
         skipped_backfill_repo, skipped_backfill_file = init_active_repo(root, "skipped-backfill")
         test_skipped_backfill_has_no_effect(skipped_backfill_repo, skipped_backfill_file)
         final_repo, final_file = init_active_repo(root, "final-issue-effect")

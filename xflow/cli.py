@@ -647,7 +647,16 @@ def begin_remote_action(
     receipt = json.loads(reservation.provider_receipt)
     if not isinstance(receipt, dict):
         raise ValueError("confirmed provider receipt must be a mapping")
-    approval.complete_remote_action(repo_root, reservation)
+    return reservation, receipt
+
+
+def begin_remote_action_with_immediate_completion(
+    repo_root: Path,
+    grant: approval.ApprovalGrant,
+) -> tuple[approval.RemoteActionReservation | None, dict[str, object] | None]:
+    reservation, receipt = begin_remote_action(repo_root, grant)
+    if receipt is not None and reservation is not None:
+        approval.complete_remote_action(repo_root, reservation)
     return reservation, receipt
 
 
@@ -721,7 +730,7 @@ def run_issue(args: argparse.Namespace) -> int:
         if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
             print("[INFO] issue-comment gate passed; provider skipped")
             return 0
-        reservation, recovered = begin_remote_action(ctx.repo_root, grant)
+        reservation, recovered = begin_remote_action_with_immediate_completion(ctx.repo_root, grant)
         if recovered is None:
             provider_body = reservation.approved_text() if reservation is not None else body
             try:
@@ -750,7 +759,7 @@ def run_issue(args: argparse.Namespace) -> int:
         if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
             print("[INFO] issue-close gate passed; provider skipped")
             return 0
-        reservation, recovered = begin_remote_action(ctx.repo_root, grant)
+        reservation, recovered = begin_remote_action_with_immediate_completion(ctx.repo_root, grant)
         if recovered is None:
             try:
                 result = providers.close_issue(ctx.repo_root, issue_id, os.environ)
@@ -787,7 +796,7 @@ def run_issue(args: argparse.Namespace) -> int:
     if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
         print("[INFO] issue-create gate passed; provider skipped")
         return 0
-    reservation, recovered = begin_remote_action(ctx.repo_root, grant)
+    reservation, recovered = begin_remote_action_with_immediate_completion(ctx.repo_root, grant)
     if recovered is None:
         provider_body = reservation.approved_text() if reservation is not None else body
         try:
@@ -877,6 +886,53 @@ def set_branch_meta(repo_root: Path, key: str, value: str) -> None:
         value = normalized_issue(value)
     enable_worktree_config(repo_root)
     git_run(repo_root, ["config", "--worktree", f"devctl.{key}", value])
+
+
+def _document_pr_identity(path: Path) -> tuple[str, str]:
+    if not path.is_file():
+        return "", ""
+    number = ""
+    url = ""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("PR:"):
+            number = line.partition(":")[2].strip()
+        elif line.startswith("PR URL:"):
+            url = line.partition(":")[2].strip()
+    return number, url
+
+
+def _require_matching_pr_identity(label: str, actual_number: str, actual_url: str, number: str, url: str) -> None:
+    if actual_number and normalized_issue(actual_number) != normalized_issue(number):
+        raise ValueError(f"conflicting {label} PR identity: expected {number}, got {actual_number}")
+    if actual_url and actual_url != url:
+        raise ValueError(f"conflicting {label} PR URL: expected {url or 'none'}, got {actual_url}")
+
+
+def apply_pr_local_metadata(
+    repo_root: Path,
+    issue: str,
+    number: str,
+    url: str,
+) -> tuple[Path, list[Path]]:
+    _require_matching_pr_identity(
+        "branch metadata",
+        branch_meta(repo_root, "pr"),
+        branch_meta(repo_root, "pr-url"),
+        number,
+        url,
+    )
+    suggestion = repo_root / ".xflow" / "issues" / f"issue-{normalized_issue(issue)}" / "state-update-suggestion.md"
+    suggestion_number, suggestion_url = _document_pr_identity(suggestion)
+    _require_matching_pr_identity("state suggestion", suggestion_number, suggestion_url, number, url)
+    current_task = repo_root / ".xflow" / "current-task.md"
+    task_number, task_url = _document_pr_identity(current_task)
+    _require_matching_pr_identity("current task", task_number, task_url, number, url)
+
+    set_branch_meta(repo_root, "pr", number)
+    if url:
+        set_branch_meta(repo_root, "pr-url", url)
+    written_suggestion = write_pr_state_update_suggestion(repo_root, issue, number, url)
+    return written_suggestion, update_current_task_for_pr(repo_root, issue, number, url)
 
 
 def branch_meta(repo_root: Path, key: str) -> str:
@@ -1137,6 +1193,10 @@ def commit_and_push_pr_backfill(
             f"expected {sorted(expected_paths)}, found {sorted(staged_after)}"
         )
     if not staged_after:
+        upstream = git_output(repo_root, ["rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}"])
+        tracked = all(git_succeeds(repo_root, ["ls-files", "--error-unmatch", relative]) for relative in expected_paths)
+        if upstream and tracked and git_succeeds(repo_root, ["diff", "--quiet", upstream, "HEAD"]):
+            return PushResult(performed=True, success=True)
         return None
     message = (
         f"chore(xflow): 回填合并请求状态[#{normalized_issue(issue)}]\n\n"
@@ -1161,7 +1221,7 @@ def run_git_push(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     if branch == base:
         raise ValueError(f"current branch is {base}; start a task branch before pushing")
     grant = approval.require_remote_or_unattended(ctx.repo_root, "git-push", approved_file, issue)
-    reservation, recovered = begin_remote_action(ctx.repo_root, grant)
+    reservation, recovered = begin_remote_action_with_immediate_completion(ctx.repo_root, grant)
     if recovered is not None:
         push_result = PushResult(performed=True, success=True)
     else:
@@ -1376,7 +1436,7 @@ def _run_git(ctx: RuntimeContext, args: argparse.Namespace) -> int:
         if remote_pr.base != base:
             raise ValueError(f"pull request base branch mismatch: expected {base}, got {remote_pr.base}")
         grant = approval.require_remote_or_unattended(ctx.repo_root, "git-pr-merge", approved_file, issue)
-        reservation, recovered = begin_remote_action(ctx.repo_root, grant)
+        reservation, recovered = begin_remote_action_with_immediate_completion(ctx.repo_root, grant)
         if recovered is None:
             try:
                 result = providers.merge_pull_request(
@@ -1447,22 +1507,41 @@ def _run_git(ctx: RuntimeContext, args: argparse.Namespace) -> int:
         except BaseException as exc:
             mark_remote_outcome_unknown(ctx.repo_root, reservation, exc)
             raise
-        finish_remote_action(
-            ctx.repo_root,
-            grant,
-            reservation,
-            target_issue=None,
-            provider_receipt={"html_url": result.html_url, "number": result.number},
-        )
+        if reservation is None:
+            confirmed = None
+        else:
+            confirmed = approval.confirm_remote_action(
+                ctx.repo_root,
+                reservation,
+                target_issue=None,
+                provider_receipt={"html_url": result.html_url, "number": result.number},
+            )
     else:
         result = providers.PullRequestResult(str(recovered["number"]), str(recovered.get("html_url", "")))
-    set_branch_meta(ctx.repo_root, "pr", result.number)
-    if result.html_url:
-        set_branch_meta(ctx.repo_root, "pr-url", result.html_url)
-    suggestion = write_pr_state_update_suggestion(ctx.repo_root, issue, result.number, result.html_url)
-    backfill_paths = [suggestion, *update_current_task_for_pr(ctx.repo_root, issue, result.number, result.html_url)]
+        confirmed = reservation
+    suggestion, current_task_paths = apply_pr_local_metadata(
+        ctx.repo_root,
+        issue,
+        result.number,
+        result.html_url,
+    )
+    backfill_paths = [suggestion, *current_task_paths]
     backfill_pushed = commit_and_push_pr_backfill(ctx.repo_root, branch, backfill_paths, result.number, issue)
-    record_backfill_effect_if_confirmed(ctx.repo_root, grant, backfill_pushed)
+    if confirmed is None:
+        approval.record_consumed_approval(ctx.repo_root, grant, "success")
+    else:
+        approval.publish_remote_action_history(ctx.repo_root, confirmed)
+    if backfill_pushed is not None and backfill_pushed.performed and backfill_pushed.success:
+        approval.record_subordinate_effect(
+            ctx.repo_root,
+            grant,
+            "git-state-backfill",
+            "success",
+            idempotent=True,
+        )
+    if confirmed is not None:
+        ready = approval.mark_remote_post_effects_complete(ctx.repo_root, confirmed)
+        approval.complete_remote_action(ctx.repo_root, ready)
     print(f"[INFO] PR #{result.number} created")
     if result.html_url:
         print(f"[INFO] {result.html_url}")
