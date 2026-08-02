@@ -13,6 +13,7 @@ import threading
 from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
 import yaml
@@ -24,6 +25,7 @@ sys.path.insert(0, str(OPS_ROOT))
 
 from xflow.checks import check_resolution_report, write_pr_state_update_suggestion
 from xflow import approval as approval_gate
+from xflow import cli as cli_module
 from xflow import providers as provider_module
 from xflow.bindings import resolve_bindings
 from xflow.commit_message import check_commit_message
@@ -1898,6 +1900,47 @@ def test_pr_backfill_commit_message_without_push(repo: Path) -> None:
     assert "business.py" not in git_text(repo, "show", "--format=", "--name-only", "HEAD")
 
 
+def test_pr_backfill_replays_real_commit_and_push_windows(parent: Path) -> None:
+    parent.mkdir(parents=True)
+    origin = parent / "origin.git"
+    repo = parent / "repo"
+    git(parent, "init", "--bare", str(origin))
+    repo.mkdir()
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test User")
+    git(repo, "checkout", "-b", "main", "-q")
+    write(repo / "README.md", "# Demo\n")
+    git(repo, "add", "README.md")
+    git(repo, "commit", "-m", "初始化仓库", "-q")
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "push", "-u", "origin", "main", "-q")
+    branch = "feature/8-pr-backfill-replay"
+    git(repo, "checkout", "-b", branch, "-q")
+    write(repo / "feature.txt", "feature content\n")
+    git(repo, "add", "feature.txt")
+    git(repo, "commit", "-m", "feat(xflow): 添加回填恢复场景", "-q")
+    git(repo, "push", "-u", "origin", branch, "-q")
+
+    suggestion = repo / ".xflow" / "issues" / "issue-8" / "state-update-suggestion.md"
+    write(suggestion, "PR: 42\nPR URL: https://example.invalid/pulls/42\n")
+    with patch.object(cli_module, "push_branch", side_effect=RuntimeError("injected failure before backfill push")):
+        try:
+            commit_and_push_pr_backfill(repo, branch, [suggestion], "42", "8")
+        except RuntimeError as exc:
+            assert "injected failure" in str(exc)
+        else:
+            raise AssertionError("expected failure after local backfill commit")
+    assert git_text(repo, "rev-list", "--count", f"origin/{branch}..HEAD") == "1"
+
+    pushed = commit_and_push_pr_backfill(repo, branch, [suggestion], "42", "8")
+    assert pushed is not None and pushed.performed and pushed.success
+    assert git_text(repo, "rev-parse", "HEAD") == git_text(repo, "rev-parse", f"origin/{branch}")
+
+    already_pushed = commit_and_push_pr_backfill(repo, branch, [suggestion], "42", "8")
+    assert already_pushed is not None and already_pushed.performed and already_pushed.success
+
+
 def test_python_core_git_and_app_commands(parent: Path) -> None:
     parent.mkdir(parents=True, exist_ok=True)
     origin = parent / "origin.git"
@@ -2748,6 +2791,7 @@ def main() -> None:
         test_commit_message_cli(repo / "commit-message-cli")
         test_commit_message_generator(repo / "commit-message-generator")
         test_pr_backfill_commit_message_without_push(repo / "pr-backfill-message")
+        test_pr_backfill_replays_real_commit_and_push_windows(repo / "pr-backfill-replay")
         test_python_core_git_and_app_commands(repo / "core-routing")
         test_git_done_requires_exact_human_cleanup_approval(repo / "git-done-exact-approval")
         test_git_task_metadata_is_scoped_to_each_worktree(repo / "worktree-metadata")

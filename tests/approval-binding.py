@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -117,6 +118,30 @@ def init_active_repo(root: Path, name: str, issue: str = "202") -> tuple[Path, P
     write(approved_file, "# Walkthrough\n\nApproved artifact.\n")
     activate(repo, issue)
     return repo, approved_file
+
+
+def init_remote_mr_repo(root: Path, name: str) -> tuple[Path, Path, Path]:
+    origin = root / f"{name}-origin.git"
+    repo = root / name
+    git(root, "init", "--bare", str(origin))
+    git(root, "init", "-q", str(repo))
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test User")
+    git(repo, "checkout", "-b", "main", "-q")
+    write(repo / "README.md", f"# {name}\n")
+    git(repo, "add", "README.md")
+    git(repo, "commit", "-m", "init", "-q")
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "push", "-u", "origin", "main", "-q")
+    branch = f"feature/202-{name}"
+    git(repo, "checkout", "-b", branch, "-q")
+    write(repo / "feature.txt", "approved feature content\n")
+    git(repo, "add", "feature.txt")
+    git(repo, "commit", "-m", "feat(xflow): 添加远端恢复场景", "-q")
+    git(repo, "push", "-u", "origin", branch, "-q")
+    approved_file = repo / ".xflow" / "issues" / "issue-202" / "walkthrough.md"
+    activate(repo, "202")
+    return repo, approved_file, origin
 
 
 def test_consumed_record(repo_root: Path, approved_file: Path) -> None:
@@ -601,9 +626,12 @@ def run_replayable_mr(
     repo_root: Path,
     provider_calls: list[str],
     *,
+    body_file: Path | None = None,
     set_meta: object | None = None,
+    backfill_result: cli.PushResult | None = cli.PushResult(performed=True, success=True),
+    update_task: object | None = None,
 ) -> int:
-    body_file = repo_root / ".xflow" / "issues" / "issue-202" / "walkthrough.md"
+    selected_body = body_file or repo_root / ".xflow" / "issues" / "issue-202" / "walkthrough.md"
     def create_pull_request(*_args: object, **_kwargs: object) -> providers.PullRequestResult:
         provider_calls.append("create")
         return providers.PullRequestResult("42", "https://example.invalid/pulls/42")
@@ -626,17 +654,67 @@ def run_replayable_mr(
         patch.object(
             cli,
             "commit_and_push_pr_backfill",
-            return_value=cli.PushResult(performed=True, success=True),
+            return_value=backfill_result,
         ),
     ]
     if set_meta is not None:
         patches.append(patch.object(cli, "set_branch_meta", side_effect=set_meta))
+    if update_task is not None:
+        patches.append(patch.object(cli, "update_current_task_for_pr", side_effect=update_task))
     with patches[0], patches[1], patches[2], patches[3], patches[4]:
-        if len(patches) == 6:
+        if set_meta is not None:
             with patches[5]:
                 return cli.main(
-                    ["git", "mr", "--title", "Replay MR", "--body-file", str(body_file), "--issue", "202"]
+                    ["git", "mr", "--title", "Replay MR", "--body-file", str(selected_body), "--issue", "202"]
                 )
+        if update_task is not None:
+            with patches[5]:
+                return cli.main(
+                    ["git", "mr", "--title", "Replay MR", "--body-file", str(selected_body), "--issue", "202"]
+                )
+        return cli.main(
+            ["git", "mr", "--title", "Replay MR", "--body-file", str(selected_body), "--issue", "202"]
+        )
+
+
+def run_real_replayable_mr(
+    repo_root: Path,
+    provider_calls: list[str],
+    *,
+    push_effect: object | None = None,
+    history_effect: object | None = None,
+) -> int:
+    body_file = repo_root / ".xflow" / "issues" / "issue-202" / "walkthrough.md"
+
+    def create_pull_request(*_args: object, **_kwargs: object) -> providers.PullRequestResult:
+        provider_calls.append("create")
+        return providers.PullRequestResult("42", "https://example.invalid/pulls/42")
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.dict(
+                os.environ,
+                {
+                    "DEVCTL_REPO_ROOT": str(repo_root),
+                    "DEVCTL_TOOL_ROOT": str(OPS_ROOT),
+                    "DEVCTL_OPS_ROOT": str(OPS_ROOT),
+                    "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+                clear=False,
+            )
+        )
+        stack.enter_context(patch.object(providers, "create_pull_request", side_effect=create_pull_request))
+        if push_effect is not None:
+            stack.enter_context(patch.object(cli, "push_branch", side_effect=push_effect))
+        if history_effect is not None:
+            stack.enter_context(
+                patch.object(
+                    approval,
+                    "publish_remote_action_history",
+                    side_effect=history_effect,
+                )
+            )
         return cli.main(
             ["git", "mr", "--title", "Replay MR", "--body-file", str(body_file), "--issue", "202"]
         )
@@ -714,6 +792,94 @@ def test_mr_replay_converges_after_partial_metadata(repo_root: Path, approved_fi
     assert actions.count("git-state-backfill") == 1
 
 
+def assert_real_mr_replay_completed(repo_root: Path, origin: Path, provider_calls: list[str]) -> None:
+    branch = subprocess.run(
+        ["git", "-C", str(repo_root), "branch", "--show-current"],
+        check=True,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    assert provider_calls == ["create"]
+    assert subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+    ).stdout.strip() == subprocess.run(
+        ["git", "-C", str(origin), "rev-parse", f"refs/heads/{branch}"],
+        check=True,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    history = repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history"
+    actions = [yaml.safe_load(path.read_text(encoding="utf-8"))["action"] for path in history.glob("*.yaml")]
+    assert actions.count("git-mr") == 1
+    assert actions.count("git-state-backfill") == 1
+    claim_path = next((history / "claims").glob("*-remote.yaml"))
+    assert yaml.safe_load(claim_path.read_text(encoding="utf-8"))["state"] == "completed"
+
+
+def test_mr_replay_pushes_existing_local_backfill_commit(
+    repo_root: Path,
+    approved_file: Path,
+    origin: Path,
+) -> None:
+    prepare_replayable_mr(repo_root, approved_file)
+    provider_calls: list[str] = []
+    try:
+        run_real_replayable_mr(
+            repo_root,
+            provider_calls,
+            push_effect=RuntimeError("injected failure after local backfill commit"),
+        )
+    except RuntimeError as exc:
+        assert "injected failure" in str(exc)
+    else:
+        raise AssertionError("expected failure after local backfill commit")
+    branch = subprocess.run(
+        ["git", "-C", str(repo_root), "branch", "--show-current"],
+        check=True,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    assert subprocess.run(
+        ["git", "-C", str(repo_root), "rev-list", "--count", f"origin/{branch}..HEAD"],
+        check=True,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+    ).stdout.strip() == "1"
+
+    assert run_real_replayable_mr(repo_root, provider_calls) == 0
+    assert_real_mr_replay_completed(repo_root, origin, provider_calls)
+
+
+def test_mr_replay_verifies_already_pushed_backfill_before_history(
+    repo_root: Path,
+    approved_file: Path,
+    origin: Path,
+) -> None:
+    prepare_replayable_mr(repo_root, approved_file)
+    provider_calls: list[str] = []
+    try:
+        run_real_replayable_mr(
+            repo_root,
+            provider_calls,
+            history_effect=RuntimeError("injected failure after backfill push"),
+        )
+    except RuntimeError as exc:
+        assert "injected failure" in str(exc)
+    else:
+        raise AssertionError("expected failure after backfill push")
+
+    assert run_real_replayable_mr(repo_root, provider_calls) == 0
+    assert_real_mr_replay_completed(repo_root, origin, provider_calls)
+
+
 def test_mr_replay_rejects_conflicting_pr_identity(repo_root: Path, approved_file: Path) -> None:
     prepare_replayable_mr(repo_root, approved_file)
     provider_calls: list[str] = []
@@ -737,6 +903,197 @@ def test_mr_replay_rejects_conflicting_pr_identity(repo_root: Path, approved_fil
         (repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history" / "claims").glob("*-remote.yaml")
     )
     assert yaml.safe_load(claim_path.read_text(encoding="utf-8"))["state"] == "post-effects-pending"
+
+
+def test_mr_without_successful_backfill_stays_nonterminal(
+    repo_root: Path,
+    approved_file: Path,
+    result: cli.PushResult | None,
+) -> None:
+    prepare_replayable_mr(repo_root, approved_file)
+    provider_calls: list[str] = []
+    assert run_replayable_mr(repo_root, provider_calls, backfill_result=result) == 1
+    assert provider_calls == ["create"]
+    claim_path = next(
+        (repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history" / "claims").glob(
+            "*-remote.yaml"
+        )
+    )
+    assert yaml.safe_load(claim_path.read_text(encoding="utf-8"))["state"] == "post-effects-pending"
+    history = repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history"
+    assert not tuple(history.glob("*.yaml"))
+
+
+def test_mr_terminal_gate_requires_unique_backfill_effect(repo_root: Path, approved_file: Path) -> None:
+    grant = prepare_replayable_mr(repo_root, approved_file)
+    reservation = approval.reserve_remote_action(repo_root, grant)
+    confirmed = approval.confirm_remote_action(
+        repo_root,
+        reservation,
+        target_issue=None,
+        provider_receipt={"number": "42", "html_url": "https://example.invalid/pulls/42"},
+    )
+    approval.publish_remote_action_history(repo_root, confirmed)
+    assert_value_error(
+        "git-state-backfill effect",
+        lambda: approval.mark_remote_post_effects_complete(repo_root, confirmed),
+    )
+
+
+def test_mr_replay_uses_sealed_body_when_mutable_body_changes(repo_root: Path, approved_file: Path) -> None:
+    prepare_replayable_mr(repo_root, approved_file)
+    provider_calls: list[str] = []
+
+    def fail_before_pr_meta(_repo_root: Path, key: str, _value: str) -> None:
+        if key == "pr":
+            raise RuntimeError("injected failure before PR metadata")
+
+    try:
+        run_replayable_mr(repo_root, provider_calls, set_meta=fail_before_pr_meta)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected post-provider metadata failure")
+    approved_file.write_text("mutated body without MR markers\n", encoding="utf-8")
+
+    assert run_replayable_mr(repo_root, provider_calls) == 0
+    assert provider_calls == ["create"]
+
+
+def test_mr_replay_uses_sealed_body_when_mutable_body_is_deleted(repo_root: Path, approved_file: Path) -> None:
+    prepare_replayable_mr(repo_root, approved_file)
+    provider_calls: list[str] = []
+
+    def fail_before_pr_meta(_repo_root: Path, key: str, _value: str) -> None:
+        if key == "pr":
+            raise RuntimeError("injected failure before PR metadata")
+
+    try:
+        run_replayable_mr(repo_root, provider_calls, set_meta=fail_before_pr_meta)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected post-provider metadata failure")
+    approved_file.unlink()
+
+    assert run_replayable_mr(repo_root, provider_calls) == 0
+    assert provider_calls == ["create"]
+
+
+def test_pending_mr_claim_discovery_rejects_conflicting_body_path(
+    repo_root: Path,
+    approved_file: Path,
+) -> None:
+    prepare_replayable_mr(repo_root, approved_file)
+    provider_calls: list[str] = []
+
+    def fail_before_pr_meta(_repo_root: Path, key: str, _value: str) -> None:
+        if key == "pr":
+            raise RuntimeError("injected failure before PR metadata")
+
+    try:
+        run_replayable_mr(repo_root, provider_calls, set_meta=fail_before_pr_meta)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected post-provider metadata failure")
+    conflicting_body = approved_file.with_name("other-mr-draft.md")
+    shutil.copyfile(approved_file, conflicting_body)
+
+    assert run_replayable_mr(repo_root, provider_calls, body_file=conflicting_body) == 1
+    assert provider_calls == ["create"]
+
+
+def test_pending_mr_claim_discovery_rejects_multiple_matches(repo_root: Path, approved_file: Path) -> None:
+    first = prepare_replayable_mr(repo_root, approved_file)
+    first_reservation = approval.reserve_remote_action(repo_root, first)
+    approval.confirm_remote_action(
+        repo_root,
+        first_reservation,
+        target_issue=None,
+        provider_receipt={"number": "42", "html_url": "https://example.invalid/pulls/42"},
+    )
+    second_review = approval.prepare(
+        repo_root,
+        "202",
+        "git-mr",
+        approved_file,
+        reviewer="second human reviewer",
+        force=True,
+    )
+    approve(second_review)
+    second = approval.require_remote(repo_root, "git-mr", approved_file, "202")
+    assert second.approval_id != first.approval_id
+    second_reservation = approval.reserve_remote_action(repo_root, second)
+    approval.confirm_remote_action(
+        repo_root,
+        second_reservation,
+        target_issue=None,
+        provider_receipt={"number": "43", "html_url": "https://example.invalid/pulls/43"},
+    )
+
+    assert_value_error(
+        "multiple matching pending git-mr claims",
+        lambda: approval.resume_pending_remote_action(repo_root, "git-mr", approved_file, "202"),
+    )
+
+
+def test_mr_replay_completes_partial_current_task_fields(repo_root: Path, approved_file: Path) -> None:
+    prepare_replayable_mr(repo_root, approved_file)
+    provider_calls: list[str] = []
+
+    def write_partial_task(root: Path, issue: str, number: str, _url: str) -> list[Path]:
+        path = root / ".xflow" / "current-task.md"
+        path.write_text(
+            f"# XFlow Current Task\n\nIssue: {issue}\nState: S9_REMOTE_REVIEW_AND_CI\n\n"
+            f"## Remote Review\nPR: {number}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        raise RuntimeError("injected failure after partial current-task metadata")
+
+    try:
+        run_replayable_mr(repo_root, provider_calls, update_task=write_partial_task)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected partial current-task failure")
+
+    assert run_replayable_mr(repo_root, provider_calls) == 0
+    assert provider_calls == ["create"]
+    current_task = (repo_root / ".xflow" / "current-task.md").read_text(encoding="utf-8")
+    assert current_task.count("PR: 42") == 1
+    assert current_task.count("PR URL: https://example.invalid/pulls/42") == 1
+
+
+def test_current_task_pr_fields_merge_and_conflict(repo_root: Path) -> None:
+    current_task = repo_root / ".xflow" / "current-task.md"
+    write(
+        current_task,
+        "# XFlow Current Task\n\nIssue: 202\nState: S9_REMOTE_REVIEW_AND_CI\n\n## Remote Review\nPR: 42\n",
+    )
+    assert cli.update_current_task_for_pr(
+        repo_root,
+        "202",
+        "42",
+        "https://example.invalid/pulls/42",
+    ) == [current_task]
+    merged = current_task.read_text(encoding="utf-8")
+    assert merged.count("PR: 42") == 1
+    assert merged.count("PR URL: https://example.invalid/pulls/42") == 1
+    write(
+        current_task,
+        merged.replace("https://example.invalid/pulls/42", "https://example.invalid/pulls/99"),
+    )
+    assert_value_error(
+        "conflicting current task PR URL",
+        lambda: cli.update_current_task_for_pr(
+            repo_root,
+            "202",
+            "42",
+            "https://example.invalid/pulls/42",
+        ),
+    )
 
 
 def test_skipped_backfill_has_no_effect(repo_root: Path, approved_file: Path) -> None:
@@ -1074,8 +1431,38 @@ def main() -> None:
         test_mr_replay_after_provider_confirmation_finishes_local_effects(replay_repo, replay_file)
         partial_repo, partial_file = init_active_repo(root, "remote-mr-partial")
         test_mr_replay_converges_after_partial_metadata(partial_repo, partial_file)
+        local_commit_repo, local_commit_file, local_commit_origin = init_remote_mr_repo(root, "remote-mr-local-commit")
+        test_mr_replay_pushes_existing_local_backfill_commit(
+            local_commit_repo,
+            local_commit_file,
+            local_commit_origin,
+        )
+        pushed_repo, pushed_file, pushed_origin = init_remote_mr_repo(root, "remote-mr-pushed")
+        test_mr_replay_verifies_already_pushed_backfill_before_history(pushed_repo, pushed_file, pushed_origin)
         conflict_repo, conflict_file = init_active_repo(root, "remote-mr-conflict")
         test_mr_replay_rejects_conflicting_pr_identity(conflict_repo, conflict_file)
+        incomplete_repo, incomplete_file = init_active_repo(root, "remote-mr-incomplete")
+        test_mr_without_successful_backfill_stays_nonterminal(incomplete_repo, incomplete_file, None)
+        skipped_repo, skipped_file = init_active_repo(root, "remote-mr-skipped")
+        test_mr_without_successful_backfill_stays_nonterminal(
+            skipped_repo,
+            skipped_file,
+            cli.PushResult(performed=False, success=False),
+        )
+        gate_repo, gate_file = init_active_repo(root, "remote-mr-effect-gate")
+        test_mr_terminal_gate_requires_unique_backfill_effect(gate_repo, gate_file)
+        mutated_repo, mutated_file = init_active_repo(root, "remote-mr-mutated-body")
+        test_mr_replay_uses_sealed_body_when_mutable_body_changes(mutated_repo, mutated_file)
+        deleted_repo, deleted_file = init_active_repo(root, "remote-mr-deleted-body")
+        test_mr_replay_uses_sealed_body_when_mutable_body_is_deleted(deleted_repo, deleted_file)
+        claim_conflict_repo, claim_conflict_file = init_active_repo(root, "remote-mr-claim-conflict")
+        test_pending_mr_claim_discovery_rejects_conflicting_body_path(claim_conflict_repo, claim_conflict_file)
+        multiple_repo, multiple_file = init_active_repo(root, "remote-mr-multiple-claims")
+        test_pending_mr_claim_discovery_rejects_multiple_matches(multiple_repo, multiple_file)
+        partial_task_repo, partial_task_file = init_active_repo(root, "remote-mr-partial-task")
+        test_mr_replay_completes_partial_current_task_fields(partial_task_repo, partial_task_file)
+        task_merge_repo, _task_merge_file = init_active_repo(root, "remote-mr-task-merge")
+        test_current_task_pr_fields_merge_and_conflict(task_merge_repo)
         skipped_backfill_repo, skipped_backfill_file = init_active_repo(root, "skipped-backfill")
         test_skipped_backfill_has_no_effect(skipped_backfill_repo, skipped_backfill_file)
         final_repo, final_file = init_active_repo(root, "final-issue-effect")

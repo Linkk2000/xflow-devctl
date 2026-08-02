@@ -644,10 +644,16 @@ def begin_remote_action(
     reservation = approval.reserve_remote_action(repo_root, grant)
     if reservation.provider_required:
         return reservation, None
+    return reservation, provider_receipt_from_reservation(reservation)
+
+
+def provider_receipt_from_reservation(
+    reservation: approval.RemoteActionReservation,
+) -> dict[str, object]:
     receipt = json.loads(reservation.provider_receipt)
     if not isinstance(receipt, dict):
         raise ValueError("confirmed provider receipt must be a mapping")
-    return reservation, receipt
+    return receipt
 
 
 def begin_remote_action_with_immediate_completion(
@@ -891,14 +897,16 @@ def set_branch_meta(repo_root: Path, key: str, value: str) -> None:
 def _document_pr_identity(path: Path) -> tuple[str, str]:
     if not path.is_file():
         return "", ""
-    number = ""
-    url = ""
+    numbers: list[str] = []
+    urls: list[str] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if line.startswith("PR:"):
-            number = line.partition(":")[2].strip()
+            numbers.append(line.partition(":")[2].strip())
         elif line.startswith("PR URL:"):
-            url = line.partition(":")[2].strip()
-    return number, url
+            urls.append(line.partition(":")[2].strip())
+    if len(numbers) > 1 or len(urls) > 1:
+        raise ValueError(f"duplicate PR identity fields in {path}")
+    return (numbers[0] if numbers else "", urls[0] if urls else "")
 
 
 def _require_matching_pr_identity(label: str, actual_number: str, actual_url: str, number: str, url: str) -> None:
@@ -932,7 +940,9 @@ def apply_pr_local_metadata(
     if url:
         set_branch_meta(repo_root, "pr-url", url)
     written_suggestion = write_pr_state_update_suggestion(repo_root, issue, number, url)
-    return written_suggestion, update_current_task_for_pr(repo_root, issue, number, url)
+    update_current_task_for_pr(repo_root, issue, number, url)
+    current_task_paths = [current_task] if current_task.is_file() else []
+    return written_suggestion, current_task_paths
 
 
 def branch_meta(repo_root: Path, key: str) -> str:
@@ -1136,6 +1146,9 @@ def update_current_task_for_pr(repo_root: Path, issue: str, pr_number: str, pr_u
     if not path.is_file():
         return []
     text = path.read_text(encoding="utf-8")
+    expected_url = pr_url or ""
+    actual_number, actual_url = _document_pr_identity(path)
+    _require_matching_pr_identity("current task", actual_number, actual_url, pr_number, expected_url)
     lines = []
     state_updated = False
     for line in text.splitlines():
@@ -1146,10 +1159,29 @@ def update_current_task_for_pr(repo_root: Path, issue: str, pr_number: str, pr_u
             lines.append(line)
     if not state_updated:
         lines.insert(0, "State: S9_REMOTE_REVIEW_AND_CI")
-    updated = "\n".join(lines).rstrip() + "\n"
-    if "## Remote Review" not in updated:
+    headings = [index for index, line in enumerate(lines) if line.strip() == "## Remote Review"]
+    if len(headings) > 1:
+        raise ValueError("current task contains duplicate Remote Review sections")
+    if not headings:
         url_line = f"PR URL: {pr_url}\n" if pr_url else ""
-        updated += f"\n## Remote Review\nPR: {pr_number}\n{url_line}"
+        lines.extend(["", "## Remote Review", f"PR: {pr_number}"])
+        if url_line:
+            lines.append(url_line.rstrip("\n"))
+    else:
+        section_start = headings[0]
+        section_end = next(
+            (index for index in range(section_start + 1, len(lines)) if lines[index].startswith("## ")),
+            len(lines),
+        )
+        section = lines[section_start + 1 : section_end]
+        pr_offset = next((index for index, line in enumerate(section) if line.startswith("PR:")), None)
+        if pr_offset is None:
+            section.insert(0, f"PR: {pr_number}")
+            pr_offset = 0
+        if pr_url and not any(line.startswith("PR URL:") for line in section):
+            section.insert(pr_offset + 1, f"PR URL: {pr_url}")
+        lines[section_start + 1 : section_end] = section
+    updated = "\n".join(lines).rstrip() + "\n"
     if updated != text:
         path.write_text(updated, encoding="utf-8", newline="\n")
         return [path]
@@ -1187,25 +1219,50 @@ def commit_and_push_pr_backfill(
         for line in git_run(repo_root, ["diff", "--cached", "--name-only"]).splitlines()
         if line
     }
-    if staged_after != expected_paths:
+    if not staged_after.issubset(expected_paths):
         raise ValueError(
-            "PR state backfill staged paths must exactly match metadata paths; "
-            f"expected {sorted(expected_paths)}, found {sorted(staged_after)}"
+            "PR state backfill staged paths must stay within metadata paths; "
+            f"allowed {sorted(expected_paths)}, found {sorted(staged_after)}"
         )
-    if not staged_after:
-        upstream = git_output(repo_root, ["rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}"])
-        tracked = all(git_succeeds(repo_root, ["ls-files", "--error-unmatch", relative]) for relative in expected_paths)
-        if upstream and tracked and git_succeeds(repo_root, ["diff", "--quiet", upstream, "HEAD"]):
-            return PushResult(performed=True, success=True)
-        return None
     message = (
         f"chore(xflow): 回填合并请求状态[#{normalized_issue(issue)}]\n\n"
         "- 记录合并请求编号与远端链接\n"
         "- 同步当前任务状态文件"
     )
     check_commit_message(message, branch_issue=issue)
-    git_run(repo_root, ["commit", "-m", message])
-    return push_branch(repo_root, branch)
+    if staged_after:
+        git_run(repo_root, ["commit", "-m", message])
+        return push_branch(repo_root, branch)
+
+    tracked = all(git_succeeds(repo_root, ["ls-files", "--error-unmatch", relative]) for relative in expected_paths)
+    clean_paths = git_succeeds(repo_root, ["diff", "--quiet", "HEAD", "--", *sorted(expected_paths)])
+    committed_paths = {
+        line
+        for line in git_run(repo_root, ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]).splitlines()
+        if line
+    }
+    committed_message = git_run(repo_root, ["log", "-1", "--pretty=%B"]).strip()
+    if (
+        not expected_paths
+        or not tracked
+        or not clean_paths
+        or not committed_paths
+        or not committed_paths.issubset(expected_paths)
+        or committed_message != message
+    ):
+        raise ValueError("PR state backfill has no verifiable committed metadata effect")
+    upstream = git_output(repo_root, ["rev-parse", "--abbrev-ref", f"{branch}@{{upstream}}"])
+    if not upstream:
+        raise ValueError("PR state backfill recovery requires an existing upstream")
+    ahead = int(git_output(repo_root, ["rev-list", "--count", f"{upstream}..HEAD"]) or "0")
+    behind = int(git_output(repo_root, ["rev-list", "--count", f"HEAD..{upstream}"]) or "0")
+    if behind or ahead > 1:
+        raise ValueError("PR state backfill recovery found an unexpected upstream history")
+    if ahead == 1:
+        return push_branch(repo_root, branch)
+    if git_output(repo_root, ["rev-parse", "HEAD"]) != git_output(repo_root, ["rev-parse", upstream]):
+        raise ValueError("PR state backfill recovery requires HEAD to match its upstream")
+    return PushResult(performed=True, success=True)
 
 
 def run_git_push(ctx: RuntimeContext, args: argparse.Namespace) -> int:
@@ -1477,30 +1534,36 @@ def _run_git(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     if not issue:
         raise ValueError("devctl git mr requires --issue or branch issue metadata")
     body_file = args.body_file or default_issue_file(ctx.repo_root, issue, "mr-draft.md")
-    if not body_file.is_file():
-        raise ValueError(f"body file does not exist: {body_file}")
-    check_current_task(ctx.repo_root, issue)
-    check_mr_draft(body_file)
-    attachment.ensure_publishable(ctx.repo_root, body_file, args.attachments, issue if args.attachments else None)
     branch = current_branch(ctx.repo_root)
-    base = args.base or branch_meta(ctx.repo_root, "base") or default_base(ctx.repo_root)
-    if branch == base:
-        raise ValueError(f"current branch is {base}; start a task branch before creating an MR")
-    require_branch_ready_for_mr(ctx.repo_root, branch)
-    require_branch_contains_remote_base(ctx.repo_root, base)
-    grant = approval.require_remote_or_unattended(
-        ctx.repo_root,
-        "git-mr",
-        body_file,
-        issue,
-        args.attachments,
-    )
-    title = args.title or f"[#{issue}] {branch.replace('-', ' ')}"
-    if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
-        print("[INFO] git-mr gate passed; provider skipped")
-        return 0
-    reservation, recovered = begin_remote_action(ctx.repo_root, grant)
+    reservation = approval.resume_pending_remote_action(ctx.repo_root, "git-mr", body_file, issue)
+    if reservation is not None:
+        grant = reservation.grant
+        recovered = provider_receipt_from_reservation(reservation)
+    else:
+        if not body_file.is_file():
+            raise ValueError(f"body file does not exist: {body_file}")
+        check_current_task(ctx.repo_root, issue)
+        check_mr_draft(body_file)
+        attachment.ensure_publishable(ctx.repo_root, body_file, args.attachments, issue if args.attachments else None)
+        base = args.base or branch_meta(ctx.repo_root, "base") or default_base(ctx.repo_root)
+        if branch == base:
+            raise ValueError(f"current branch is {base}; start a task branch before creating an MR")
+        require_branch_ready_for_mr(ctx.repo_root, branch)
+        require_branch_contains_remote_base(ctx.repo_root, base)
+        grant = approval.require_remote_or_unattended(
+            ctx.repo_root,
+            "git-mr",
+            body_file,
+            issue,
+            args.attachments,
+        )
+        if os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
+            print("[INFO] git-mr gate passed; provider skipped")
+            return 0
+        reservation, recovered = begin_remote_action(ctx.repo_root, grant)
     if recovered is None:
+        base = args.base or branch_meta(ctx.repo_root, "base") or default_base(ctx.repo_root)
+        title = args.title or f"[#{issue}] {branch.replace('-', ' ')}"
         provider_body = reservation.approved_text() if reservation is not None else body_file.read_text(encoding="utf-8")
         try:
             result = providers.create_pull_request(ctx.repo_root, title, provider_body, branch, base, os.environ)
@@ -1527,18 +1590,19 @@ def _run_git(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     )
     backfill_paths = [suggestion, *current_task_paths]
     backfill_pushed = commit_and_push_pr_backfill(ctx.repo_root, branch, backfill_paths, result.number, issue)
+    if backfill_pushed is None or not backfill_pushed.performed or not backfill_pushed.success:
+        raise ValueError("PR state backfill is not confirmed; remote approval remains pending")
     if confirmed is None:
         approval.record_consumed_approval(ctx.repo_root, grant, "success")
     else:
         approval.publish_remote_action_history(ctx.repo_root, confirmed)
-    if backfill_pushed is not None and backfill_pushed.performed and backfill_pushed.success:
-        approval.record_subordinate_effect(
-            ctx.repo_root,
-            grant,
-            "git-state-backfill",
-            "success",
-            idempotent=True,
-        )
+    approval.record_subordinate_effect(
+        ctx.repo_root,
+        grant,
+        "git-state-backfill",
+        "success",
+        idempotent=True,
+    )
     if confirmed is not None:
         ready = approval.mark_remote_post_effects_complete(ctx.repo_root, confirmed)
         approval.complete_remote_action(ctx.repo_root, ready)

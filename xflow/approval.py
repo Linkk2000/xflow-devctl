@@ -1636,6 +1636,55 @@ def _reservation_from_claim(repo_root: Path, claim_path: Path, claim: dict[str, 
     )
 
 
+def resume_pending_remote_action(
+    repo_root: Path,
+    action: str,
+    approved_file: Path,
+    issue: str,
+) -> RemoteActionReservation | None:
+    root = repo_root.resolve()
+    normalized = normalized_issue(issue)
+    if action != "git-mr":
+        raise ValueError("deferred remote recovery is only supported for git-mr")
+    requested_file = display_path(root, approved_file)
+    bindings = resolve_bindings(root)
+    claims_root = _contract_artifact_path(root, normalized, "claims", "placeholder").parent
+    if not claims_root.is_dir():
+        return None
+
+    matches: list[tuple[Path, dict[str, object]]] = []
+    conflicts: list[Path] = []
+    for claim_path in sorted(claims_root.glob("*-remote.yaml")):
+        claim = _parse_remote_claim(root, claim_path, normalized)
+        if claim["state"] not in {"post-effects-pending", "remote-confirmed"}:
+            continue
+        scope_matches = (
+            claim["repository"] == bindings.repository
+            and claim["worktree"] == bindings.worktree
+            and claim["branch"] == bindings.branch
+            and claim["approvalIssue"] == normalized
+            and claim["action"] == action
+        )
+        if not scope_matches:
+            continue
+        expected_path = _remote_claim_path(root, normalized, str(claim["approvalId"]))
+        if claim_path.resolve() != expected_path or claim["remoteClaimFile"] != claim_path.relative_to(root).as_posix():
+            raise ValueError("pending remote approval claim path identity mismatch")
+        if claim["approvedFile"] != requested_file:
+            conflicts.append(claim_path)
+            continue
+        matches.append((claim_path, claim))
+
+    if conflicts:
+        raise ValueError("conflicting pending git-mr claim uses a different approved file")
+    if len(matches) > 1:
+        raise ValueError("multiple matching pending git-mr claims")
+    if not matches:
+        return None
+    claim_path, claim = matches[0]
+    return _reservation_from_claim(root, claim_path, claim)
+
+
 def reserve_remote_action(repo_root: Path, grant: ApprovalGrant) -> RemoteActionReservation:
     from .local_artifacts import revalidate_snapshots
 
@@ -1963,6 +2012,16 @@ def mark_remote_post_effects_complete(
         history_bytes = _stable_approval_bytes(root, history_path, issue_dir(root, str(claim["targetIssue"])), "remote approval history")
         if hashlib.sha256(history_bytes).hexdigest() != claim["historySha256"]:
             raise ValueError("remote approval post-effects require exact published history")
+        effects = [
+            record
+            for record in _history_records(root)
+            if record["source"] == "effect"
+            and record["action"] == EFFECT_ACTION
+            and record["parentApprovalId"] == grant.approval_id
+            and record["result"] == "success"
+        ]
+        if len(effects) != 1:
+            raise ValueError("remote approval post-effects require exactly one git-state-backfill effect")
         claim.update({"state": "remote-confirmed", "updatedAt": _canonical_utc_now()})
         _replace_bytes(reservation.claim_path, _remote_claim_bytes(claim))
         return _reservation_from_claim(root, reservation.claim_path, claim)
