@@ -44,6 +44,7 @@ from .task_state import (
     _pointer_snapshots,
     _snapshot_text,
     activate_task,
+    activate_task_from_snapshot,
     list_task_states,
     load_active_task,
     load_active_task_snapshot,
@@ -894,6 +895,15 @@ def set_branch_meta(repo_root: Path, key: str, value: str) -> None:
     git_run(repo_root, ["config", "--worktree", f"devctl.{key}", value])
 
 
+def set_branch_meta_exact(repo_root: Path, key: str, value: str) -> None:
+    expected = normalized_issue(value) if key == "issue" else value
+    existing = branch_meta(repo_root, key)
+    if existing and existing != expected:
+        raise ValueError(f"conflicting task branch metadata for {key}: expected {expected}, found {existing}")
+    if not existing:
+        set_branch_meta(repo_root, key, expected)
+
+
 def _document_pr_identity(path: Path) -> tuple[str, str]:
     if not path.is_file():
         return "", ""
@@ -1307,7 +1317,7 @@ def run_git_push(ctx: RuntimeContext, args: argparse.Namespace) -> int:
 def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     base = args.base or default_base(ctx.repo_root)
     branch = branch_name_from_slug(args.slug, args.issue)
-    branch_grant: approval.ApprovalGrant | None = None
+    branch_reservation: approval.TaskBranchStartReservation | None = None
     issue = normalized_issue(args.issue) if args.issue else None
     state_path = task_state_file(ctx.repo_root, issue) if issue else None
     if state_path is not None and state_path.is_file():
@@ -1325,37 +1335,77 @@ def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
                     "task branch identity step may only change the matching Issue workspace; "
                     f"found {unexpected}"
                 )
-            branch_grant = approval.require_task_branch_start(
-                ctx.repo_root,
-                issue,
-                args.file,
-                branch,
-                base,
+            branch_reservation = approval.resume_task_branch_start(
+                ctx.repo_root, issue, args.file, branch, base
             )
+            if branch_reservation is None:
+                branch_grant = approval.require_task_branch_start(
+                    ctx.repo_root,
+                    issue,
+                    args.file,
+                    branch,
+                    base,
+                )
+                branch_reservation = approval.reserve_task_branch_start(
+                    ctx.repo_root,
+                    branch_grant,
+                    base,
+                )
         else:
             require_clean_worktree(ctx.repo_root)
     else:
         require_clean_worktree(ctx.repo_root)
     current = current_branch(ctx.repo_root)
-    if branch_grant is not None and current != base:
-        raise ValueError(f"task branch identity approval requires active base branch {base}")
-    if current != base:
-        print(f"[INFO] checkout {base}")
-        git_run(ctx.repo_root, ["checkout", base])
-    print(f"[INFO] pull origin/{base}")
-    git_run(ctx.repo_root, ["pull", "--ff-only", "origin", base])
-    if git_succeeds(ctx.repo_root, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"]):
-        raise ValueError(f"branch already exists: {branch}")
-    print(f"[INFO] create branch {branch}")
-    git_run(ctx.repo_root, ["checkout", "-b", branch])
-    set_branch_meta(ctx.repo_root, "slug", args.slug)
+    if branch_reservation is not None:
+        if branch_reservation.base_commit == "pending":
+            if current != base:
+                raise ValueError(f"task branch reservation requires active base branch {base}")
+            print(f"[INFO] pull origin/{base}")
+            git_run(ctx.repo_root, ["pull", "--ff-only", "origin", base])
+            branch_reservation = approval.bind_task_branch_base(ctx.repo_root, branch_reservation)
+        target_commit = git_output(ctx.repo_root, ["rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}"])
+        if target_commit:
+            if target_commit != branch_reservation.base_commit:
+                raise ValueError("task branch exact start point mismatch")
+            branch_reservation = approval.revalidate_task_branch_start(ctx.repo_root, branch_reservation)
+            if current != branch:
+                print(f"[INFO] checkout {branch}")
+                git_run(ctx.repo_root, ["checkout", branch])
+            branch_reservation = approval.mark_task_branch_created(ctx.repo_root, branch_reservation)
+        else:
+            if branch_reservation.state != "reserved":
+                raise ValueError("task branch claim requires an existing exact target branch")
+            if current != base:
+                raise ValueError(f"task branch creation requires active base branch {base}")
+            base_commit = git_output(ctx.repo_root, ["rev-parse", "--verify", f"refs/heads/{base}^{{commit}}"])
+            if base_commit != branch_reservation.base_commit:
+                raise ValueError("task branch exact base commit changed before creation")
+            branch_reservation = approval.revalidate_task_branch_start(ctx.repo_root, branch_reservation)
+            print(f"[INFO] create branch {branch}")
+            git_run(ctx.repo_root, ["checkout", "-b", branch, branch_reservation.base_commit])
+            branch_reservation = approval.mark_task_branch_created(ctx.repo_root, branch_reservation)
+    else:
+        if current != base:
+            print(f"[INFO] checkout {base}")
+            git_run(ctx.repo_root, ["checkout", base])
+        print(f"[INFO] pull origin/{base}")
+        git_run(ctx.repo_root, ["pull", "--ff-only", "origin", base])
+        if git_succeeds(ctx.repo_root, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"]):
+            raise ValueError(f"branch already exists: {branch}")
+        print(f"[INFO] create branch {branch}")
+        git_run(ctx.repo_root, ["checkout", "-b", branch])
+    set_meta = set_branch_meta_exact if branch_reservation is not None else set_branch_meta
+    set_meta(ctx.repo_root, "slug", args.slug)
     if args.issue:
-        set_branch_meta(ctx.repo_root, "issue", args.issue)
-    set_branch_meta(ctx.repo_root, "base", base)
+        set_meta(ctx.repo_root, "issue", args.issue)
+    set_meta(ctx.repo_root, "base", base)
     unattended.disable(ctx.repo_root)
-    if branch_grant is not None:
-        activate_task(ctx.repo_root, issue)
-        approval.record_consumed_approval(ctx.repo_root, branch_grant, "success")
+    if branch_reservation is not None:
+        assert state_path is not None
+        assert issue is not None
+        activate_task_from_snapshot(ctx.repo_root, issue, branch_reservation.task_state_bytes)
+        branch_reservation = approval.mark_task_branch_activated(ctx.repo_root, branch_reservation)
+        approval.complete_task_branch_start(ctx.repo_root, branch_reservation)
     print("[INFO] ready")
     return 0
 

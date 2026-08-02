@@ -77,7 +77,15 @@ HISTORY_GAP_FIELDS = HISTORY_COMMON_FIELDS | {
     "gapSnapshotFile",
     "gapSnapshotSha256",
 }
-HISTORY_BRANCH_FIELDS = HISTORY_COMMON_FIELDS | {"targetBranch"}
+HISTORY_BRANCH_FIELDS = HISTORY_COMMON_FIELDS | {
+    "targetBranch",
+    "baseCommit",
+    "approvedReviewFile",
+    "approvedReviewSha256",
+    "taskStateSnapshotFile",
+    "taskStateSnapshotSha256",
+    "branchStartClaimFile",
+}
 HISTORY_REMOTE_FIELDS = HISTORY_COMMON_FIELDS | {
     "approvedReviewFile",
     "approvedReviewSha256",
@@ -127,6 +135,16 @@ REMOTE_CLAIM_FIELD_ORDER = (
     "historyFile", "historySha256",
 )
 REMOTE_CLAIM_FIELDS = set(REMOTE_CLAIM_FIELD_ORDER)
+TASK_BRANCH_CLAIM_STATES = {"reserved", "branch-created", "activated", "completed"}
+TASK_BRANCH_CLAIM_FIELD_ORDER = (
+    "version", "approvalId", "repository", "worktree", "branch", "baseBranch", "targetBranch",
+    "approvalIssue", "action", "approvedFile", "approvedSha256", "reviewerSummary",
+    "approvedReviewFile", "approvedReviewSha256", "taskStateSnapshotFile",
+    "taskStateSnapshotSha256", "branchStartClaimFile", "state", "baseCommit", "reservedAt",
+    "updatedAt", "recordedAt", "historyFile", "historySha256",
+)
+TASK_BRANCH_CLAIM_FIELDS = set(TASK_BRANCH_CLAIM_FIELD_ORDER)
+GIT_COMMIT_RE = re.compile(r"[0-9a-f]{40,64}")
 
 
 @dataclass(frozen=True)
@@ -161,6 +179,18 @@ class RemoteActionReservation:
             return self.approved_bytes.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:
             raise ValueError("approved remote body snapshot must be valid UTF-8") from exc
+
+
+@dataclass(frozen=True)
+class TaskBranchStartReservation:
+    grant: ApprovalGrant
+    claim_path: Path
+    task_state_snapshot_path: Path
+    task_state_bytes: bytes
+    approved_review_path: Path
+    approved_review_bytes: bytes
+    state: str
+    base_commit: str
 
 
 def validate_action(action: str, *, history: bool = False) -> str:
@@ -691,6 +721,16 @@ def _parse_history_snapshot(
                     or payload["targetBranch"] == payload["branch"]
                 ):
                     raise ValueError("invalid targetBranch")
+                if not isinstance(payload["baseCommit"], str) or not GIT_COMMIT_RE.fullmatch(payload["baseCommit"]):
+                    raise ValueError("invalid baseCommit")
+                for name in ("approvedReviewFile", "taskStateSnapshotFile", "branchStartClaimFile"):
+                    if not isinstance(payload[name], str) or not payload[name]:
+                        raise ValueError(f"invalid {name}")
+                for name in ("approvedReviewSha256", "taskStateSnapshotSha256"):
+                    if not isinstance(payload[name], str) or not FINGERPRINT_RE.fullmatch(payload[name]):
+                        raise ValueError(f"invalid {name}")
+                if payload["taskStateSnapshotSha256"] != payload["approvedSha256"]:
+                    raise ValueError("task-state snapshot SHA256 mismatch")
                 _canonical_utc_timestamp(payload["recordedAt"], "recordedAt", microseconds=True)
             elif remote_snapshot_history:
                 for name in ("approvedReviewFile", "approvedSnapshotFile", "remoteClaimFile", "providerReceipt"):
@@ -791,6 +831,16 @@ def reject_consumed_approval(repo_root: Path, approval_id: str) -> None:
                 )
                 claim = _parse_remote_claim(repo_root, claim_path, str(record["approvalIssue"]))
                 if claim["state"] != "completed" and _remote_history_payload(claim) == record:
+                    continue
+            branch_claim_file = record.get("branchStartClaimFile")
+            if record["action"] == "task-branch-start" and isinstance(branch_claim_file, str):
+                claim_path = require_safe_repo_path(
+                    repo_root,
+                    repo_root / Path(branch_claim_file),
+                    "task branch start claim",
+                )
+                claim = _parse_task_branch_claim(repo_root, claim_path, str(record["approvalIssue"]))
+                if claim["state"] != "completed" and _task_branch_history_payload(claim) == record:
                     continue
             raise ValueError(f"approval already consumed: {approval_id}")
 
@@ -1300,6 +1350,8 @@ def record_consumed_approval(
         raise ValueError("contract-acceptance must use contract acceptance history")
     if grant.action == "gap-recognition":
         raise ValueError("gap-recognition must use gap recognition history")
+    if grant.action == "task-branch-start":
+        raise ValueError("task-branch-start must use task branch claim completion")
     repo_root = repo_root.resolve()
     _validate_grant(grant)
     reject_consumed_approval(repo_root, grant.approval_id)
@@ -1310,11 +1362,9 @@ def record_consumed_approval(
         issue,
         grant.action,
         recorded_at,
-        grant.approval_id if grant.action == "task-branch-start" else None,
+        None,
     )
     payload = _record_payload(grant, issue, recorded_at)
-    if grant.action == "task-branch-start":
-        payload["targetBranch"] = grant.target_branch
     content = yaml.safe_dump(payload, sort_keys=False, allow_unicode=False)
     reject_credentials(content)
     _write_history_atomic(history_file, content)
@@ -1453,6 +1503,660 @@ def _replace_bytes(path: Path, content: bytes) -> None:
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _task_branch_claim_path(repo_root: Path, issue: str, approval_id: str) -> Path:
+    return _contract_artifact_path(repo_root, issue, "claims", f"{approval_id}-task-branch.yaml")
+
+
+def _task_branch_state_snapshot_path(repo_root: Path, issue: str, approval_id: str) -> Path:
+    return _contract_artifact_path(
+        repo_root,
+        issue,
+        "consumed",
+        f"{approval_id}-task-branch-start-task-state.md",
+    )
+
+
+def _task_branch_review_path(repo_root: Path, issue: str, approval_id: str) -> Path:
+    return _contract_artifact_path(
+        repo_root,
+        issue,
+        "consumed",
+        f"{approval_id}-task-branch-start-local-review.md",
+    )
+
+
+def _task_branch_claim_bytes(payload: dict[str, object]) -> bytes:
+    return _yaml_bytes({name: payload[name] for name in TASK_BRANCH_CLAIM_FIELD_ORDER})
+
+
+@contextmanager
+def _task_branch_claim_lock(repo_root: Path, approval_id: str) -> Iterator[None]:
+    bindings = resolve_bindings(repo_root)
+    lock_path = (
+        git_path(repo_root, "--git-common-dir")
+        / "xflow"
+        / "runtime"
+        / "task-branch-start"
+        / bindings.worktree
+        / f"{approval_id}.lock"
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    try:
+        if handle.seek(0, os.SEEK_END) == 0:
+            handle.write(b"0")
+            handle.flush()
+            os.fsync(handle.fileno())
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            raise ValueError(f"task branch approval reservation is busy: {approval_id}") from None
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+        try:
+            lock_path.unlink(missing_ok=True)
+        except PermissionError:
+            pass
+
+
+def _git_ref_commit(repo_root: Path, ref: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(repo_root), "rev-parse", "--verify", f"{ref}^{{commit}}"],
+        check=False,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return result.stdout.strip().lower() if result.returncode == 0 else ""
+
+
+def _parse_task_branch_claim(repo_root: Path, path: Path, issue: str) -> dict[str, object]:
+    issue_root = issue_dir(repo_root, issue)
+    raw_bytes = _stable_approval_bytes(repo_root, path, issue_root, "task branch start claim")
+    payload = _load_yaml(_decode_approval_bytes(raw_bytes, path, "task branch start claim"))
+    if not isinstance(payload, dict) or set(payload) != TASK_BRANCH_CLAIM_FIELDS:
+        raise ValueError("task branch start claim has unexpected or missing fields")
+    if (
+        payload["version"] != "0.1.0"
+        or payload["action"] != "task-branch-start"
+        or payload["state"] not in TASK_BRANCH_CLAIM_STATES
+    ):
+        raise ValueError("task branch start claim has invalid fixed fields")
+    for name in (
+        "repository",
+        "worktree",
+        "approvedSha256",
+        "approvedReviewSha256",
+        "taskStateSnapshotSha256",
+    ):
+        if not isinstance(payload[name], str) or not FINGERPRINT_RE.fullmatch(payload[name]):
+            raise ValueError(f"task branch start claim has invalid {name}")
+    if payload["approvedSha256"] != payload["taskStateSnapshotSha256"]:
+        raise ValueError("task branch start claim task-state snapshot SHA256 mismatch")
+    if not isinstance(payload["approvalId"], str) or not APPROVAL_ID_RE.fullmatch(payload["approvalId"]):
+        raise ValueError("task branch start claim has invalid approvalId")
+    if payload["approvalIssue"] != normalized_issue(payload["approvalIssue"]):
+        raise ValueError("task branch start claim has invalid approvalIssue")
+    for name in (
+        "branch",
+        "baseBranch",
+        "targetBranch",
+        "approvedFile",
+        "reviewerSummary",
+        "approvedReviewFile",
+        "taskStateSnapshotFile",
+        "branchStartClaimFile",
+        "reservedAt",
+        "updatedAt",
+        "recordedAt",
+        "historyFile",
+        "historySha256",
+    ):
+        if not isinstance(payload[name], str) or not payload[name]:
+            raise ValueError(f"task branch start claim has invalid {name}")
+    if payload["branch"] != payload["baseBranch"] or payload["targetBranch"] == payload["baseBranch"]:
+        raise ValueError("task branch start claim has invalid branch bindings")
+    _canonical_utc_timestamp(payload["reservedAt"], "reservedAt", microseconds=True)
+    _canonical_utc_timestamp(payload["updatedAt"], "updatedAt", microseconds=True)
+    base_commit = payload["baseCommit"]
+    if base_commit != "pending" and (not isinstance(base_commit, str) or not GIT_COMMIT_RE.fullmatch(base_commit)):
+        raise ValueError("task branch start claim has invalid baseCommit")
+    if payload["state"] != "reserved" and base_commit == "pending":
+        raise ValueError("task branch start claim is missing the exact base commit")
+    history_names = ("recordedAt", "historyFile", "historySha256")
+    history_values = tuple(payload[name] for name in history_names)
+    if payload["state"] == "completed" or history_values != ("none", "none", "none"):
+        if "none" in history_values:
+            raise ValueError("task branch start claim has incomplete history identity")
+        _canonical_utc_timestamp(payload["recordedAt"], "recordedAt", microseconds=True)
+        if not FINGERPRINT_RE.fullmatch(str(payload["historySha256"])):
+            raise ValueError("task branch start claim has invalid historySha256")
+    if payload["state"] in {"reserved", "branch-created"} and history_values != ("none", "none", "none"):
+        raise ValueError("task branch start claim records history before activation")
+    if raw_bytes != _task_branch_claim_bytes(payload):
+        raise ValueError("task branch start claim bytes are not canonical")
+    return payload
+
+
+def _task_branch_grant(claim: dict[str, object]) -> ApprovalGrant:
+    grant = ApprovalGrant(
+        source="local-review",
+        approval_id=str(claim["approvalId"]),
+        repository=str(claim["repository"]),
+        worktree=str(claim["worktree"]),
+        branch=str(claim["branch"]),
+        approval_issue=str(claim["approvalIssue"]),
+        action="task-branch-start",
+        approved_file=str(claim["approvedFile"]),
+        approved_sha256=str(claim["approvedSha256"]),
+        reviewer_summary=str(claim["reviewerSummary"]),
+        target_branch=str(claim["targetBranch"]),
+    )
+    _validate_grant(grant)
+    return grant
+
+
+def _validate_task_branch_claim_grant(claim: dict[str, object], grant: ApprovalGrant) -> None:
+    expected = {
+        "approvalId": grant.approval_id,
+        "repository": grant.repository,
+        "worktree": grant.worktree,
+        "branch": grant.branch,
+        "baseBranch": grant.branch,
+        "targetBranch": grant.target_branch,
+        "approvalIssue": grant.approval_issue,
+        "action": grant.action,
+        "approvedFile": grant.approved_file,
+        "approvedSha256": grant.approved_sha256,
+        "reviewerSummary": grant.reviewer_summary,
+    }
+    if any(claim.get(name) != value for name, value in expected.items()):
+        raise ValueError("task branch start claim does not match exact local approval")
+
+
+def _task_branch_artifact_bytes(repo_root: Path, claim: dict[str, object], field_name: str, label: str) -> tuple[Path, bytes]:
+    path = require_safe_repo_path(repo_root, repo_root / Path(str(claim[field_name])), label)
+    content = _stable_approval_bytes(repo_root, path, issue_dir(repo_root, str(claim["approvalIssue"])), label)
+    digest_field = "taskStateSnapshotSha256" if field_name == "taskStateSnapshotFile" else "approvedReviewSha256"
+    if hashlib.sha256(content).hexdigest() != claim[digest_field]:
+        raise ValueError(f"{label} SHA256 mismatch")
+    return path, content
+
+
+def _validate_task_branch_sealed_content(
+    repo_root: Path,
+    claim: dict[str, object],
+    state_bytes: bytes,
+    review_bytes: bytes,
+) -> None:
+    from .task_state import parse_task_state_text
+
+    issue = str(claim["approvalIssue"])
+    state_path = task_state_file(repo_root, issue).resolve()
+    if display_path(repo_root, state_path) != claim["approvedFile"]:
+        raise ValueError("task branch claim approved file is not the canonical task-state")
+    try:
+        state_text = state_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError("approved task-state snapshot must be valid UTF-8") from exc
+    state = parse_task_state_text(
+        state_path,
+        state_text,
+        binding_mode="recorded",
+        validate_acceptance=False,
+    )
+    if (
+        state.issue != issue
+        or state.classification != "capability-change"
+        or state.execution_state != "S2_REMOTE_ISSUE_CREATED"
+        or state.semantic_phase not in {"classified", "declaring"}
+        or state.base != claim["baseBranch"]
+        or state.branch != claim["targetBranch"]
+    ):
+        raise ValueError("task branch claim does not seal exact approved task-state bindings")
+    review_path = default_approval_file(repo_root, issue)
+    review_text = _decode_approval_bytes(review_bytes, review_path, "approved task branch review")
+    sealed_bindings = GitBindings(
+        repository=str(claim["repository"]),
+        worktree=str(claim["worktree"]),
+        branch=str(claim["baseBranch"]),
+    )
+    _validate_review_text(
+        repo_root,
+        issue,
+        state_path,
+        None,
+        review_text,
+        sealed_bindings,
+        str(claim["approvedSha256"]),
+    )
+    if (
+        field(review_text, "Approval ID") != claim["approvalId"]
+        or field(review_text, "Approved Action") != "task-branch-start"
+        or safe_reviewer_summary(field(review_text, "Reviewer")) != claim["reviewerSummary"]
+    ):
+        raise ValueError("task branch claim does not seal the exact approval identity")
+
+
+def _task_branch_reservation(
+    repo_root: Path,
+    claim_path: Path,
+    claim: dict[str, object],
+) -> TaskBranchStartReservation:
+    issue = str(claim["approvalIssue"])
+    approval_id = str(claim["approvalId"])
+    expected_claim = _task_branch_claim_path(repo_root, issue, approval_id)
+    if claim_path.resolve() != expected_claim or claim["branchStartClaimFile"] != claim_path.relative_to(repo_root).as_posix():
+        raise ValueError("task branch start claim path identity mismatch")
+    state_path, state_bytes = _task_branch_artifact_bytes(
+        repo_root,
+        claim,
+        "taskStateSnapshotFile",
+        "approved task-state snapshot",
+    )
+    review_path, review_bytes = _task_branch_artifact_bytes(
+        repo_root,
+        claim,
+        "approvedReviewFile",
+        "approved task branch review",
+    )
+    if state_path != _task_branch_state_snapshot_path(repo_root, issue, approval_id):
+        raise ValueError("task branch start claim task-state snapshot path mismatch")
+    if review_path != _task_branch_review_path(repo_root, issue, approval_id):
+        raise ValueError("task branch start claim review snapshot path mismatch")
+    _validate_task_branch_sealed_content(repo_root, claim, state_bytes, review_bytes)
+    return TaskBranchStartReservation(
+        grant=_task_branch_grant(claim),
+        claim_path=claim_path,
+        task_state_snapshot_path=state_path,
+        task_state_bytes=state_bytes,
+        approved_review_path=review_path,
+        approved_review_bytes=review_bytes,
+        state=str(claim["state"]),
+        base_commit=str(claim["baseCommit"]),
+    )
+
+
+def _revalidate_task_branch_current(repo_root: Path, reservation: TaskBranchStartReservation) -> None:
+    from .local_artifacts import revalidate_snapshots
+
+    issue = reservation.grant.approval_issue
+    issue_root = issue_dir(repo_root, issue)
+    state_path = resolve_path(repo_root, Path(reservation.grant.approved_file))
+    state_snapshot = capture_stable_file(
+        repo_root,
+        state_path,
+        issue_root,
+        "task branch identity state",
+        max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+    )
+    review_path = default_approval_file(repo_root, issue)
+    review_snapshot = capture_stable_file(
+        repo_root,
+        review_path,
+        issue_root,
+        "task branch identity review",
+        max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+    )
+    if state_snapshot.content != reservation.task_state_bytes:
+        raise ValueError("exact approved task-state bytes changed before task branch effect")
+    if review_snapshot.content != reservation.approved_review_bytes:
+        raise ValueError("exact approved local-review bytes changed before task branch effect")
+    revalidate_snapshots(repo_root, (state_snapshot, review_snapshot), "exact approved task branch snapshots")
+
+
+def reserve_task_branch_start(repo_root: Path, grant: ApprovalGrant, base_branch: str) -> TaskBranchStartReservation:
+    from .local_artifacts import revalidate_snapshots
+    from .task_state import parse_task_state_text
+
+    root = repo_root.resolve()
+    _validate_grant(grant)
+    if grant.source != "local-review" or grant.action != "task-branch-start" or grant.branch != base_branch:
+        raise ValueError("task branch reservation requires the exact local branch-start approval")
+    issue = grant.approval_issue
+    issue_root = issue_dir(root, issue)
+    claim_path = _task_branch_claim_path(root, issue, grant.approval_id)
+    with _task_branch_claim_lock(root, grant.approval_id):
+        if claim_path.is_file():
+            claim = _parse_task_branch_claim(root, claim_path, issue)
+            _validate_task_branch_claim_grant(claim, grant)
+            if claim["state"] == "completed":
+                raise ValueError(f"approval already consumed: {grant.approval_id}")
+            reservation = _task_branch_reservation(root, claim_path, claim)
+            _revalidate_task_branch_current(root, reservation)
+            return reservation
+        if _git_ref_commit(root, f"refs/heads/{grant.target_branch}"):
+            raise ValueError(f"branch already exists without exact task branch claim: {grant.target_branch}")
+        bindings = resolve_bindings(root)
+        if bindings.repository != grant.repository or bindings.worktree != grant.worktree or bindings.branch != base_branch:
+            raise ValueError("task branch reservation Git bindings changed after approval")
+        approved_path = resolve_path(root, Path(grant.approved_file))
+        state_snapshot = capture_stable_file(
+            root,
+            approved_path,
+            issue_root,
+            "task branch identity state",
+            max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+        )
+        state_bytes = state_snapshot.content or b""
+        if hashlib.sha256(state_bytes).hexdigest() != grant.approved_sha256:
+            raise ValueError("exact approved task-state bytes changed before reservation")
+        try:
+            state_text = state_bytes.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise ValueError("task-state must be valid UTF-8") from exc
+        state = parse_task_state_text(approved_path, state_text, binding_mode="recorded", validate_acceptance=False)
+        if (
+            state.issue != issue
+            or state.branch != grant.target_branch
+            or state.base != base_branch
+            or state.classification != "capability-change"
+        ):
+            raise ValueError("task branch reservation does not match exact task-state bindings")
+        review_path = default_approval_file(root, issue)
+        review_snapshot = capture_stable_file(
+            root,
+            review_path,
+            issue_root,
+            "approval review",
+            max_bytes=MAX_TEXT_ARTIFACT_BYTES,
+        )
+        review_bytes = review_snapshot.content or b""
+        review_text = _decode_approval_bytes(review_bytes, review_path, "approval review")
+        if field(review_text, "Approval ID") != grant.approval_id:
+            raise ValueError("active local review no longer matches task branch approval")
+        _validate_review_text(
+            root,
+            issue,
+            approved_path,
+            None,
+            review_text,
+            bindings,
+            grant.approved_sha256,
+        )
+        revalidate_snapshots(root, (state_snapshot, review_snapshot), "task branch approval reservation")
+        state_archive = _task_branch_state_snapshot_path(root, issue, grant.approval_id)
+        review_archive = _task_branch_review_path(root, issue, grant.approval_id)
+        _publish_exact_artifact(
+            root,
+            issue_root,
+            state_archive,
+            state_bytes,
+            label="approved task-state snapshot",
+            collision_message="approved task-state snapshot collision",
+        )
+        _publish_exact_artifact(
+            root,
+            issue_root,
+            review_archive,
+            review_bytes,
+            label="approved task branch review",
+            collision_message="approved task branch review collision",
+        )
+        now = _canonical_utc_now()
+        claim: dict[str, object] = {
+            "version": "0.1.0",
+            "approvalId": grant.approval_id,
+            "repository": grant.repository,
+            "worktree": grant.worktree,
+            "branch": grant.branch,
+            "baseBranch": base_branch,
+            "targetBranch": grant.target_branch,
+            "approvalIssue": issue,
+            "action": "task-branch-start",
+            "approvedFile": grant.approved_file,
+            "approvedSha256": grant.approved_sha256,
+            "reviewerSummary": grant.reviewer_summary,
+            "approvedReviewFile": review_archive.relative_to(root).as_posix(),
+            "approvedReviewSha256": hashlib.sha256(review_bytes).hexdigest(),
+            "taskStateSnapshotFile": state_archive.relative_to(root).as_posix(),
+            "taskStateSnapshotSha256": grant.approved_sha256,
+            "branchStartClaimFile": claim_path.relative_to(root).as_posix(),
+            "state": "reserved",
+            "baseCommit": "pending",
+            "reservedAt": now,
+            "updatedAt": now,
+            "recordedAt": "none",
+            "historyFile": "none",
+            "historySha256": "none",
+        }
+        _write_immutable_bytes(claim_path, _task_branch_claim_bytes(claim), "task branch start claim collision")
+        return _task_branch_reservation(root, claim_path, claim)
+
+
+def resume_task_branch_start(
+    repo_root: Path,
+    issue: str,
+    approved_file: Path,
+    target_branch: str,
+    base_branch: str,
+) -> TaskBranchStartReservation | None:
+    root = repo_root.resolve()
+    issue = normalized_issue(issue)
+    requested_file = display_path(root, approved_file)
+    claims_root = _contract_artifact_path(root, issue, "claims", "placeholder").parent
+    if not claims_root.is_dir():
+        return None
+    matches: list[tuple[Path, dict[str, object]]] = []
+    for claim_path in sorted(claims_root.glob("*-task-branch.yaml")):
+        claim = _parse_task_branch_claim(root, claim_path, issue)
+        if claim["targetBranch"] != target_branch:
+            continue
+        expected = {
+            "approvalIssue": issue,
+            "approvedFile": requested_file,
+            "baseBranch": base_branch,
+            "branch": base_branch,
+            "targetBranch": target_branch,
+        }
+        if any(claim.get(name) != value for name, value in expected.items()):
+            raise ValueError("existing task branch claim does not match exact requested bindings")
+        matches.append((claim_path, claim))
+    if len(matches) > 1:
+        raise ValueError("multiple task branch claims match the requested target branch")
+    if not matches:
+        return None
+    claim_path, claim = matches[0]
+    if claim["state"] == "completed":
+        raise ValueError(f"approval already consumed: {claim['approvalId']}")
+    bindings = resolve_bindings(root)
+    if claim["repository"] != bindings.repository or claim["worktree"] != bindings.worktree:
+        raise ValueError("task branch claim does not match exact repository/worktree bindings")
+    if bindings.branch not in {base_branch, target_branch}:
+        raise ValueError("task branch recovery requires the exact base or target branch")
+    reservation = _task_branch_reservation(root, claim_path, claim)
+    _revalidate_task_branch_current(root, reservation)
+    return reservation
+
+
+def _reload_task_branch_reservation(
+    repo_root: Path,
+    reservation: TaskBranchStartReservation,
+) -> tuple[dict[str, object], TaskBranchStartReservation]:
+    claim = _parse_task_branch_claim(
+        repo_root,
+        reservation.claim_path,
+        reservation.grant.approval_issue,
+    )
+    _validate_task_branch_claim_grant(claim, reservation.grant)
+    current = _task_branch_reservation(repo_root, reservation.claim_path, claim)
+    if (
+        current.task_state_bytes != reservation.task_state_bytes
+        or current.approved_review_bytes != reservation.approved_review_bytes
+    ):
+        raise ValueError("task branch claim sealed snapshot identity changed")
+    return claim, current
+
+
+def bind_task_branch_base(
+    repo_root: Path,
+    reservation: TaskBranchStartReservation,
+) -> TaskBranchStartReservation:
+    root = repo_root.resolve()
+    with _task_branch_claim_lock(root, reservation.grant.approval_id):
+        claim, current = _reload_task_branch_reservation(root, reservation)
+        if claim["state"] != "reserved":
+            raise ValueError("task branch base commit can only be bound while reserved")
+        _revalidate_task_branch_current(root, current)
+        bindings = resolve_bindings(root)
+        if bindings.branch != claim["baseBranch"]:
+            raise ValueError("task branch base binding requires the exact base branch")
+        base_commit = _git_ref_commit(root, f"refs/heads/{claim['baseBranch']}")
+        if not GIT_COMMIT_RE.fullmatch(base_commit):
+            raise ValueError("cannot resolve exact task branch base commit")
+        if claim["baseCommit"] not in {"pending", base_commit}:
+            raise ValueError("task branch claim base commit mismatch")
+        if claim["baseCommit"] == "pending":
+            claim.update({"baseCommit": base_commit, "updatedAt": _canonical_utc_now()})
+            _replace_bytes(reservation.claim_path, _task_branch_claim_bytes(claim))
+        return _task_branch_reservation(root, reservation.claim_path, claim)
+
+
+def revalidate_task_branch_start(
+    repo_root: Path,
+    reservation: TaskBranchStartReservation,
+) -> TaskBranchStartReservation:
+    root = repo_root.resolve()
+    with _task_branch_claim_lock(root, reservation.grant.approval_id):
+        claim, current = _reload_task_branch_reservation(root, reservation)
+        _revalidate_task_branch_current(root, current)
+        return _task_branch_reservation(root, reservation.claim_path, claim)
+
+
+def mark_task_branch_created(
+    repo_root: Path,
+    reservation: TaskBranchStartReservation,
+) -> TaskBranchStartReservation:
+    root = repo_root.resolve()
+    with _task_branch_claim_lock(root, reservation.grant.approval_id):
+        claim, _ = _reload_task_branch_reservation(root, reservation)
+        if claim["baseCommit"] == "pending":
+            raise ValueError("task branch cannot be created before binding the exact base commit")
+        target_commit = _git_ref_commit(root, f"refs/heads/{claim['targetBranch']}")
+        if target_commit != claim["baseCommit"]:
+            raise ValueError("task branch exact start point mismatch")
+        if resolve_bindings(root).branch != claim["targetBranch"]:
+            raise ValueError("task branch creation transition requires the exact target branch")
+        if claim["state"] == "reserved":
+            claim.update({"state": "branch-created", "updatedAt": _canonical_utc_now()})
+            _replace_bytes(reservation.claim_path, _task_branch_claim_bytes(claim))
+        elif claim["state"] not in {"branch-created", "activated"}:
+            raise ValueError("task branch claim is not recoverable at branch creation")
+        return _task_branch_reservation(root, reservation.claim_path, claim)
+
+
+def mark_task_branch_activated(
+    repo_root: Path,
+    reservation: TaskBranchStartReservation,
+) -> TaskBranchStartReservation:
+    root = repo_root.resolve()
+    with _task_branch_claim_lock(root, reservation.grant.approval_id):
+        claim, _ = _reload_task_branch_reservation(root, reservation)
+        if _git_ref_commit(root, f"refs/heads/{claim['targetBranch']}") != claim["baseCommit"]:
+            raise ValueError("task branch exact start point mismatch")
+        if resolve_bindings(root).branch != claim["targetBranch"]:
+            raise ValueError("task branch activation transition requires the exact target branch")
+        if claim["state"] == "branch-created":
+            claim.update({"state": "activated", "updatedAt": _canonical_utc_now()})
+            _replace_bytes(reservation.claim_path, _task_branch_claim_bytes(claim))
+        elif claim["state"] != "activated":
+            raise ValueError("task branch claim is not ready for activation")
+        return _task_branch_reservation(root, reservation.claim_path, claim)
+
+
+def _task_branch_history_payload(claim: dict[str, object]) -> dict[str, object]:
+    payload = _record_payload(
+        _task_branch_grant(claim),
+        str(claim["approvalIssue"]),
+        str(claim["recordedAt"]),
+    )
+    payload.update(
+        {
+            "targetBranch": claim["targetBranch"],
+            "baseCommit": claim["baseCommit"],
+            "approvedReviewFile": claim["approvedReviewFile"],
+            "approvedReviewSha256": claim["approvedReviewSha256"],
+            "taskStateSnapshotFile": claim["taskStateSnapshotFile"],
+            "taskStateSnapshotSha256": claim["taskStateSnapshotSha256"],
+            "branchStartClaimFile": claim["branchStartClaimFile"],
+        }
+    )
+    return payload
+
+
+def complete_task_branch_start(repo_root: Path, reservation: TaskBranchStartReservation) -> Path:
+    root = repo_root.resolve()
+    with _task_branch_claim_lock(root, reservation.grant.approval_id):
+        claim, _ = _reload_task_branch_reservation(root, reservation)
+        if claim["state"] not in {"activated", "completed"}:
+            raise ValueError("task branch claim is not activated")
+        if claim["recordedAt"] == "none":
+            recorded_at = _canonical_utc_now()
+            history_path = _history_path(
+                root,
+                str(claim["approvalIssue"]),
+                "task-branch-start",
+                recorded_at,
+                str(claim["approvalId"]),
+            )
+            claim.update(
+                {
+                    "recordedAt": recorded_at,
+                    "historyFile": history_path.relative_to(root).as_posix(),
+                    "historySha256": "pending",
+                    "updatedAt": recorded_at,
+                }
+            )
+            history_bytes = _yaml_bytes(_task_branch_history_payload(claim))
+            claim["historySha256"] = hashlib.sha256(history_bytes).hexdigest()
+            _replace_bytes(reservation.claim_path, _task_branch_claim_bytes(claim))
+        history_path = require_safe_repo_path(
+            root,
+            root / Path(str(claim["historyFile"])),
+            "task branch approval history",
+        )
+        history_bytes = _yaml_bytes(_task_branch_history_payload(claim))
+        if hashlib.sha256(history_bytes).hexdigest() != claim["historySha256"]:
+            raise ValueError("task branch claim does not seal exact history")
+        if history_path.is_file():
+            existing = _stable_approval_bytes(
+                root,
+                history_path,
+                issue_dir(root, str(claim["approvalIssue"])),
+                "task branch approval history",
+            )
+            if existing != history_bytes:
+                raise ValueError("task branch approval history collision")
+        else:
+            _write_history_atomic(history_path, history_bytes.decode("utf-8"))
+        if claim["state"] != "completed":
+            claim.update({"state": "completed", "updatedAt": _canonical_utc_now()})
+            _replace_bytes(reservation.claim_path, _task_branch_claim_bytes(claim))
+        return history_path
 
 
 @contextmanager

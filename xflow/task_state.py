@@ -1079,10 +1079,13 @@ def load_active_task_snapshot(repo_root: Path) -> tuple[GitBindings, TaskState]:
     return bindings, state
 
 
-@repository_locked
-def activate_task(repo_root: Path, issue: str) -> TaskState:
-    bindings = resolve_bindings(repo_root)
-    _, state = _load_task_state(task_state_file(repo_root, issue))
+def _activate_modern_task(
+    repo_root: Path,
+    bindings: GitBindings,
+    state: TaskState,
+    *,
+    reuse_exact_pointer: bool,
+) -> TaskState:
     if state.branch != bindings.branch:
         raise ValueError(f"task-state branch mismatch: expected {bindings.branch}, found {state.branch}")
     task_mode, contract_id, contract_version, contract_file = _task_contract_binding(state)
@@ -1095,7 +1098,27 @@ def activate_task(repo_root: Path, issue: str) -> TaskState:
     if existing_authority is not None and existing_authority.taskMode == "modern-contract":
         _validate_authority_state(existing_authority, state)
         authority = existing_authority
-    _pointer_snapshots(repo_root, bindings)
+    current_pointer, legacy_pointer = _pointer_snapshots(repo_root, bindings)
+    existing_pointer_snapshot = (
+        current_pointer if getattr(current_pointer, "exists") else legacy_pointer
+    )
+    if reuse_exact_pointer and getattr(existing_pointer_snapshot, "exists"):
+        pointer = _read_pointer_snapshot(existing_pointer_snapshot)
+        stale_branch_pointer = (
+            pointer.repository == bindings.repository
+            and pointer.worktree == bindings.worktree
+            and pointer.branch != bindings.branch
+        )
+        if not stale_branch_pointer:
+            _validate_pointer_bindings(pointer, bindings)
+            _validate_pointer_state(pointer, state, bindings)
+            if existing_authority is None:
+                raise ValueError("active task pointer exists without matching task authority")
+            _validate_authority_pointer(existing_authority, pointer)
+            if not getattr(current_pointer, "exists"):
+                _write_pointer(active_task_pointer_file(repo_root, bindings.worktree), pointer)
+                legacy_active_task_pointer_file(repo_root, bindings.worktree).unlink(missing_ok=True)
+            return state
     pointer = ActiveTaskPointer(
         version=POINTER_VERSION,
         repository=bindings.repository,
@@ -1112,6 +1135,34 @@ def activate_task(repo_root: Path, issue: str) -> TaskState:
     _write_pointer(active_task_pointer_file(repo_root, bindings.worktree), pointer)
     legacy_active_task_pointer_file(repo_root, bindings.worktree).unlink(missing_ok=True)
     return state
+
+
+@repository_locked
+def activate_task(repo_root: Path, issue: str) -> TaskState:
+    bindings = resolve_bindings(repo_root)
+    _, state = _load_task_state(task_state_file(repo_root, issue))
+    return _activate_modern_task(repo_root, bindings, state, reuse_exact_pointer=False)
+
+
+@repository_locked
+def activate_task_from_snapshot(repo_root: Path, issue: str, approved_bytes: bytes) -> TaskState:
+    from .local_artifacts import revalidate_snapshots
+
+    root = repo_root.resolve()
+    canonical_path = task_state_file(root, issue).resolve()
+    snapshot = _task_state_snapshot(canonical_path)
+    if getattr(snapshot, "content") != approved_bytes:
+        raise ValueError("exact approved task-state bytes changed before activation")
+    try:
+        text = approved_bytes.decode("utf-8-sig", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError("approved task-state snapshot must be valid UTF-8") from exc
+    state = parse_task_state_text(canonical_path, text)
+    bindings = resolve_bindings(root)
+    revalidate_snapshots(root, (snapshot,), "approved task-state activation")
+    if resolve_bindings(root) != bindings:
+        raise ValueError("Git bindings changed during approved task-state activation")
+    return _activate_modern_task(root, bindings, state, reuse_exact_pointer=True)
 
 
 @repository_locked
