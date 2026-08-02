@@ -1176,6 +1176,83 @@ def test_snapshot_content_and_transitive_revalidation(repo: Path) -> None:
     write(archived_review, original_review)
 
 
+def _prepare_historical_contract_trace(repo: Path) -> tuple[Path, Path, Path]:
+    path = prepare_valid_chain(repo)
+    contract_path = repo / "contracts" / "contract.yaml"
+    contract = load_contract(repo, contract_path)
+    review = approval.prepare(
+        repo,
+        "101",
+        "contract-acceptance",
+        contract.path,
+        reviewer="reviewer",
+        force=True,
+        accepted_objects=ACCEPTED_OBJECTS,
+    )
+    approve(review)
+    history = validate_contract_acceptance(repo, "101", contract, ACCEPTED_OBJECTS)
+    state_path = path.with_name("task-state.md")
+    state = traceability_module.parse_task_state_text(
+        state_path,
+        state_path.read_text(encoding="utf-8"),
+        binding_mode="recorded",
+        validate_acceptance=False,
+    )
+    write(
+        state_path,
+        render_task_state(
+            dataclass_replace(
+                state,
+                semantic_phase="accepted-design",
+                classification="capability-change",
+                contract_change_required=True,
+                human_approval_ref=history.relative_to(path.parent).as_posix(),
+            )
+        ),
+    )
+    classification_path = path.with_name("classification.yaml")
+    replace(classification_path, "classification: ui-defect", "classification: capability-change")
+    replace(classification_path, "contractChangeRequired: false", "contractChangeRequired: true")
+    replace(
+        classification_path,
+        "nextArtifact: lightweight-route-complete",
+        "nextArtifact: contract-change-proposal.md",
+    )
+    return path, contract_path, history
+
+
+def test_historical_contract_trace_uses_sealed_acceptance(repo: Path) -> None:
+    for mutation in (
+        lambda contract_path: replace(contract_path, "status: accepted-design", "status: active"),
+        lambda contract_path: replace(contract_path, "version: 0.1.0", "version: 0.2.0"),
+        lambda contract_path: contract_path.unlink(),
+    ):
+        path, contract_path, _ = _prepare_historical_contract_trace(repo)
+        mutation(contract_path)
+        check_traceability(repo, "101", None, path)
+
+    path, _, history = _prepare_historical_contract_trace(repo)
+    import yaml
+
+    record = yaml.safe_load(history.read_text(encoding="utf-8"))
+    sealed_contract = path.parent / record["contractSnapshotFile"]
+    write(sealed_contract, sealed_contract.read_text(encoding="utf-8") + "\nchanged after acceptance\n")
+    assert_error("archived contract snapshot SHA256 mismatch", lambda: check_traceability(repo, "101", None, path))
+
+    matrix_mismatches = (
+        ("  id: example.contract.capability-name", "  id: example.contract.other"),
+        ("  version: 0.1.0", "  version: 0.2.0"),
+        ("  file: contracts/contract.yaml", "  file: contracts/other.yaml"),
+    )
+    for original, replacement in matrix_mismatches:
+        path, _, _ = _prepare_historical_contract_trace(repo)
+        replace(path, original, replacement)
+        assert_error(
+            "task-state Contract does not match matrix contract id/version/file",
+            lambda: check_traceability(repo, "101", None, path),
+        )
+
+
 def test_repository_collaboration_lock(repo: Path) -> None:
     path = prepare_valid_chain(repo)
     env = {
@@ -1575,6 +1652,7 @@ def main() -> None:
         test_single_authoritative_criterion_source(repo)
         test_current_repository_acceptance_binding(repo, root)
         test_snapshot_content_and_transitive_revalidation(repo)
+        test_historical_contract_trace_uses_sealed_acceptance(repo)
         test_repository_collaboration_lock(repo)
         test_final_authority_and_git_revalidation(repo)
         test_legacy_resolution_still_binds_current_issue(repo)

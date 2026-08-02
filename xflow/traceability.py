@@ -223,6 +223,41 @@ def _load_contract_snapshot(root: Path, file_path: str) -> tuple[StableFileSnaps
     return snapshot, _build_document(path, raw, snapshot.content)
 
 
+def _load_sealed_acceptance_contract(
+    root: Path,
+    issue_directory: Path,
+    record: Mapping[str, object],
+    supporting_snapshots: tuple[StableFileSnapshot, ...],
+) -> tuple[StableFileSnapshot, ContractDocument]:
+    snapshot_file = record.get("contractSnapshotFile")
+    snapshot_sha256 = record.get("contractSnapshotSha256")
+    approved_file = record.get("approvedFile")
+    if not isinstance(snapshot_file, str) or not isinstance(snapshot_sha256, str) or not isinstance(approved_file, str):
+        raise ValueError("accepted contract reference has invalid sealed contract identity")
+    snapshot_path = require_safe_repo_path(
+        root,
+        issue_directory / Path(snapshot_file),
+        "archived contract snapshot",
+    )
+    matches = tuple(snapshot for snapshot in supporting_snapshots if snapshot.path == snapshot_path)
+    if len(matches) != 1:
+        raise ValueError("accepted contract reference must contain exactly one sealed contract snapshot")
+    snapshot = matches[0]
+    raw_bytes = snapshot.content or b""
+    if hashlib.sha256(raw_bytes).hexdigest() != snapshot_sha256:
+        raise ValueError("accepted contract reference sealed contract snapshot SHA256 mismatch")
+    try:
+        _, contract_path = _contract_path(root, Path(approved_file))
+        raw = _parse_contract_yaml(_decode_utf8(snapshot, "sealed contract snapshot"))
+        _validate_contract_schema(raw)
+        contract = _build_document(contract_path, raw, raw_bytes)
+    except ValueError as exc:
+        raise ValueError(f"accepted contract reference has invalid sealed contract snapshot: {exc}") from exc
+    if contract.sha256 != snapshot_sha256:
+        raise ValueError("accepted contract reference sealed contract snapshot SHA256 mismatch")
+    return snapshot, contract
+
+
 def _optional_snapshot(
     root: Path,
     issue_directory: Path,
@@ -438,15 +473,6 @@ def _load_context(
     if state.contract_file not in refs:
         raise ValueError("classification contractSearch.refs must contain the task-state Contract File")
 
-    contract_snapshot, contract = _load_contract_snapshot(root, state.contract_file)
-    tracked.append((contract_snapshot, "contract file"))
-    expected_contract = f"{contract.raw['id']}@{contract.raw['version']}"
-    if state.contract != expected_contract:
-        raise ValueError("task-state Contract does not match matrix contract")
-    if supplied_contract is not None and (
-        supplied_contract.path != contract.path or supplied_contract.sha256 != contract.sha256
-    ):
-        raise ValueError("supplied ContractDocument bytes/path do not match the task-state contract")
     from .semantic_routes import semantic_reference_kind
 
     reference_kind = semantic_reference_kind(state.classification, state.semantic_phase)
@@ -471,6 +497,18 @@ def _load_context(
         assert isinstance(validated, tuple)
         record, acceptance_snapshots = validated
         tracked.extend((snapshot, "contract acceptance supporting artifact") for snapshot in acceptance_snapshots)
+        _, contract = _load_sealed_acceptance_contract(
+            root,
+            issue_directory,
+            record,
+            acceptance_snapshots,
+        )
+        expected_contract = f"{contract.raw['id']}@{contract.raw['version']}"
+        if state.contract != expected_contract:
+            raise ValueError("task-state Contract does not match sealed contract")
+        expected_file = contract.path.relative_to(root).as_posix()
+        if state.contract_file != expected_file:
+            raise ValueError("task-state Contract File does not match sealed contract path")
         expected_record = {
             "repository": bindings.repository,
             "worktree": bindings.worktree,
@@ -495,9 +533,19 @@ def _load_context(
             or any(identifier not in contract.objects_by_id for identifier in accepted)
         ):
             raise ValueError(
-                "accepted contract reference does not match the current repository/worktree/branch/Issue and contract bytes/path"
+                "accepted contract reference does not match the current repository/worktree/branch/Issue and sealed contract bytes/path"
             )
-    elif reference_kind == "gap-recognition":
+    else:
+        contract_snapshot, contract = _load_contract_snapshot(root, state.contract_file)
+        tracked.append((contract_snapshot, "contract file"))
+        expected_contract = f"{contract.raw['id']}@{contract.raw['version']}"
+        if state.contract != expected_contract:
+            raise ValueError("task-state Contract does not match matrix contract")
+        if supplied_contract is not None and (
+            supplied_contract.path != contract.path or supplied_contract.sha256 != contract.sha256
+        ):
+            raise ValueError("supplied ContractDocument bytes/path do not match the task-state contract")
+    if reference_kind == "gap-recognition":
         try:
             recognition_snapshots = approval.validate_task_gap_recognition_snapshots(
                 root,
@@ -1080,7 +1128,7 @@ def _compatibility_evidence_limit(context: _ClosureContext, path: Path) -> int:
 def check_traceability(
     repo_root: Path,
     issue: str,
-    contract: ContractDocument,
+    contract: ContractDocument | None,
     matrix: Path | None = None,
 ) -> TraceabilityResult:
     context = _load_context(repo_root, issue, matrix, require_task_state=True, supplied_contract=contract)
