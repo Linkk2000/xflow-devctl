@@ -127,8 +127,21 @@ The native Windows PowerShell equivalent is:
 ```
 
 The `task-branch-start` approval is a one-time local identity gate. It binds
-the base branch, exact task-state bytes, and final branch; `git start` creates
-and activates that branch but does not implement, push, or perform any other
+the repository/worktree, base and final branches, exact task-state and
+local-review bytes, and the remote base commit observed before Git mutation.
+Use the exact approved command, including the canonical file:
+
+```text
+devctl git start <slug> --issue IK3RR6 --base main --file .xflow/issues/issue-IK3RR6/task-state.md
+```
+
+Before fetch, fast-forward, or checkout, `git start` persists a claim sealing
+that identity and remote base commit. If the command crashes after base
+synchronization, branch creation, or task activation, rerun the same command to
+resume. Replay accepts only the same approval identity, exact live bytes,
+bindings, target branch, and sealed start commit; an unclaimed or conflicting
+branch fails closed. Replay resumes the existing approval and never creates an
+approval bypass. `git start` does not implement, push, or perform any other
 remote write. Contract acceptance then occurs on the final branch, followed by
 a separate human development-start gate.
 

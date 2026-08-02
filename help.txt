@@ -71,7 +71,7 @@ Attachment:
   ALIYUN_OSS_ACCESS_KEY_SECRET must never be written to manifests, issues, comments, commits, or Markdown guides.
 
 Git:
-  devctl git start <slug> [--issue <id>] [--base BRANCH]
+  devctl git start <slug> [--issue <id>] [--base BRANCH] [--file canonical-task-state.md]
   devctl git commit-msg [-a] [-c] [-m MESSAGE] [summary]
   devctl git push [--issue <id>] [--file evidence.md]
   devctl git mr [--title T] [--body-file F] [--base BRANCH] [--issue <id>] [--attachments manifest.json]
@@ -83,6 +83,15 @@ Git:
   before any approval gate or provider write.
   Normal cleanup uses git branch -d only. There is no implicit -D fallback.
   Gitee pull request merge is not supported by devctl yet.
+  A capability task branch requires the exact approved command:
+    devctl approval prepare --issue IK3RR6 --action task-branch-start --file .xflow/issues/issue-IK3RR6/task-state.md
+    devctl git start <slug> --issue IK3RR6 --base main --file .xflow/issues/issue-IK3RR6/task-state.md
+  Before Git mutation, task-branch-start seals the approval identity, exact
+  task-state/local-review bytes, repository/worktree/base/target bindings, and
+  observed remote base commit in a persistent claim. After a crash, rerun that
+  same git start command. Replay resumes only the exact claimed branch/start
+  point and fails closed on missing or conflicting identity; it does not create
+  a new approval or bypass human approval.
   Commit messages must be portable, scoped, Chinese-dominant, multi-line, and issue-linked.
   Use first line: type(scope): 中文核心摘要[#Issue编号]
   Require at least two non-empty Chinese-dominant body lines after a blank line.

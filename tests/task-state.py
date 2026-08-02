@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import subprocess
 import sys
 import tempfile
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace as dataclass_replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -593,6 +595,60 @@ def task_branch_claim(repo_root: Path, issue: str) -> tuple[Path, dict[str, obje
     return claims[0], yaml.safe_load(claims[0].read_text(encoding="utf-8"))
 
 
+def invoke_git_start_cli(repo_root: Path, args: SimpleNamespace) -> SimpleNamespace:
+    argv = [
+        "git",
+        "start",
+        args.slug,
+        "--issue",
+        args.issue,
+        "--base",
+        args.base,
+        "--file",
+        str(args.file),
+    ]
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    with patch.dict(
+        os.environ,
+        {
+            "DEVCTL_REPO_ROOT": str(repo_root),
+            "DEVCTL_SKIP_PROVIDER_LOAD": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONIOENCODING": "utf-8",
+            "XFLOW_COLLABORATION_LOCK_TIMEOUT": "0.2",
+        },
+        clear=False,
+    ):
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            returncode = cli_module.main(argv)
+    return SimpleNamespace(returncode=returncode, stdout=stdout.getvalue(), stderr=stderr.getvalue())
+
+
+def assert_cli_mutation_lease(repo_root: Path) -> None:
+    child_env = git_child_environment(repo_root)
+    assert len(child_env.get("XFLOW_DEVCTL_MUTATION_LEASE", "")) == 64
+
+
+def advance_origin(root: Path, origin: Path, name: str, content: str) -> str:
+    updater = root / name
+    git(root, "clone", "-q", "--branch", "main", str(origin), str(updater))
+    git(updater, "config", "user.email", "test@example.com")
+    git(updater, "config", "user.name", "Test User")
+    write(updater / "README.md", content)
+    git(updater, "add", "README.md")
+    git(updater, "commit", "-m", f"test: {name}", "-q")
+    commit = subprocess.run(
+        ["git", "-C", str(updater), "rev-parse", "HEAD"],
+        check=True,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    git(updater, "push", "origin", "main", "-q")
+    return commit
+
+
 def assert_task_branch_start_revalidates_exact_bytes_after_pull(
     root: Path,
     suffix: str,
@@ -606,19 +662,24 @@ def assert_task_branch_start_revalidates_exact_bytes_after_pull(
         f"exact-{suffix}",
     )
     mutate_path = state_path if selected == "state" else review
-    original_git_run = cli_module.git_run
     mutated = False
+    original_revalidate = approval.revalidate_task_branch_start
 
-    def mutate_after_pull(repo_root: Path, git_args: list[str]) -> str:
+    def mutate_before_branch(
+        repo_root: Path,
+        reservation: approval.TaskBranchStartReservation,
+    ) -> approval.TaskBranchStartReservation:
         nonlocal mutated
-        output = original_git_run(repo_root, git_args)
-        if git_args[:2] == ["pull", "--ff-only"] and not mutated:
+        assert_cli_mutation_lease(repo_root)
+        if not mutated:
             mutate_path.write_bytes(mutate_path.read_bytes() + b"\n")
             mutated = True
-        return output
+        return original_revalidate(repo_root, reservation)
 
-    with patch.object(cli_module, "git_run", side_effect=mutate_after_pull):
-        assert_value_error("exact approved", lambda: cli_module.run_git_start(ctx, args))
+    with patch.object(approval, "revalidate_task_branch_start", side_effect=mutate_before_branch):
+        result = invoke_git_start_cli(repo, args)
+    assert result.returncode == 1, result.stdout
+    assert "exact approved" in result.stderr, result.stderr
     assert mutated
     assert resolve_bindings(repo).branch == "main"
     assert subprocess.run(
@@ -635,6 +696,53 @@ def test_task_branch_start_revalidates_exact_local_review_after_pull(root: Path)
     assert_task_branch_start_revalidates_exact_bytes_after_pull(root, "local-review", "712", "review")
 
 
+def test_task_branch_start_replays_the_first_sealed_remote_tip(root: Path) -> None:
+    issue = "717"
+    name = "branch-sealed-remote-tip"
+    repo, _, _, target, _, args = capability_branch_start_fixture(
+        root,
+        name,
+        issue,
+        "sealed-remote-tip",
+    )
+    origin = root / f"{name}-origin.git"
+    sealed_tip = advance_origin(root, origin, "branch-sealed-tip-b", "# sealed remote tip B\n")
+    original_git_run = cli_module.git_run
+    crashed = False
+
+    def crash_after_base_sync(repo_root: Path, git_args: list[str]) -> str:
+        nonlocal crashed
+        output = original_git_run(repo_root, git_args)
+        synchronized = git_args[:2] == ["pull", "--ff-only"] or git_args[:2] == ["merge", "--ff-only"]
+        if synchronized and not crashed:
+            assert_cli_mutation_lease(repo_root)
+            crashed = True
+            raise RuntimeError("injected failure after exact base synchronization")
+        return output
+
+    with patch.object(cli_module, "git_run", side_effect=crash_after_base_sync):
+        try:
+            invoke_git_start_cli(repo, args)
+        except RuntimeError as exc:
+            assert "injected failure" in str(exc)
+        else:
+            raise AssertionError("expected injected base synchronization failure")
+    assert crashed
+    advance_origin(root, origin, "branch-sealed-tip-c", "# later remote tip C\n")
+    replay = invoke_git_start_cli(repo, args)
+    assert replay.returncode == 0, replay.stderr
+    target_tip = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", target],
+        check=True,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
+    _, claim = task_branch_claim(repo, issue)
+    assert claim["baseCommit"] == sealed_tip
+    assert target_tip == sealed_tip
+
+
 def test_task_branch_start_recovers_after_branch_creation(root: Path) -> None:
     issue = "713"
     repo, _, _, target, ctx, args = capability_branch_start_fixture(
@@ -644,23 +752,34 @@ def test_task_branch_start_recovers_after_branch_creation(root: Path) -> None:
         "created-recovery",
     )
 
-    with patch.object(cli_module, "set_branch_meta", side_effect=RuntimeError("injected failure after branch creation")):
+    def fail_branch_transition(
+        repo_root: Path,
+        _reservation: approval.TaskBranchStartReservation,
+    ) -> approval.TaskBranchStartReservation:
+        assert_cli_mutation_lease(repo_root)
+        raise RuntimeError("injected failure before branch-created transition")
+
+    with patch.object(approval, "mark_task_branch_created", side_effect=fail_branch_transition):
         try:
-            cli_module.run_git_start(ctx, args)
+            invoke_git_start_cli(repo, args)
         except RuntimeError as exc:
             assert "injected failure" in str(exc)
         else:
             raise AssertionError("expected injected branch creation failure")
 
     _, pending = task_branch_claim(repo, issue)
-    assert pending["state"] in {"reserved", "branch-created"}
+    assert pending["state"] == "reserved"
     assert resolve_bindings(repo).branch == target
-    cli_module.run_git_start(ctx, args)
+    replay = invoke_git_start_cli(repo, args)
+    assert replay.returncode == 0, replay.stderr
     _, completed = task_branch_claim(repo, issue)
     assert completed["state"] == "completed"
     assert resolve_bindings(repo).branch == target
     records = tuple((repo / ".xflow" / "issues" / f"issue-{issue}" / "approvals" / "history").glob("*-task-branch-start-*.yaml"))
     assert len(records) == 1
+    assert not tuple(
+        (git_path(repo, "--git-common-dir") / "xflow" / "runtime" / "task-branch-start").rglob("*.lock")
+    )
 
 
 def test_task_branch_start_recovers_after_activation(root: Path) -> None:
@@ -672,9 +791,13 @@ def test_task_branch_start_recovers_after_activation(root: Path) -> None:
         "activation-recovery",
     )
 
-    with patch.object(approval, "_write_history_atomic", side_effect=RuntimeError("injected failure after activation")):
+    def fail_history(path: Path, content: str) -> None:
+        assert_cli_mutation_lease(repo)
+        raise RuntimeError("injected failure after activation")
+
+    with patch.object(approval, "_write_history_atomic", side_effect=fail_history):
         try:
-            cli_module.run_git_start(ctx, args)
+            invoke_git_start_cli(repo, args)
         except RuntimeError as exc:
             assert "injected failure" in str(exc)
         else:
@@ -687,7 +810,8 @@ def test_task_branch_start_recovers_after_activation(root: Path) -> None:
     authority = authority_file(repo, issue)
     pointer_bytes = pointer.read_bytes()
     authority_bytes = authority.read_bytes()
-    cli_module.run_git_start(ctx, args)
+    replay = invoke_git_start_cli(repo, args)
+    assert replay.returncode == 0, replay.stderr
     _, completed = task_branch_claim(repo, issue)
     assert completed["state"] == "completed"
     assert resolve_bindings(repo).branch == target
@@ -705,7 +829,9 @@ def test_task_branch_start_rejects_unclaimed_or_wrong_start_point(root: Path) ->
         "unclaimed",
     )
     git(unclaimed, "branch", target, "main")
-    assert_value_error("branch already exists", lambda: cli_module.run_git_start(unclaimed_ctx, unclaimed_args))
+    unclaimed_result = invoke_git_start_cli(unclaimed, unclaimed_args)
+    assert unclaimed_result.returncode == 1, unclaimed_result.stdout
+    assert "branch already exists" in unclaimed_result.stderr
     claims_root = unclaimed / ".xflow" / "issues" / "issue-715" / "approvals" / "history" / "claims"
     assert not claims_root.exists() or not tuple(claims_root.glob("*-task-branch.yaml"))
 
@@ -716,9 +842,16 @@ def test_task_branch_start_rejects_unclaimed_or_wrong_start_point(root: Path) ->
         issue,
         "wrong-start",
     )
-    with patch.object(cli_module, "set_branch_meta", side_effect=RuntimeError("injected failure after branch creation")):
+    def fail_branch_transition(
+        repo_root: Path,
+        _reservation: approval.TaskBranchStartReservation,
+    ) -> approval.TaskBranchStartReservation:
+        assert_cli_mutation_lease(repo_root)
+        raise RuntimeError("injected failure before branch-created transition")
+
+    with patch.object(approval, "mark_task_branch_created", side_effect=fail_branch_transition):
         try:
-            cli_module.run_git_start(ctx, args)
+            invoke_git_start_cli(repo, args)
         except RuntimeError:
             pass
         else:
@@ -726,7 +859,9 @@ def test_task_branch_start_rejects_unclaimed_or_wrong_start_point(root: Path) ->
     write(repo / "unexpected.txt", "unexpected branch advance\n")
     git(repo, "add", "unexpected.txt")
     git(repo, "commit", "-m", "test: advance claimed branch", "-q")
-    assert_value_error("start point mismatch", lambda: cli_module.run_git_start(ctx, args))
+    wrong_start = invoke_git_start_cli(repo, args)
+    assert wrong_start.returncode == 1, wrong_start.stdout
+    assert "start point mismatch" in wrong_start.stderr
 
 
 def test_inherited_mutation_lease_is_scoped_and_live(root: Path) -> None:
@@ -1539,6 +1674,7 @@ def main() -> None:
         test_first_capability_task_establishes_final_branch_before_acceptance(root)
         test_task_branch_start_revalidates_exact_task_state_after_pull(root)
         test_task_branch_start_revalidates_exact_local_review_after_pull(root)
+        test_task_branch_start_replays_the_first_sealed_remote_tip(root)
         test_task_branch_start_recovers_after_branch_creation(root)
         test_task_branch_start_recovers_after_activation(root)
         test_task_branch_start_rejects_unclaimed_or_wrong_start_point(root)

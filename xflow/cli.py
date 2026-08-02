@@ -878,6 +878,38 @@ def current_branch(repo_root: Path) -> str:
     return branch
 
 
+def remote_branch_tip(repo_root: Path, remote: str, branch: str) -> str:
+    ref = f"refs/heads/{branch}"
+    lines = [line.split() for line in git_run(repo_root, ["ls-remote", "--heads", remote, ref]).splitlines()]
+    matches = [fields for fields in lines if len(fields) == 2 and fields[1] == ref]
+    if len(matches) != 1:
+        raise ValueError(f"cannot resolve exactly one remote base branch: {remote}/{branch}")
+    commit = matches[0][0].lower()
+    if len(commit) not in {40, 64} or any(char not in "0123456789abcdef" for char in commit):
+        raise ValueError(f"invalid remote base commit for {remote}/{branch}")
+    return commit
+
+
+def synchronize_base_to_commit(repo_root: Path, base: str, sealed_commit: str) -> None:
+    if current_branch(repo_root) != base:
+        raise ValueError(f"exact base synchronization requires active base branch {base}")
+    current_commit = git_output(repo_root, ["rev-parse", "--verify", f"refs/heads/{base}^{{commit}}"])
+    if current_commit == sealed_commit:
+        return
+    if not current_commit:
+        raise ValueError(f"cannot resolve local base branch {base}")
+    git_run(repo_root, ["fetch", "--no-tags", "origin", sealed_commit])
+    fetched_commit = git_output(repo_root, ["rev-parse", "--verify", "FETCH_HEAD^{commit}"])
+    if fetched_commit != sealed_commit:
+        raise ValueError("fetched base commit does not match the sealed remote tip")
+    if not git_succeeds(repo_root, ["merge-base", "--is-ancestor", current_commit, sealed_commit]):
+        raise ValueError("local base cannot fast-forward to the sealed remote tip")
+    git_run(repo_root, ["merge", "--ff-only", sealed_commit])
+    synchronized = git_output(repo_root, ["rev-parse", "--verify", f"refs/heads/{base}^{{commit}}"])
+    if synchronized != sealed_commit:
+        raise ValueError("local base did not synchronize to the sealed remote tip")
+
+
 def enable_worktree_config(repo_root: Path) -> None:
     enabled = git_output(
         repo_root,
@@ -1360,9 +1392,15 @@ def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
         if branch_reservation.base_commit == "pending":
             if current != base:
                 raise ValueError(f"task branch reservation requires active base branch {base}")
-            print(f"[INFO] pull origin/{base}")
-            git_run(ctx.repo_root, ["pull", "--ff-only", "origin", base])
-            branch_reservation = approval.bind_task_branch_base(ctx.repo_root, branch_reservation)
+            remote_tip = remote_branch_tip(ctx.repo_root, "origin", base)
+            branch_reservation = approval.bind_task_branch_base(
+                ctx.repo_root,
+                branch_reservation,
+                remote_tip,
+            )
+        if current == base:
+            print(f"[INFO] synchronize {base} to {branch_reservation.base_commit}")
+            synchronize_base_to_commit(ctx.repo_root, base, branch_reservation.base_commit)
         target_commit = git_output(ctx.repo_root, ["rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}"])
         if target_commit:
             if target_commit != branch_reservation.base_commit:

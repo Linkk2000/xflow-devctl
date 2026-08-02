@@ -1532,13 +1532,22 @@ def _task_branch_claim_bytes(payload: dict[str, object]) -> bytes:
 
 
 @contextmanager
-def _task_branch_claim_lock(repo_root: Path, approval_id: str) -> Iterator[None]:
+def _approval_claim_lock(
+    repo_root: Path,
+    approval_id: str,
+    runtime_scope: str,
+    busy_message: str,
+) -> Iterator[None]:
+    if runtime_scope not in {"remote-approvals", "task-branch-start"}:
+        raise ValueError("invalid approval claim lock scope")
+    if not APPROVAL_ID_RE.fullmatch(approval_id):
+        raise ValueError("approval claim lock requires a valid approval identity")
     bindings = resolve_bindings(repo_root)
     lock_path = (
         git_path(repo_root, "--git-common-dir")
         / "xflow"
         / "runtime"
-        / "task-branch-start"
+        / runtime_scope
         / bindings.worktree
         / f"{approval_id}.lock"
     )
@@ -1560,7 +1569,7 @@ def _task_branch_claim_lock(repo_root: Path, approval_id: str) -> Iterator[None]
 
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         except OSError:
-            raise ValueError(f"task branch approval reservation is busy: {approval_id}") from None
+            raise ValueError(f"{busy_message}: {approval_id}") from None
         try:
             yield
         finally:
@@ -1579,6 +1588,17 @@ def _task_branch_claim_lock(repo_root: Path, approval_id: str) -> Iterator[None]
             lock_path.unlink(missing_ok=True)
         except PermissionError:
             pass
+
+
+@contextmanager
+def _task_branch_claim_lock(repo_root: Path, approval_id: str) -> Iterator[None]:
+    with _approval_claim_lock(
+        repo_root,
+        approval_id,
+        "task-branch-start",
+        "task branch approval reservation is busy",
+    ):
+        yield
 
 
 def _git_ref_commit(repo_root: Path, ref: str) -> str:
@@ -2015,8 +2035,12 @@ def _reload_task_branch_reservation(
 def bind_task_branch_base(
     repo_root: Path,
     reservation: TaskBranchStartReservation,
+    remote_base_commit: str,
 ) -> TaskBranchStartReservation:
     root = repo_root.resolve()
+    sealed_commit = remote_base_commit.strip().lower()
+    if not GIT_COMMIT_RE.fullmatch(sealed_commit):
+        raise ValueError("cannot seal exact remote task branch base commit")
     with _task_branch_claim_lock(root, reservation.grant.approval_id):
         claim, current = _reload_task_branch_reservation(root, reservation)
         if claim["state"] != "reserved":
@@ -2025,13 +2049,10 @@ def bind_task_branch_base(
         bindings = resolve_bindings(root)
         if bindings.branch != claim["baseBranch"]:
             raise ValueError("task branch base binding requires the exact base branch")
-        base_commit = _git_ref_commit(root, f"refs/heads/{claim['baseBranch']}")
-        if not GIT_COMMIT_RE.fullmatch(base_commit):
-            raise ValueError("cannot resolve exact task branch base commit")
-        if claim["baseCommit"] not in {"pending", base_commit}:
+        if claim["baseCommit"] not in {"pending", sealed_commit}:
             raise ValueError("task branch claim base commit mismatch")
         if claim["baseCommit"] == "pending":
-            claim.update({"baseCommit": base_commit, "updatedAt": _canonical_utc_now()})
+            claim.update({"baseCommit": sealed_commit, "updatedAt": _canonical_utc_now()})
             _replace_bytes(reservation.claim_path, _task_branch_claim_bytes(claim))
         return _task_branch_reservation(root, reservation.claim_path, claim)
 
@@ -2161,53 +2182,13 @@ def complete_task_branch_start(repo_root: Path, reservation: TaskBranchStartRese
 
 @contextmanager
 def _remote_action_lock(repo_root: Path, approval_id: str) -> Iterator[None]:
-    bindings = resolve_bindings(repo_root)
-    lock_path = (
-        git_path(repo_root, "--git-common-dir")
-        / "xflow"
-        / "runtime"
-        / "remote-approvals"
-        / bindings.worktree
-        / f"{approval_id}.lock"
-    )
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = lock_path.open("a+b")
-    try:
-        if handle.seek(0, os.SEEK_END) == 0:
-            handle.write(b"0")
-            handle.flush()
-            os.fsync(handle.fileno())
-        handle.seek(0)
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except OSError:
-            raise ValueError(f"remote approval reservation is busy: {approval_id}") from None
-        try:
-            yield
-        finally:
-            handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    finally:
-        handle.close()
-        try:
-            lock_path.unlink(missing_ok=True)
-        except PermissionError:
-            # Another Windows waiter already opened the same lock; the last closer removes it.
-            pass
+    with _approval_claim_lock(
+        repo_root,
+        approval_id,
+        "remote-approvals",
+        "remote approval reservation is busy",
+    ):
+        yield
 
 
 def _remote_claim_path(repo_root: Path, issue: str, approval_id: str) -> Path:
