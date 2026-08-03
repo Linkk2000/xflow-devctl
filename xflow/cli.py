@@ -1777,13 +1777,14 @@ def run_git(args: argparse.Namespace) -> int:
 def run_approval(args: argparse.Namespace) -> int:
     ctx = context()
     if args.approval_command == "supersede-branch-start":
-        path = approval.supersede_task_branch_start_by_id(
-            ctx.repo_root,
-            args.issue,
-            args.approval_id,
-            reason=args.reason,
-            confirmation=args.confirm,
-        )
+        with repository_mutation(ctx.repo_root):
+            path = approval.supersede_task_branch_start_by_id(
+                ctx.repo_root,
+                args.issue,
+                args.approval_id,
+                reason=args.reason,
+                confirmation=args.confirm,
+            )
         print(f"[INFO] task branch approval claim superseded: {path}")
         return 0
     if args.approval_command == "reconcile":

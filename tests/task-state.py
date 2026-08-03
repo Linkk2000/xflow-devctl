@@ -6,9 +6,11 @@ import os
 import subprocess
 import sys
 import tempfile
-from contextlib import redirect_stderr, redirect_stdout
+import threading
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace as dataclass_replace
 from types import SimpleNamespace
+from typing import Iterator
 from unittest.mock import patch
 from pathlib import Path
 
@@ -986,6 +988,104 @@ def test_task_branch_supersede_requires_exact_confirmation_and_no_effects(root: 
     assert effected.returncode == 1, effected.stdout
     assert "branch effect" in effected.stderr
     assert yaml.safe_load(claim_path.read_text(encoding="utf-8"))["state"] == "reserved"
+
+
+def test_task_branch_supersede_waits_for_final_branch_effect(root: Path) -> None:
+    issue = "724"
+    repo, _, _, target, _, args = capability_branch_start_fixture(
+        root,
+        "branch-supersede-mutex",
+        issue,
+        "supersede-mutex",
+    )
+    claim_path, claim = reserve_task_branch_before_effect(repo, args)
+    branch_effect_ready = threading.Event()
+    release_branch_effect = threading.Event()
+    supersede_started = threading.Event()
+    supersede_claim_lock_acquired = threading.Event()
+    outcomes: dict[str, int] = {}
+    failures: dict[str, BaseException] = {}
+    original_git_run = cli_module.git_run
+    original_claim_lock = approval._task_branch_claim_lock
+
+    def hold_before_branch_effect(repo_root: Path, command: list[str]) -> str:
+        if command == ["checkout", "-b", target, str(claim["baseCommit"])]:
+            assert_cli_mutation_lease(repo_root)
+            branch_effect_ready.set()
+            assert release_branch_effect.wait(5), "timed out waiting to release branch creation"
+        return original_git_run(repo_root, command)
+
+    @contextmanager
+    def track_claim_lock(repo_root: Path, approval_id: str) -> Iterator[None]:
+        with original_claim_lock(repo_root, approval_id):
+            if branch_effect_ready.is_set():
+                supersede_claim_lock_acquired.set()
+            yield
+
+    git_args = SimpleNamespace(**vars(args), git_command="start")
+    supersede_args = SimpleNamespace(
+        approval_command="supersede-branch-start",
+        issue=issue,
+        approval_id=str(claim["approvalId"]),
+        reason="branch creation is being superseded",
+        confirm="XFLOW_HUMAN_SUPERSEDE_TASK_BRANCH_START",
+    )
+
+    def run_start() -> None:
+        try:
+            outcomes["start"] = cli_module.run_git(git_args)
+        except BaseException as exc:
+            failures["start"] = exc
+
+    def run_supersede() -> None:
+        supersede_started.set()
+        try:
+            outcomes["supersede"] = cli_module.run_approval(supersede_args)
+        except BaseException as exc:
+            failures["supersede"] = exc
+
+    with patch.dict(
+        os.environ,
+        {
+            "DEVCTL_REPO_ROOT": str(repo),
+            "DEVCTL_SKIP_PROVIDER_LOAD": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONIOENCODING": "utf-8",
+            "XFLOW_COLLABORATION_LOCK_TIMEOUT": "0.2",
+        },
+        clear=False,
+    ):
+        with patch.object(cli_module, "git_run", side_effect=hold_before_branch_effect):
+            with patch.object(approval, "_remote_task_branch_exists", return_value=False):
+                with patch.object(approval, "_task_branch_claim_lock", side_effect=track_claim_lock):
+                    start_thread = threading.Thread(target=run_start)
+                    supersede_thread = threading.Thread(target=run_supersede)
+                    start_thread.start()
+                    assert branch_effect_ready.wait(5), (
+                        f"git start did not reach its final branch effect: {failures}"
+                    )
+                    supersede_thread.start()
+                    assert supersede_started.wait(5), "supersede did not start"
+                    try:
+                        assert not supersede_claim_lock_acquired.wait(0.2), (
+                            "supersede acquired its claim lock while git start owned the repository mutation"
+                        )
+                    finally:
+                        release_branch_effect.set()
+                        start_thread.join(5)
+                        supersede_thread.join(5)
+
+    assert not start_thread.is_alive(), "git start did not finish"
+    assert not supersede_thread.is_alive(), "supersede did not finish"
+    assert outcomes == {"start": 0}
+    assert "supersede" in failures
+    assert "branch effect" in str(failures["supersede"])
+    _, persisted = task_branch_claim(repo, issue)
+    assert persisted["state"] == "completed"
+    assert subprocess.run(
+        ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{target}"],
+        check=False,
+    ).returncode == 0
 
 
 def test_task_branch_start_recovers_after_branch_creation(root: Path) -> None:
@@ -1986,6 +2086,7 @@ def main() -> None:
         test_task_branch_start_rejects_force_pushed_remote_before_effect(root)
         test_human_supersede_unblocks_new_approval_after_sealed_sha_is_unreachable(root)
         test_task_branch_supersede_requires_exact_confirmation_and_no_effects(root)
+        test_task_branch_supersede_waits_for_final_branch_effect(root)
         test_task_branch_start_recovers_after_branch_creation(root)
         test_task_branch_start_recovers_after_activation(root)
         test_task_branch_completion_rejects_noncanonical_history_paths(root)
