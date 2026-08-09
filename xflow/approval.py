@@ -157,6 +157,30 @@ TASK_BRANCH_SUPERSEDED_FIELD_ORDER = TASK_BRANCH_CLAIM_FIELD_ORDER + (
     "supersededReason",
 )
 TASK_BRANCH_SUPERSEDED_FIELDS = set(TASK_BRANCH_SUPERSEDED_FIELD_ORDER)
+TASK_BRANCH_BASE_SYNC_CLAIM_VERSION = "0.3.0"
+TASK_BRANCH_BASE_SYNC_SUPERSEDED_VERSION = "0.4.0"
+TASK_BRANCH_BASE_SYNC_CLAIM_FIELD_ORDER = (
+    "version", "approvalId", "repository", "worktree", "branch", "baseBranch", "targetBranch",
+    "approvalIssue", "action", "approvedFile", "approvedSha256", "reviewerSummary",
+    "approvedReviewFile", "approvedReviewSha256", "taskStateSnapshotFile",
+    "taskStateSnapshotSha256", "branchStartClaimFile", "state", "baseCommit",
+    "preSyncBaseCommit", "reservedAt", "updatedAt", "recordedAt", "historyFile", "historySha256",
+)
+TASK_BRANCH_BASE_SYNC_SUPERSEDED_FIELD_ORDER = TASK_BRANCH_BASE_SYNC_CLAIM_FIELD_ORDER + (
+    "supersededAt",
+    "supersededReason",
+)
+TASK_BRANCH_CLAIM_SCHEMAS = {
+    "0.1.0": TASK_BRANCH_CLAIM_FIELD_ORDER,
+    "0.2.0": TASK_BRANCH_SUPERSEDED_FIELD_ORDER,
+    TASK_BRANCH_BASE_SYNC_CLAIM_VERSION: TASK_BRANCH_BASE_SYNC_CLAIM_FIELD_ORDER,
+    TASK_BRANCH_BASE_SYNC_SUPERSEDED_VERSION: TASK_BRANCH_BASE_SYNC_SUPERSEDED_FIELD_ORDER,
+}
+TASK_BRANCH_SUPERSEDED_VERSIONS = {"0.2.0", TASK_BRANCH_BASE_SYNC_SUPERSEDED_VERSION}
+TASK_BRANCH_BASE_SYNC_VERSIONS = {
+    TASK_BRANCH_BASE_SYNC_CLAIM_VERSION,
+    TASK_BRANCH_BASE_SYNC_SUPERSEDED_VERSION,
+}
 GIT_COMMIT_RE = re.compile(r"[0-9a-f]{40,64}")
 
 
@@ -1540,12 +1564,24 @@ def _task_branch_review_path(repo_root: Path, issue: str, approval_id: str) -> P
     )
 
 
+def _task_branch_claim_order(version: object) -> tuple[str, ...] | None:
+    if not isinstance(version, str):
+        return None
+    return TASK_BRANCH_CLAIM_SCHEMAS.get(version)
+
+
 def _task_branch_claim_bytes(payload: dict[str, object]) -> bytes:
-    order = (
-        TASK_BRANCH_SUPERSEDED_FIELD_ORDER
-        if payload.get("version") == "0.2.0"
-        else TASK_BRANCH_CLAIM_FIELD_ORDER
-    )
+    version = payload.get("version")
+    order = _task_branch_claim_order(version)
+    if order is None or set(payload) != set(order):
+        raise ValueError("task branch start claim has unexpected or missing fields")
+    if version in TASK_BRANCH_BASE_SYNC_VERSIONS:
+        pre_sync_base_commit = payload.get("preSyncBaseCommit")
+        if (
+            not isinstance(pre_sync_base_commit, str)
+            or not GIT_COMMIT_RE.fullmatch(pre_sync_base_commit)
+        ):
+            raise ValueError("task branch start claim has invalid preSyncBaseCommit")
     return _yaml_bytes({name: payload[name] for name in order})
 
 
@@ -1635,20 +1671,18 @@ def _parse_task_branch_claim(repo_root: Path, path: Path, issue: str) -> dict[st
     if not isinstance(payload, dict):
         raise ValueError("task branch start claim has unexpected or missing fields")
     version = payload.get("version")
-    expected_fields = (
-        TASK_BRANCH_SUPERSEDED_FIELDS
-        if version == "0.2.0"
-        else TASK_BRANCH_CLAIM_FIELDS
-    )
+    order = _task_branch_claim_order(version)
+    if order is None:
+        raise ValueError("task branch start claim has unsupported schema version")
+    expected_fields = set(order)
     if set(payload) != expected_fields:
         raise ValueError("task branch start claim has unexpected or missing fields")
     if (
-        version not in {"0.1.0", "0.2.0"}
-        or payload["action"] != "task-branch-start"
+        payload["action"] != "task-branch-start"
         or payload["state"] not in TASK_BRANCH_CLAIM_STATES
     ):
         raise ValueError("task branch start claim has invalid fixed fields")
-    if (version == "0.2.0") != (payload["state"] == "superseded"):
+    if (version in TASK_BRANCH_SUPERSEDED_VERSIONS) != (payload["state"] == "superseded"):
         raise ValueError("task branch start claim has invalid supersede lifecycle")
     for name in (
         "repository",
@@ -1689,6 +1723,13 @@ def _parse_task_branch_claim(repo_root: Path, path: Path, issue: str) -> dict[st
     base_commit = payload["baseCommit"]
     if base_commit != "pending" and (not isinstance(base_commit, str) or not GIT_COMMIT_RE.fullmatch(base_commit)):
         raise ValueError("task branch start claim has invalid baseCommit")
+    if version in TASK_BRANCH_BASE_SYNC_VERSIONS:
+        pre_sync_base_commit = payload["preSyncBaseCommit"]
+        if (
+            not isinstance(pre_sync_base_commit, str)
+            or not GIT_COMMIT_RE.fullmatch(pre_sync_base_commit)
+        ):
+            raise ValueError("task branch start claim has invalid preSyncBaseCommit")
     if payload["state"] != "reserved" and base_commit == "pending":
         if payload["state"] != "superseded":
             raise ValueError("task branch start claim is missing the exact base commit")
@@ -1702,7 +1743,7 @@ def _parse_task_branch_claim(repo_root: Path, path: Path, issue: str) -> dict[st
             raise ValueError("task branch start claim has invalid historySha256")
     if payload["state"] in {"reserved", "branch-created", "superseded"} and history_values != ("none", "none", "none"):
         raise ValueError("task branch start claim records history before activation")
-    if version == "0.2.0":
+    if version in TASK_BRANCH_SUPERSEDED_VERSIONS:
         if not isinstance(payload["supersededAt"], str):
             raise ValueError("task branch start claim has invalid supersededAt")
         _canonical_utc_timestamp(payload["supersededAt"], "supersededAt", microseconds=True)
@@ -1937,6 +1978,9 @@ def reserve_task_branch_start(repo_root: Path, grant: ApprovalGrant, base_branch
         bindings = resolve_bindings(root)
         if bindings.repository != grant.repository or bindings.worktree != grant.worktree or bindings.branch != base_branch:
             raise ValueError("task branch reservation Git bindings changed after approval")
+        pre_sync_base_commit = _git_ref_commit(root, f"refs/heads/{base_branch}")
+        if not GIT_COMMIT_RE.fullmatch(pre_sync_base_commit):
+            raise ValueError("cannot seal exact local task branch base commit")
         approved_path = resolve_path(root, Path(grant.approved_file))
         state_snapshot = capture_stable_file(
             root,
@@ -2002,7 +2046,7 @@ def reserve_task_branch_start(repo_root: Path, grant: ApprovalGrant, base_branch
         )
         now = _canonical_utc_now()
         claim: dict[str, object] = {
-            "version": "0.1.0",
+            "version": TASK_BRANCH_BASE_SYNC_CLAIM_VERSION,
             "approvalId": grant.approval_id,
             "repository": grant.repository,
             "worktree": grant.worktree,
@@ -2021,6 +2065,7 @@ def reserve_task_branch_start(repo_root: Path, grant: ApprovalGrant, base_branch
             "branchStartClaimFile": claim_path.relative_to(root).as_posix(),
             "state": "reserved",
             "baseCommit": "pending",
+            "preSyncBaseCommit": pre_sync_base_commit,
             "reservedAt": now,
             "updatedAt": now,
             "recordedAt": "none",
@@ -2142,6 +2187,13 @@ def supersede_task_branch_start_by_id(
             raise ValueError("task branch claim cannot be superseded after a branch effect")
         if any(claim[name] != "none" for name in ("recordedAt", "historyFile", "historySha256")):
             raise ValueError("task branch claim cannot be superseded after a history effect")
+        if claim["version"] not in TASK_BRANCH_BASE_SYNC_VERSIONS:
+            raise ValueError(
+                "task branch claim cannot be superseded without a sealed pre-effect base identity"
+            )
+        current_base_commit = _git_ref_commit(root, f"refs/heads/{claim['baseBranch']}")
+        if current_base_commit != claim["preSyncBaseCommit"]:
+            raise ValueError("task branch claim cannot be superseded after a base-branch effect")
         target_branch = str(claim["targetBranch"])
         if _git_ref_commit(root, f"refs/heads/{target_branch}") or resolve_bindings(root).branch == target_branch:
             raise ValueError("task branch claim cannot be superseded after a branch effect")
@@ -2171,7 +2223,7 @@ def supersede_task_branch_start_by_id(
         superseded_at = _canonical_utc_now()
         claim.update(
             {
-                "version": "0.2.0",
+                "version": TASK_BRANCH_BASE_SYNC_SUPERSEDED_VERSION,
                 "state": "superseded",
                 "updatedAt": superseded_at,
                 "supersededAt": superseded_at,

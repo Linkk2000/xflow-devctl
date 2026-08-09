@@ -826,6 +826,81 @@ def test_task_branch_start_replays_the_first_sealed_remote_tip(root: Path) -> No
     assert target_tip == sealed_tip
 
 
+def test_human_supersede_rejects_after_base_fast_forward_crash(root: Path) -> None:
+    issue = "725"
+    name = "branch-base-effect-supersede"
+    repo, _, _, target, _, args = capability_branch_start_fixture(
+        root,
+        name,
+        issue,
+        "base-effect-supersede",
+    )
+    origin = root / f"{name}-origin.git"
+    sealed_tip = advance_origin(root, origin, "branch-base-effect-sealed", "# sealed base tip\n")
+    original_git_run = cli_module.git_run
+    crashed = False
+
+    def crash_after_base_sync(repo_root: Path, git_args: list[str]) -> str:
+        nonlocal crashed
+        output = original_git_run(repo_root, git_args)
+        synchronized = git_args[:2] == ["pull", "--ff-only"] or git_args[:2] == ["merge", "--ff-only"]
+        if synchronized and not crashed:
+            crashed = True
+            raise RuntimeError("injected failure after exact base synchronization")
+        return output
+
+    with patch.object(cli_module, "git_run", side_effect=crash_after_base_sync):
+        try:
+            invoke_git_start_cli(repo, args)
+        except RuntimeError as exc:
+            assert "injected failure" in str(exc)
+        else:
+            raise AssertionError("expected injected base synchronization failure")
+    assert crashed
+
+    replacement_tip = replace_origin_history(
+        root,
+        origin,
+        "branch-base-effect-replacement",
+        "# replacement remote history\n",
+    )
+    assert replacement_tip != sealed_tip
+    assert resolve_bindings(repo).branch == "main"
+    assert subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+        check=True,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+    ).stdout.strip() == sealed_tip
+
+    claim_path, before = task_branch_claim(repo, issue)
+    before_bytes = claim_path.read_bytes()
+    assert before["state"] == "reserved"
+    superseded = run_devctl_result(
+        repo,
+        "approval",
+        "supersede-branch-start",
+        "--issue",
+        issue,
+        "--approval-id",
+        str(before["approvalId"]),
+        "--reason",
+        "base branch changed after synchronization",
+        "--confirm",
+        "XFLOW_HUMAN_SUPERSEDE_TASK_BRANCH_START",
+    )
+    assert superseded.returncode == 1, superseded.stdout
+    assert "base-branch effect" in superseded.stderr
+    assert claim_path.read_bytes() == before_bytes
+    _, unchanged = task_branch_claim(repo, issue)
+    assert unchanged["state"] == "reserved"
+    assert subprocess.run(
+        ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{target}"],
+        check=False,
+    ).returncode != 0
+
+
 def test_task_branch_start_rejects_force_pushed_remote_before_effect(root: Path) -> None:
     issue = "718"
     name = "branch-force-push"
@@ -868,8 +943,17 @@ def test_human_supersede_unblocks_new_approval_after_sealed_sha_is_unreachable(r
     )
     origin = root / f"{name}-origin.git"
     sealed_tip = advance_origin(root, origin, "branch-unreachable-sealed", "# sealed but unfetched tip\n")
+    local_base_before_reservation = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "refs/heads/main"],
+        check=True,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+    ).stdout.strip()
     claim_path, claim = reserve_task_branch_before_effect(repo, args)
     assert claim["baseCommit"] == sealed_tip
+    assert claim["version"] == "0.3.0"
+    assert claim["preSyncBaseCommit"] == local_base_before_reservation
     replacement_tip = replace_origin_history(
         root,
         origin,
@@ -943,6 +1027,112 @@ def test_human_supersede_unblocks_new_approval_after_sealed_sha_is_unreachable(r
         encoding="utf-8",
         stdout=subprocess.PIPE,
     ).stdout.strip() == replacement_tip
+
+
+def test_legacy_task_branch_claim_supersede_fails_closed(root: Path) -> None:
+    issue = "726"
+    repo, _, _, target, _, args = capability_branch_start_fixture(
+        root,
+        "branch-legacy-supersede",
+        issue,
+        "legacy-supersede",
+    )
+    claim_path, claim = reserve_task_branch_before_effect(repo, args)
+    legacy = dict(claim)
+    legacy["version"] = "0.1.0"
+    del legacy["preSyncBaseCommit"]
+    claim_path.write_bytes(approval._task_branch_claim_bytes(legacy))
+    parsed = approval._parse_task_branch_claim(repo, claim_path, issue)
+    assert parsed["version"] == "0.1.0"
+    assert "preSyncBaseCommit" not in parsed
+    before_bytes = claim_path.read_bytes()
+
+    superseded = run_devctl_result(
+        repo,
+        "approval",
+        "supersede-branch-start",
+        "--issue",
+        issue,
+        "--approval-id",
+        str(claim["approvalId"]),
+        "--reason",
+        "legacy claim requires review",
+        "--confirm",
+        "XFLOW_HUMAN_SUPERSEDE_TASK_BRANCH_START",
+    )
+    assert superseded.returncode == 1, superseded.stdout
+    assert "pre-effect base identity" in superseded.stderr
+    assert claim_path.read_bytes() == before_bytes
+    assert yaml.safe_load(claim_path.read_text(encoding="utf-8"))["state"] == "reserved"
+    assert subprocess.run(
+        ["git", "-C", str(repo), "show-ref", "--verify", "--quiet", f"refs/heads/{target}"],
+        check=False,
+    ).returncode != 0
+
+
+def test_task_branch_claim_rejects_missing_malformed_or_tampered_pre_sync_identity(root: Path) -> None:
+    issue = "727"
+    repo, _, _, _, _, args = capability_branch_start_fixture(
+        root,
+        "branch-claim-schema",
+        issue,
+        "claim-schema",
+    )
+    claim_path, claim = reserve_task_branch_before_effect(repo, args)
+    original_bytes = claim_path.read_bytes()
+
+    legacy_superseded = dict(claim)
+    legacy_superseded["version"] = "0.2.0"
+    legacy_superseded["state"] = "superseded"
+    del legacy_superseded["preSyncBaseCommit"]
+    legacy_superseded["supersededAt"] = claim["updatedAt"]
+    legacy_superseded["supersededReason"] = "legacy terminal"
+    claim_path.write_bytes(approval._task_branch_claim_bytes(legacy_superseded))
+    parsed_legacy_superseded = approval._parse_task_branch_claim(repo, claim_path, issue)
+    assert parsed_legacy_superseded["version"] == "0.2.0"
+    assert parsed_legacy_superseded["state"] == "superseded"
+    claim_path.write_bytes(original_bytes)
+
+    missing = dict(claim)
+    del missing["preSyncBaseCommit"]
+    assert_value_error("unexpected or missing fields", lambda: approval._task_branch_claim_bytes(missing))
+    claim_path.write_bytes(approval._yaml_bytes(missing))
+    assert_value_error(
+        "unexpected or missing fields",
+        lambda: approval._parse_task_branch_claim(repo, claim_path, issue),
+    )
+    claim_path.write_bytes(original_bytes)
+
+    malformed = dict(claim)
+    malformed["preSyncBaseCommit"] = "not-a-commit"
+    assert_value_error("invalid preSyncBaseCommit", lambda: approval._task_branch_claim_bytes(malformed))
+    claim_path.write_bytes(approval._yaml_bytes(malformed))
+    assert_value_error(
+        "invalid preSyncBaseCommit",
+        lambda: approval._parse_task_branch_claim(repo, claim_path, issue),
+    )
+    claim_path.write_bytes(original_bytes)
+
+    tampered = dict(claim)
+    tampered["preSyncBaseCommit"] = "0" * len(str(claim["preSyncBaseCommit"]))
+    claim_path.write_bytes(approval._yaml_bytes(tampered))
+    superseded = run_devctl_result(
+        repo,
+        "approval",
+        "supersede-branch-start",
+        "--issue",
+        issue,
+        "--approval-id",
+        str(claim["approvalId"]),
+        "--reason",
+        "tampered claim identity",
+        "--confirm",
+        "XFLOW_HUMAN_SUPERSEDE_TASK_BRANCH_START",
+    )
+    assert superseded.returncode == 1, superseded.stdout
+    assert "base-branch effect" in superseded.stderr
+    claim_path.write_bytes(original_bytes)
+    assert approval._parse_task_branch_claim(repo, claim_path, issue)["preSyncBaseCommit"] == claim["preSyncBaseCommit"]
 
 
 def test_task_branch_supersede_requires_exact_confirmation_and_no_effects(root: Path) -> None:
@@ -2083,8 +2273,11 @@ def main() -> None:
         test_task_branch_start_revalidates_exact_task_state_after_pull(root)
         test_task_branch_start_revalidates_exact_local_review_after_pull(root)
         test_task_branch_start_replays_the_first_sealed_remote_tip(root)
+        test_human_supersede_rejects_after_base_fast_forward_crash(root)
         test_task_branch_start_rejects_force_pushed_remote_before_effect(root)
         test_human_supersede_unblocks_new_approval_after_sealed_sha_is_unreachable(root)
+        test_legacy_task_branch_claim_supersede_fails_closed(root)
+        test_task_branch_claim_rejects_missing_malformed_or_tampered_pre_sync_identity(root)
         test_task_branch_supersede_requires_exact_confirmation_and_no_effects(root)
         test_task_branch_supersede_waits_for_final_branch_effect(root)
         test_task_branch_start_recovers_after_branch_creation(root)
