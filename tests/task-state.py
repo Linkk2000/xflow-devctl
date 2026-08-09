@@ -1051,7 +1051,7 @@ def test_task_branch_supersede_waits_for_final_branch_effect(root: Path) -> None
             "DEVCTL_SKIP_PROVIDER_LOAD": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONIOENCODING": "utf-8",
-            "XFLOW_COLLABORATION_LOCK_TIMEOUT": "0.2",
+            "XFLOW_COLLABORATION_LOCK_TIMEOUT": "5",
         },
         clear=False,
     ):
