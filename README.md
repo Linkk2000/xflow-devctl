@@ -524,10 +524,15 @@ provider-only metadata.
 PowerShell users should prefer the repository-local `devctl.ps1`, which invokes
 the Python core and sets `PYTHONDONTWRITEBYTECODE=1` to avoid `__pycache__`
 byproducts. Do not rely on a user-level PATH devctl shim for repository work.
-Normal Git, Issue, Attachment, Approval, Rules, and Migration commands route
-through Python core. The entrypoint checks are independent capability suites:
+The repository-local `devctl` and generated POSIX project wrappers use a
+`/bin/sh` launcher and require Python 3.9 or newer. They select the interpreter
+in this deterministic order: `DEVCTL_PYTHON`, `python3`, then `python`. Set
+`DEVCTL_PYTHON` when the preferred interpreter is not on `PATH`. Normal Git,
+Issue, Attachment, Approval, Rules, and Migration commands route through the
+Python core. The entrypoint checks are independent capability suites:
 
 ```text
+python tests/posix-launcher.py
 python tests/entrypoint-routing.py
 python tests/powershell-entrypoint.py
 ```

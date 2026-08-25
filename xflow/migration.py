@@ -1463,23 +1463,36 @@ def inspect(repo_root: Path) -> MigrationReport:
 
 
 def wrapper_files() -> dict[str, str]:
-    bash = """#!/usr/bin/env bash
-set -euo pipefail
+    posix = """#!/bin/sh
+set -eu
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 TOOL_ROOT="$ROOT/.xflow/ops/devctl"
 
-if [[ ! -d "$TOOL_ROOT/xflow" ]]; then
-  echo "[ERROR] Missing XFlow devctl Python core at .xflow/ops/devctl/xflow" >&2
+if [ ! -d "$TOOL_ROOT/xflow" ]; then
+  printf '%s\\n' '[ERROR] Missing XFlow devctl Python core at .xflow/ops/devctl/xflow' >&2
   exit 1
 fi
 
+select_python() {
+  for candidate in "${DEVCTL_PYTHON:-}" python3 python; do
+    [ -n "$candidate" ] || continue
+    command -v "$candidate" >/dev/null 2>&1 || [ -x "$candidate" ] || continue
+    "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1 || continue
+    printf '%s\\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+PYTHON=$(select_python) || {
+  printf '%s\\n' '[ERROR] devctl requires Python 3.9+; set DEVCTL_PYTHON.' >&2
+  exit 1
+}
 export DEVCTL_REPO_ROOT="$ROOT"
-export DEVCTL_TOOL_ROOT="$TOOL_ROOT"
-export DEVCTL_OPS_ROOT="$TOOL_ROOT"
-export PYTHONDONTWRITEBYTECODE=1
+export DEVCTL_TOOL_ROOT="$TOOL_ROOT" DEVCTL_OPS_ROOT="$TOOL_ROOT" PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$TOOL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-exec python -m xflow "$@"
+exec "$PYTHON" -m xflow "$@"
 """
     ps1 = """$ErrorActionPreference = "Stop"
 
@@ -1494,7 +1507,7 @@ if (-not (Test-Path -LiteralPath $Package)) {
 
 $Python = Get-Command python -ErrorAction SilentlyContinue
 if (-not $Python) {
-    Write-Error "[ERROR] Python 3.10+ is required for devctl Python core."
+    Write-Error "[ERROR] Python 3.9+ is required for devctl Python core."
     exit 1
 }
 
@@ -1511,7 +1524,7 @@ if ($env:PYTHONPATH) {
 python -m xflow @args
 exit $LASTEXITCODE
 """
-    return {"devctl": bash, "devctl.ps1": ps1}
+    return {"devctl": posix, "devctl.ps1": ps1}
 
 
 def write_wrappers(repo_root: Path) -> list[Path]:

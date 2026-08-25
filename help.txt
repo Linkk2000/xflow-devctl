@@ -307,10 +307,15 @@ Migration:
   devctl migrate issue-workspace --mode tracked|local --check|--apply
 
 Runtime:
-  Repository-local devctl.ps1 and generated project wrappers route normal commands to Python core.
+  Repository-local devctl and generated POSIX project wrappers use a /bin/sh
+  launcher and require Python 3.9 or newer. Interpreter discovery is deterministic:
+  DEVCTL_PYTHON, then python3, then python. Set DEVCTL_PYTHON when the preferred
+  interpreter is not on PATH. Repository-local devctl.ps1 and generated project
+  wrappers route normal commands to Python core.
   Do not rely on a user-level PATH devctl shim for repository work.
-  Run the Python core regression and the two independent entrypoint capability suites:
+  Run the Python core regression and the independent entrypoint capability suites:
     python tests/python-core.py
+    python tests/posix-launcher.py
     python tests/entrypoint-routing.py
     python tests/powershell-entrypoint.py
   The PowerShell-only suite exits 77 when its executable capability is unavailable;

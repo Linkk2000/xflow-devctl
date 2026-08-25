@@ -13,6 +13,7 @@ sys.path.insert(0, str(OPS_ROOT))
 from tests.support import write_text_lf
 
 from xflow import approval as approval_gate
+from xflow.migration import wrapper_files
 
 
 def test_env() -> dict[str, str]:
@@ -136,16 +137,50 @@ def assert_commit_message_check_routing(root: Path) -> None:
 
 def assert_no_legacy_run_command() -> None:
     entrypoint = (OPS_ROOT / "devctl").read_text(encoding="utf-8")
-    assert "\n    run)" not in entrypoint
-    assert 'run_script "$OPS/run.sh"' not in entrypoint
-    assert 'run_script "$OPS/git/start.sh"' not in entrypoint
-    assert 'run_script "$OPS/git/commit-msg.sh"' not in entrypoint
-    assert 'run_script "$OPS/git/done.sh"' not in entrypoint
-    assert 'run_script "$OPS/git/status.sh"' not in entrypoint
-    assert "|app)" not in entrypoint
-    assert not (OPS_ROOT / "run.sh").exists()
-    assert "preflight|approval|attachment|rules|migrate|unattended|task|contract|trace" in entrypoint
-    assert "preflight|approval|attachment|rules|migrate|unattended|task|contract|trace)" in entrypoint
+    assert entrypoint.startswith("#!/bin/sh\n")
+    assert "set -eu" in entrypoint
+    assert "select_python()" in entrypoint
+    assert '"${DEVCTL_PYTHON:-}" python3 python' in entrypoint
+    assert 'exec "$PYTHON" -m xflow "$@"' in entrypoint
+    assert "[[" not in entrypoint
+    assert "BASH_SOURCE" not in entrypoint
+    assert "source " not in entrypoint
+    assert "set -euo pipefail" not in entrypoint
+
+
+def assert_generated_wrapper_contract() -> None:
+    wrappers = wrapper_files()
+    entrypoint = wrappers["devctl"]
+    assert entrypoint.startswith("#!/bin/sh\n")
+    assert "set -eu" in entrypoint
+    assert "select_python()" in entrypoint
+    assert '"${DEVCTL_PYTHON:-}" python3 python' in entrypoint
+    assert 'TOOL_ROOT="$ROOT/.xflow/ops/devctl"' in entrypoint
+    assert 'export DEVCTL_TOOL_ROOT="$TOOL_ROOT"' in entrypoint
+    assert 'DEVCTL_OPS_ROOT="$TOOL_ROOT"' in entrypoint
+    assert 'exec "$PYTHON" -m xflow "$@"' in entrypoint
+    assert "[[" not in entrypoint
+    assert "BASH_SOURCE" not in entrypoint
+    assert "source " not in entrypoint
+    assert "Python 3.9+" in wrappers["devctl.ps1"]
+    assert "Python 3.10+" not in wrappers["devctl.ps1"]
+
+
+def assert_posix_launcher_routes_core() -> None:
+    env = test_env()
+    env["DEVCTL_REPO_ROOT"] = str(OPS_ROOT)
+    env["DEVCTL_SKIP_PROVIDER_LOAD"] = "1"
+    result = subprocess.run(
+        [str(OPS_ROOT / "devctl"), "check", "--help"],
+        cwd=OPS_ROOT,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "dependencies" in result.stdout
 
 
 def assert_check_commands_are_discoverable() -> None:
@@ -271,6 +306,8 @@ def assert_complete_command_contract_is_published() -> None:
 
 def main() -> None:
     assert_no_legacy_run_command()
+    assert_generated_wrapper_contract()
+    assert_posix_launcher_routes_core()
     assert_check_commands_are_discoverable()
     assert_unattended_commands_are_discoverable()
     assert_task_commands_are_discoverable()
