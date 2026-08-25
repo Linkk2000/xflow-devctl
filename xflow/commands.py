@@ -8,7 +8,8 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, Mapping, Sequence, Tuple
+from pathlib import Path
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 from . import capabilities
 from .cockpit import CheckSpec, CockpitContext, CockpitProfile, CommandSpec
@@ -25,10 +26,12 @@ class CommandOutcome:
 _SENSITIVE_ENV_MARKERS = ("TOKEN", "PASSWORD", "SECRET", "COOKIE")
 
 
-def start_engine_provider(env: Mapping[str, str]) -> bool:
+def start_engine_provider(
+    env: Mapping[str, str], *, timeout: Optional[float] = None
+) -> bool:
     """Delegate optional provider startup while keeping the capability seam injectable."""
 
-    return capabilities.start_engine_provider(env)
+    return capabilities.start_engine_provider(env, timeout=timeout)
 
 
 def _template_values(context: CockpitContext) -> Dict[str, str]:
@@ -95,53 +98,126 @@ def _display_argv(argv: Sequence[str]) -> str:
     return " ".join(shlex.quote(str(argument)) for argument in argv)
 
 
-def execute_command(
-    spec: CommandSpec, context: CockpitContext, *, capture: bool = False
-) -> CommandOutcome:
-    """Expand and execute one profile command without invoking a shell."""
+def _as_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
-    argv, cwd, child_env = _expanded_command(spec, context)
+
+def _append_diagnostic(stderr: str, diagnostic: str) -> str:
+    if stderr and not stderr.endswith("\n"):
+        stderr += "\n"
+    return stderr + diagnostic + "\n"
+
+
+def _cwd_diagnostic(cwd: str) -> Optional[str]:
+    path = Path(cwd)
     try:
-        completed = subprocess.run(
-            list(argv),
-            cwd=str(cwd),
-            env=child_env,
-            text=True,
-            encoding="utf-8",
-            stdout=subprocess.PIPE if capture else None,
-            stderr=subprocess.PIPE if capture else None,
-            shell=False,
+        if not path.exists():
+            return f"working directory does not exist: {cwd}"
+        if not path.is_dir():
+            return f"working directory is not a directory: {cwd}"
+    except OSError as exc:
+        return f"working directory cannot be inspected: {cwd}: {exc}"
+    return None
+
+
+def _run_expanded_command(
+    argv: Tuple[str, ...],
+    cwd: str,
+    child_env: Mapping[str, str],
+    *,
+    capture: bool,
+    timeout: Optional[float] = None,
+) -> CommandOutcome:
+    cwd_error = _cwd_diagnostic(cwd)
+    if cwd_error is not None:
+        return CommandOutcome(
+            argv,
+            126,
+            "",
+            _redact(cwd_error, child_env),
         )
+
+    run_kwargs = {
+        "cwd": str(cwd),
+        "env": dict(child_env),
+        "text": True,
+        "encoding": "utf-8",
+        "stdout": subprocess.PIPE if capture else None,
+        "stderr": subprocess.PIPE if capture else None,
+        "shell": False,
+    }
+    if timeout is not None:
+        run_kwargs["timeout"] = max(0.0, float(timeout))
+    try:
+        completed = subprocess.run(list(argv), **run_kwargs)
+    except subprocess.TimeoutExpired as exc:
+        stdout = _redact(_as_text(getattr(exc, "stdout", None) or getattr(exc, "output", None)), child_env)
+        stderr = _redact(_as_text(getattr(exc, "stderr", None)), child_env)
+        timeout_label = "unknown" if timeout is None else f"{float(timeout):g}s"
+        diagnostic = (
+            f"command timed out after {timeout_label}: {_display_argv(argv)} "
+            f"(cwd={cwd})"
+        )
+        return CommandOutcome(argv, 124, stdout, _append_diagnostic(stderr, diagnostic))
     except FileNotFoundError as exc:
         diagnostic = (
             f"executable not found for command {_display_argv(argv)} "
             f"(cwd={cwd}): {exc}"
         )
-        return CommandOutcome(tuple(argv), 127, "", _redact(diagnostic, child_env))
+        return CommandOutcome(argv, 127, "", _redact(diagnostic, child_env))
     except PermissionError as exc:
         diagnostic = (
             f"executable is not permitted for command {_display_argv(argv)} "
             f"(cwd={cwd}): {exc}"
         )
-        return CommandOutcome(tuple(argv), 126, "", _redact(diagnostic, child_env))
+        return CommandOutcome(argv, 126, "", _redact(diagnostic, child_env))
     except OSError as exc:
         diagnostic = f"could not execute command {_display_argv(argv)} (cwd={cwd}): {exc}"
-        return CommandOutcome(tuple(argv), 126, "", _redact(diagnostic, child_env))
+        return CommandOutcome(argv, 126, "", _redact(diagnostic, child_env))
 
     stdout = completed.stdout if isinstance(completed.stdout, str) else ""
     stderr = completed.stderr if isinstance(completed.stderr, str) else ""
-    return CommandOutcome(tuple(argv), int(completed.returncode), stdout, stderr)
+    return CommandOutcome(argv, int(completed.returncode), stdout, stderr)
+
+
+def execute_command(
+    spec: CommandSpec,
+    context: CockpitContext,
+    *,
+    capture: bool = False,
+    timeout: Optional[float] = None,
+) -> CommandOutcome:
+    """Expand and execute one profile command without invoking a shell."""
+
+    argv, cwd, child_env = _expanded_command(spec, context)
+    return _run_expanded_command(
+        argv,
+        cwd,
+        child_env,
+        capture=capture,
+        timeout=timeout,
+    )
 
 
 def execute_state(
     profile: CockpitProfile, context: CockpitContext, args: Sequence[str]
 ) -> int:
-    spec = CommandSpec(
-        argv=tuple(profile.state_command.argv) + tuple(str(argument) for argument in args),
-        cwd=profile.state_command.cwd,
-        env=profile.state_command.env,
+    argv, cwd, child_env = _expanded_command(profile.state_command, context)
+    outcome = _run_expanded_command(
+        argv + tuple(str(argument) for argument in args),
+        cwd,
+        child_env,
+        capture=False,
     )
-    return execute_command(spec, context).returncode
+    if outcome.stdout:
+        print(outcome.stdout, end="" if outcome.stdout.endswith("\n") else "\n")
+    if outcome.stderr:
+        print(outcome.stderr, file=sys.stderr, end="" if outcome.stderr.endswith("\n") else "\n")
+    return outcome.returncode
 
 
 def _emit_outcome(label: str, outcome: CommandOutcome, env: Mapping[str, str]) -> None:
@@ -188,9 +264,16 @@ def run_preflight(
 
 
 def _docker_probe(
-    label: str, spec: CommandSpec, context: CockpitContext
+    label: str,
+    spec: CommandSpec,
+    context: CockpitContext,
+    *,
+    timeout: Optional[float] = None,
 ) -> CommandOutcome:
-    outcome = execute_command(spec, context, capture=True)
+    if timeout is None:
+        outcome = execute_command(spec, context, capture=True)
+    else:
+        outcome = execute_command(spec, context, capture=True, timeout=timeout)
     try:
         _argv, _cwd, diagnostic_env = _expanded_command(spec, context)
     except ValueError:
@@ -202,19 +285,43 @@ def _docker_probe(
 def _setup_engine(
     profile: CockpitProfile, context: CockpitContext
 ) -> CommandOutcome:
-    engine = _docker_probe("engine", profile.docker.engine_probe, context)
+    deadline = time.monotonic() + float(profile.docker.startup_timeout_seconds)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return CommandOutcome(
+            tuple(profile.docker.engine_probe.argv),
+            124,
+            "",
+            "engine readiness deadline expired before probe\n",
+        )
+    engine = _docker_probe(
+        "engine",
+        profile.docker.engine_probe,
+        context,
+        timeout=remaining,
+    )
     if engine.returncode == 0:
         return engine
-    if not start_engine_provider(context.env):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return engine
+    if not start_engine_provider(context.env, timeout=remaining):
         return engine
 
-    deadline = time.monotonic() + float(profile.docker.startup_timeout_seconds)
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return engine
         time.sleep(min(0.1, remaining))
-        engine = _docker_probe("engine", profile.docker.engine_probe, context)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return engine
+        engine = _docker_probe(
+            "engine",
+            profile.docker.engine_probe,
+            context,
+            timeout=remaining,
+        )
         if engine.returncode == 0:
             return engine
 
@@ -223,10 +330,15 @@ def run_docker(profile: CockpitProfile, context: CockpitContext, action: str) ->
     if action not in {"status", "setup"}:
         raise ValueError(f"unsupported Docker action: {action}")
 
-    cli = _docker_probe("cli", profile.docker.cli_check, context)
-    compose = _docker_probe("compose", profile.docker.compose_check, context)
+    probe_timeout = float(profile.docker.startup_timeout_seconds)
+    cli = _docker_probe("cli", profile.docker.cli_check, context, timeout=probe_timeout)
+    compose = _docker_probe(
+        "compose", profile.docker.compose_check, context, timeout=probe_timeout
+    )
     if action == "status":
-        engine = _docker_probe("engine", profile.docker.engine_probe, context)
+        engine = _docker_probe(
+            "engine", profile.docker.engine_probe, context, timeout=probe_timeout
+        )
         for outcome in (cli, compose, engine):
             if outcome.returncode != 0:
                 return outcome.returncode or 1
@@ -241,5 +353,7 @@ def run_docker(profile: CockpitProfile, context: CockpitContext, action: str) ->
         return engine.returncode or 1
     if profile.docker.image_probe is None:
         return 0
-    image = _docker_probe("image", profile.docker.image_probe, context)
+    image = _docker_probe(
+        "image", profile.docker.image_probe, context, timeout=probe_timeout
+    )
     return image.returncode or (0 if image.returncode == 0 else 1)

@@ -404,9 +404,11 @@ def _command(
         unknown = sorted(set(tokens) - allowed)
         if unknown:
             raise ValueError(f"unknown command template token: {unknown[0]}")
+        if "python" in tokens and argument != "{python}":
+            raise ValueError(f"{label}.argv[{index}] {{python}} must be the complete argument")
         if any(token in ALLOWED_PATH_TOKENS for token in tokens):
             _path_template(argument, f"{label}.argv[{index}]", roots)
-        argv.append(argument.replace("{python}", sys.executable))
+        argv.append(sys.executable if argument == "{python}" else argument)
 
     cwd = _path_template(_required(command, "cwd", label), f"{label}.cwd", roots)
     environment = _command_environment(command.get("env", {}), label, allowed_environment)

@@ -123,6 +123,16 @@ def test_allows_blank_later_argv() -> None:
     assert profile.state_command.argv[1] == ""
 
 
+def test_rejects_embedded_python_template() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["state"]["command"]["argv"] = ["prefix-{python}"]
+
+    assert_value_error(
+        "{python} must be the complete argument",
+        lambda: load_mutated_profile(mutate),
+    )
+
+
 def test_rejects_path_escape() -> None:
     def mutate(payload: dict[str, object]) -> None:
         payload["state"]["command"]["cwd"] = "{cockpit}/../../outside"
@@ -264,6 +274,7 @@ def main() -> None:
     test_rejects_blank_first_argv()
     test_rejects_whitespace_first_argv()
     test_allows_blank_later_argv()
+    test_rejects_embedded_python_template()
     test_rejects_path_escape()
     test_rejects_duplicate_service_ids()
     test_rejects_unknown_dependency_id()

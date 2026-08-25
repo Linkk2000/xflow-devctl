@@ -71,22 +71,30 @@ def _provider_command(
 
 
 def _discover_provider(env: Mapping[str, str]) -> Optional[Tuple[str, Tuple[str, ...]]]:
-    requested = str(
+    raw_requested = str(
         env.get("XFLOW_ENGINE_PROVIDER")
         or env.get("XFLOW_DOCKER_PROVIDER")
         or env.get("DOCKER_PROVIDER")
         or ""
-    ).strip().lower()
-    if requested and requested not in {"auto", "detect"}:
+    ).strip()
+    explicit_command = str(env.get("XFLOW_ENGINE_PROVIDER_COMMAND", "")).strip()
+    if not raw_requested and not explicit_command:
+        return None
+    requested = raw_requested.lower()
+    if requested in {"auto", "detect"}:
+        for provider in _DISCOVERY_ORDER:
+            command = _provider_command(provider, env)
+            if command is not None:
+                return command
+        return None
+    if requested or explicit_command:
         return _provider_command(requested, env)
-    for provider in _DISCOVERY_ORDER:
-        command = _provider_command(provider, env)
-        if command is not None:
-            return command
     return None
 
 
-def start_engine_provider(env: Mapping[str, str]) -> bool:
+def start_engine_provider(
+    env: Mapping[str, str], *, timeout: Optional[float] = None
+) -> bool:
     """Start a detected engine provider, returning whether it accepted start.
 
     Provider startup is intentionally best-effort and has no effect when no
@@ -100,16 +108,20 @@ def start_engine_provider(env: Mapping[str, str]) -> bool:
     executable, args = command
     argv = [executable, *args]
     try:
-        completed = subprocess.run(
-            argv,
-            env=dict(env),
-            text=True,
-            encoding="utf-8",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            check=False,
-        )
+        run_kwargs = {
+            "env": dict(env),
+            "text": True,
+            "encoding": "utf-8",
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "shell": False,
+            "check": False,
+        }
+        if timeout is not None:
+            run_kwargs["timeout"] = max(0.0, float(timeout))
+        completed = subprocess.run(argv, **run_kwargs)
+    except subprocess.TimeoutExpired:
+        return False
     except OSError:
         return False
     return completed.returncode == 0

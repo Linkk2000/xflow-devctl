@@ -4,6 +4,7 @@ import contextlib
 import io
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -23,7 +24,9 @@ from xflow.cockpit import (  # noqa: E402
     DockerSpec,
 )
 from xflow.commands import (  # noqa: E402
+    CommandOutcome,
     execute_command,
+    execute_state,
     run_docker,
     run_preflight,
 )
@@ -55,13 +58,14 @@ def command(argv: Sequence[str], *, cwd: str = "{repo}", env: Optional[Mapping[s
 
 def profile_for(
     *,
+    state: Optional[CommandSpec] = None,
     checks: Sequence[CheckSpec] = (),
     docker: Optional[DockerSpec] = None,
 ) -> CockpitProfile:
     empty = command((sys.executable, "-c", "pass"))
     return CockpitProfile(
         version=1,
-        state_command=empty,
+        state_command=state or empty,
         checks=tuple(checks),
         docker=docker or DockerSpec(empty, empty, empty, None, 1),
         dependencies={},
@@ -69,6 +73,158 @@ def profile_for(
         scenarios={},
         playgrounds={},
     )
+
+
+def test_execute_state_expands_profile_only_and_preserves_runtime_args() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        helper = write_executable(
+            root / "state.py",
+            "import sys\n"
+            "print(repr(sys.argv[1:]))\n"
+            "sys.exit(7)\n",
+        )
+        runner = "\n".join(
+            (
+                "import os, sys",
+                "from pathlib import Path",
+                f"sys.path.insert(0, {str(OPS_ROOT)!r})",
+                "from xflow.cockpit import CockpitContext",
+                "from xflow.commands import execute_state",
+                f"from xflow.cockpit import CockpitProfile, CommandSpec, DockerSpec",
+                f"root = Path({str(root)!r})",
+                f"state = CommandSpec(({sys.executable!r}, {str(helper)!r}), '{{repo}}', {{}})",
+                "empty = state",
+                "profile = CockpitProfile(1, state, (), DockerSpec(empty, empty, empty, None, 1), {}, {}, {}, {})",
+                "context = CockpitContext(root, root.parent, root, Path(sys.executable), root / 'run', dict(os.environ))",
+                "raise SystemExit(execute_state(profile, context, ('literal {repo}', '{repo}')))",
+            )
+        )
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str(OPS_ROOT)
+        result = subprocess.run(
+            [sys.executable, "-c", runner],
+            cwd=str(root),
+            env=environment,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        assert result.returncode == 7
+        assert "['literal {repo}', '{repo}']" in result.stdout
+        assert result.stderr == ""
+
+
+def test_execute_state_prints_local_spawn_diagnostic_and_preserves_code() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        missing = root / "missing state executable"
+        diagnostics = io.StringIO()
+        with contextlib.redirect_stderr(diagnostics):
+            outcome = execute_state(
+                profile_for(state=command((str(missing),), env={"API_TOKEN": "secret-value"})),
+                make_context(root, {"API_TOKEN": "secret-value"}),
+                (),
+            )
+
+        assert outcome == 127
+        assert "executable not found" in diagnostics.getvalue().lower()
+        assert "secret-value" not in diagnostics.getvalue()
+
+
+def test_execute_command_distinguishes_missing_cwd_from_missing_executable() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        missing_cwd = root / "missing cwd"
+        outcome = execute_command(
+            command((str(root / "missing executable"),), cwd=str(missing_cwd)),
+            make_context(root),
+            capture=True,
+        )
+
+        assert outcome.returncode == 126
+        assert "working directory" in outcome.stderr.lower()
+        assert "executable not found" not in outcome.stderr.lower()
+
+
+def test_execute_command_converts_timeout_to_deterministic_outcome() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        helper = write_executable(
+            root / "slow.py",
+            "import sys, time\n"
+            "print('partial', flush=True)\n"
+            "time.sleep(10)\n",
+        )
+
+        outcome = execute_command(
+            command((sys.executable, str(helper))),
+            make_context(root),
+            capture=True,
+            timeout=0.05,
+        )
+
+        assert outcome.returncode == 124
+        assert outcome.stdout == "partial\n"
+        assert "timed out" in outcome.stderr.lower()
+
+
+def test_run_docker_passes_remaining_timeout_to_engine_probe_and_provider() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        calls = []
+        cli = command(("cli",), cwd="{repo}")
+        compose = command(("compose",), cwd="{repo}")
+        engine = command(("engine",), cwd="{repo}")
+        docker = DockerSpec(cli, compose, engine, None, 0.5)
+        profile = profile_for(docker=docker)
+        context = make_context(root)
+
+        def fake_execute(
+            spec: CommandSpec,
+            _context: CockpitContext,
+            *,
+            capture: bool = False,
+            timeout: Optional[float] = None,
+        ) -> CommandOutcome:
+            calls.append((spec.argv[0], capture, timeout))
+            return CommandOutcome(tuple(spec.argv), 1 if spec is engine else 0, "", "")
+
+        provider_timeouts = []
+
+        def fake_provider(_env: Mapping[str, str], *, timeout: Optional[float] = None) -> bool:
+            provider_timeouts.append(timeout)
+            return False
+
+        with mock.patch("xflow.commands.execute_command", fake_execute):
+            with mock.patch("xflow.commands.start_engine_provider", fake_provider):
+                result = run_docker(profile, context, "setup")
+
+        assert result == 1
+        assert calls[0][2] is not None
+        assert calls[1][2] is not None
+        assert calls[2][2] is not None
+        assert provider_timeouts and provider_timeouts[0] is not None
+
+
+def test_start_engine_provider_skips_implicit_discovery_and_handles_timeout() -> None:
+    with mock.patch.object(capabilities, "which", side_effect=AssertionError("which called")) as which:
+        with mock.patch.object(capabilities.subprocess, "run", side_effect=AssertionError("run called")) as run:
+            assert capabilities.start_engine_provider({}) is False
+            assert capabilities.start_engine_provider({"XFLOW_ENGINE_PROVIDER": ""}) is False
+            assert not which.called
+            assert not run.called
+
+    timeout = subprocess.TimeoutExpired(["/fake/provider"], 0.1, output=b"partial", stderr=b"secret")
+    with mock.patch.object(capabilities.subprocess, "run", side_effect=timeout):
+        assert (
+            capabilities.start_engine_provider(
+                {"XFLOW_ENGINE_PROVIDER_COMMAND": "/fake/provider"}, timeout=0.1
+            )
+            is False
+        )
 
 
 def test_execute_command_preserves_arguments_cwd_and_allowed_environment() -> None:
@@ -124,14 +280,16 @@ def test_run_preflight_aggregates_failures_and_warn_only_changes_exit_code() -> 
             "import sys\n"
             "mode = sys.argv[1]\n"
             "if mode == 'regex': print('unexpected')\n"
+            "elif mode == 'mismatch': print('wrong but successful')\n"
             "elif mode == 'stderr': print('stderr failure', file=sys.stderr)\n"
             "else: print('ok')\n"
-            "sys.exit(0 if mode == 'ok' else 3)\n",
+            "sys.exit(0 if mode in ('ok', 'mismatch') else 3)\n",
         )
         checks = (
             CheckSpec("ok", command((str(helper), "ok")), None),
             CheckSpec("stderr", command((str(helper), "stderr")), None),
             CheckSpec("regex", command((str(helper), "regex")), "required-marker"),
+            CheckSpec("mismatch", command((str(helper), "mismatch")), "required-marker"),
         )
         profile = profile_for(checks=checks)
         context = make_context(root)
@@ -144,12 +302,14 @@ def test_run_preflight_aggregates_failures_and_warn_only_changes_exit_code() -> 
         assert "ok" in text
         assert "stderr" in text
         assert "regex" in text
+        assert "mismatch" in text
 
         output = io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
             result = run_preflight(profile, context, warn_only=True)
         assert result == 0
         assert "WARN" in output.getvalue()
+        assert "mismatch" in output.getvalue()
 
 
 def test_run_docker_status_probes_cli_compose_and_engine_in_order() -> None:
@@ -206,7 +366,9 @@ def test_run_docker_setup_starts_provider_then_polls_before_image_probe() -> Non
         )
         provider_calls = []
 
-        def start_provider(_env: Mapping[str, str]) -> bool:
+        def start_provider(
+            _env: Mapping[str, str], *, timeout: Optional[float] = None
+        ) -> bool:
             provider_calls.append("provider")
             with log.open("a", encoding="utf-8") as stream:
                 stream.write("provider\n")
@@ -247,7 +409,10 @@ def test_run_docker_setup_stops_before_optional_image_when_engine_not_ready() ->
             command((str(helper), "image"), env=env),
             1,
         )
-        with mock.patch("xflow.commands.start_engine_provider", lambda _env: False):
+        with mock.patch(
+            "xflow.commands.start_engine_provider",
+            lambda _env, *, timeout=None: False,
+        ):
             result = run_docker(profile_for(docker=docker), context, "setup")
 
         assert result != 0
@@ -273,11 +438,17 @@ def main() -> None:
     tests: Sequence[Callable[[], None]] = (
         test_execute_command_preserves_arguments_cwd_and_allowed_environment,
         test_execute_command_reports_missing_executable_without_shell,
+        test_execute_state_expands_profile_only_and_preserves_runtime_args,
+        test_execute_state_prints_local_spawn_diagnostic_and_preserves_code,
+        test_execute_command_distinguishes_missing_cwd_from_missing_executable,
+        test_execute_command_converts_timeout_to_deterministic_outcome,
         test_run_preflight_aggregates_failures_and_warn_only_changes_exit_code,
         test_run_docker_status_probes_cli_compose_and_engine_in_order,
         test_run_docker_setup_starts_provider_then_polls_before_image_probe,
         test_run_docker_setup_stops_before_optional_image_when_engine_not_ready,
+        test_run_docker_passes_remaining_timeout_to_engine_probe_and_provider,
         test_start_engine_provider_uses_injected_command_discovery,
+        test_start_engine_provider_skips_implicit_discovery_and_handles_timeout,
     )
     for test in tests:
         test()
