@@ -155,14 +155,19 @@ def _run_expanded_command(
     try:
         completed = subprocess.run(list(argv), **run_kwargs)
     except subprocess.TimeoutExpired as exc:
-        stdout = _redact(_as_text(getattr(exc, "stdout", None) or getattr(exc, "output", None)), child_env)
-        stderr = _redact(_as_text(getattr(exc, "stderr", None)), child_env)
+        stdout = _as_text(getattr(exc, "stdout", None) or getattr(exc, "output", None))
+        stderr = _as_text(getattr(exc, "stderr", None))
         timeout_label = "unknown" if timeout is None else f"{float(timeout):g}s"
         diagnostic = (
             f"command timed out after {timeout_label}: {_display_argv(argv)} "
             f"(cwd={cwd})"
         )
-        return CommandOutcome(argv, 124, stdout, _append_diagnostic(stderr, diagnostic))
+        return CommandOutcome(
+            argv,
+            124,
+            _redact(stdout, child_env),
+            _redact(_append_diagnostic(stderr, diagnostic), child_env),
+        )
     except FileNotFoundError as exc:
         diagnostic = (
             f"executable not found for command {_display_argv(argv)} "

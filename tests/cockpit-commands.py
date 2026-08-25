@@ -171,6 +171,32 @@ def test_execute_command_converts_timeout_to_deterministic_outcome() -> None:
         assert "timed out" in outcome.stderr.lower()
 
 
+def test_execute_command_redacts_timeout_partial_output_and_diagnostic() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        token = "synthetic-api-token"
+        helper = write_executable(
+            root / "slow-secret.py",
+            "import sys, time\n"
+            "print(sys.argv[1], flush=True)\n"
+            "time.sleep(10)\n",
+        )
+
+        outcome = execute_command(
+            command((sys.executable, str(helper), "{API_TOKEN}")),
+            make_context(root, {"API_TOKEN": token}),
+            capture=True,
+            timeout=0.05,
+        )
+
+        assert outcome.returncode == 124
+        assert token not in outcome.stdout
+        assert token not in outcome.stderr
+        assert "<redacted>" in outcome.stdout
+        assert "<redacted>" in outcome.stderr
+        assert "timed out" in outcome.stderr.lower()
+
+
 def test_run_docker_passes_remaining_timeout_to_engine_probe_and_provider() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw).resolve()
@@ -442,6 +468,7 @@ def main() -> None:
         test_execute_state_prints_local_spawn_diagnostic_and_preserves_code,
         test_execute_command_distinguishes_missing_cwd_from_missing_executable,
         test_execute_command_converts_timeout_to_deterministic_outcome,
+        test_execute_command_redacts_timeout_partial_output_and_diagnostic,
         test_run_preflight_aggregates_failures_and_warn_only_changes_exit_code,
         test_run_docker_status_probes_cli_compose_and_engine_in_order,
         test_run_docker_setup_starts_provider_then_polls_before_image_probe,
