@@ -103,6 +103,19 @@ class _WindowsJob:
         return ok
 
 
+_WINDOWS_TRAMPOLINE_CODE = (
+    "import subprocess,sys\n"
+    "if len(sys.argv) < 3 or sys.argv[1] != '--': raise SystemExit(125)\n"
+    "if sys.stdin.read(1) != '1': raise SystemExit(125)\n"
+    "try:\n"
+    "    child = subprocess.Popen(sys.argv[2:], shell=False)\n"
+    "    code = child.wait()\n"
+    "except Exception:\n"
+    "    raise SystemExit(126)\n"
+    "raise SystemExit(int(code))\n"
+)
+
+
 class _HealthDeadlineExceeded(Exception):
     pass
 
@@ -406,6 +419,55 @@ class ServiceSupervisor:
             windows_tree_known,
         )
 
+    def _windows_trampoline_code(self) -> str:
+        return _WINDOWS_TRAMPOLINE_CODE
+
+    def _windows_trampoline_argv(self, argv: Sequence[str]) -> List[str]:
+        return [
+            str(self.context.python_executable),
+            "-c",
+            self._windows_trampoline_code(),
+            "--",
+        ] + [str(argument) for argument in argv]
+
+    def _release_windows_trampoline(self, process: object) -> None:
+        stdin = getattr(process, "stdin", None)
+        if stdin is None:
+            raise ValueError("Windows service trampoline has no release channel")
+        try:
+            stdin.write("1")
+            stdin.flush()
+        finally:
+            try:
+                stdin.close()
+            except Exception:
+                pass
+
+    def _abort_windows_trampoline(self, process: object) -> None:
+        stdin = getattr(process, "stdin", None)
+        if stdin is not None:
+            try:
+                stdin.close()
+            except Exception:
+                pass
+        try:
+            process.terminate()
+        except (OSError, AttributeError):
+            pass
+        try:
+            process.wait(timeout=1.0)
+        except (subprocess.TimeoutExpired, OSError, AttributeError):
+            pass
+        if getattr(process, "poll", lambda: None)() is None:
+            try:
+                process.kill()
+            except (OSError, AttributeError):
+                pass
+            try:
+                process.wait(timeout=1.0)
+            except (subprocess.TimeoutExpired, OSError, AttributeError):
+                pass
+
     def _spawn(
         self,
         service_id: str,
@@ -425,8 +487,13 @@ class ServiceSupervisor:
         stream = None
         process = None
         record: Optional[_ProcessRecord] = None
+        windows_trampoline = os.name == "nt"
+        released = False
         try:
             stream = log_path.open("a", encoding="utf-8")
+            launch_argv = (
+                self._windows_trampoline_argv(argv) if windows_trampoline else list(argv)
+            )
             kwargs = {
                 "cwd": str(cwd_path),
                 "env": dict(child_env),
@@ -436,10 +503,19 @@ class ServiceSupervisor:
                 "text": True,
                 "encoding": "utf-8",
             }
+            if windows_trampoline:
+                kwargs["stdin"] = subprocess.PIPE
             kwargs.update(self._session_kwargs())
-            process = subprocess.Popen(list(argv), **kwargs)
+            process = subprocess.Popen(launch_argv, **kwargs)
             handle = ServiceHandle(service_id, process, log_path)
             record = self._process_record(handle, attach_job=True)
+            if windows_trampoline:
+                if record.windows_job is None or not record.windows_tree_known:
+                    raise ValueError(
+                        f"Windows Job Object ownership unavailable for service {service_id}"
+                    )
+                self._release_windows_trampoline(process)
+                released = True
             self._write_pid_atomically(service_id, process.pid)
             self._process_records[service_id] = record
             self._log_streams[service_id] = stream
@@ -447,7 +523,13 @@ class ServiceSupervisor:
         except FileNotFoundError as exc:
             try:
                 if process is not None:
-                    self._terminate(record or ServiceHandle(service_id, process, log_path))
+                    if windows_trampoline and not released:
+                        if record is not None and record.windows_tree_known:
+                            self._terminate(record)
+                        else:
+                            self._abort_windows_trampoline(process)
+                    else:
+                        self._terminate(record or ServiceHandle(service_id, process, log_path))
             finally:
                 if stream is not None:
                     stream.close()
@@ -455,7 +537,13 @@ class ServiceSupervisor:
         except PermissionError as exc:
             try:
                 if process is not None:
-                    self._terminate(record or ServiceHandle(service_id, process, log_path))
+                    if windows_trampoline and not released:
+                        if record is not None and record.windows_tree_known:
+                            self._terminate(record)
+                        else:
+                            self._abort_windows_trampoline(process)
+                    else:
+                        self._terminate(record or ServiceHandle(service_id, process, log_path))
             finally:
                 if stream is not None:
                     stream.close()
@@ -464,7 +552,15 @@ class ServiceSupervisor:
             try:
                 if process is not None:
                     tracked = self._process_records.get(service_id)
-                    self._terminate(tracked or record or ServiceHandle(service_id, process, log_path))
+                    if windows_trampoline and not released:
+                        if record is not None and record.windows_tree_known:
+                            self._terminate(record)
+                        else:
+                            self._abort_windows_trampoline(process)
+                    else:
+                        self._terminate(
+                            tracked or record or ServiceHandle(service_id, process, log_path)
+                        )
             finally:
                 if stream is not None:
                     stream.close()

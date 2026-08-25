@@ -701,6 +701,188 @@ def test_windows_spawn_record_attaches_injectable_job() -> None:
         assert degraded.windows_tree_known is False
 
 
+def test_windows_trampoline_waits_before_business_execution() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        supervisor = ServiceSupervisor(profile, _context(root))
+        marker = root / "business.marker"
+        business_code = (
+            "from pathlib import Path; "
+            f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')"
+        )
+        command = [sys.executable, "-c", business_code]
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                supervisor._windows_trampoline_code(),
+                "--",
+            ]
+            + command,
+            cwd=str(root),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=False,
+        )
+        try:
+            time.sleep(0.05)
+            assert not marker.exists()
+            assert process.stdin is not None
+            process.stdin.write("1")
+            process.stdin.flush()
+            process.stdin.close()
+            assert process.wait(timeout=5) == 0
+            assert marker.read_text(encoding="utf-8") == "executed"
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
+
+def test_windows_spawn_assigns_before_release_and_business_state() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+        supervisor = ServiceSupervisor(profile, context)
+        events = []
+        state = {"business_executed": False}
+
+        class Pipe:
+            def write(self, value: str) -> int:
+                assert value == "1"
+                events.append("release_written")
+                return 1
+
+            def flush(self) -> None:
+                events.append("release_flushed")
+                state["business_executed"] = True
+
+            def close(self) -> None:
+                events.append("release_closed")
+
+        class Process:
+            pid = 4242
+            returncode = None
+
+            def __init__(self) -> None:
+                self.stdin = Pipe()
+
+            def poll(self) -> Optional[int]:
+                return self.returncode
+
+        process = Process()
+        command = profile.services["server"].command
+
+        def popen(argv: Sequence[str], **kwargs: object) -> Process:
+            events.append("trampoline_started")
+            assert "--" in argv
+            marker = argv.index("--")
+            assert list(argv[marker + 1 :]) == list(
+                (sys.executable, str(root / "fixture-process.py"), "service", "server")
+            )
+            assert kwargs["stdin"] == subprocess.PIPE
+            assert kwargs["shell"] is False
+            return process
+
+        def assign(_process: object) -> object:
+            assert events == ["trampoline_started"]
+            events.append("job_assigned")
+            return object()
+
+        with mock.patch("xflow.services.os.name", "nt"):
+            with mock.patch("xflow.services.Path", type(root)):
+                with mock.patch("xflow.services.subprocess.Popen", side_effect=popen):
+                    with mock.patch.object(supervisor, "_windows_create_job", side_effect=assign):
+                        with mock.patch.object(supervisor, "_write_pid_atomically") as write_pid:
+                            handle = supervisor._spawn("server", command, root / "server.log")
+                            assert handle.process is process
+                            assert write_pid.called
+        assert events == [
+            "trampoline_started",
+            "job_assigned",
+            "release_written",
+            "release_flushed",
+            "release_closed",
+        ]
+        assert state["business_executed"] is True
+        supervisor._log_streams["server"].close()
+
+
+def test_windows_spawn_assignment_failure_never_releases_business() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+        supervisor = ServiceSupervisor(profile, context)
+        state = {"business_executed": False}
+
+        class Pipe:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def write(self, _value: str) -> int:
+                state["business_executed"] = True
+                return 1
+
+            def flush(self) -> None:
+                state["business_executed"] = True
+
+            def close(self) -> None:
+                self.closed = True
+
+        class Process:
+            pid = 4242
+            returncode = None
+
+            def __init__(self) -> None:
+                self.stdin = Pipe()
+
+            def poll(self) -> Optional[int]:
+                return self.returncode
+
+            def wait(self, timeout: Optional[float] = None) -> int:
+                return int(self.returncode or 0)
+
+            def terminate(self) -> None:
+                self.returncode = 143
+
+            def kill(self) -> None:
+                self.returncode = 137
+
+        process = Process()
+
+        def popen(_argv: Sequence[str], **_kwargs: object) -> Process:
+            return process
+
+        with mock.patch("xflow.services.os.name", "nt"):
+            with mock.patch("xflow.services.Path", type(root)):
+                with mock.patch("xflow.services.subprocess.Popen", side_effect=popen):
+                    with mock.patch.object(supervisor, "_windows_create_job", return_value=None):
+                        with mock.patch.object(supervisor, "_write_pid_atomically") as write_pid:
+                            try:
+                                supervisor._spawn(
+                                    "server",
+                                    profile.services["server"].command,
+                                    root / "server.log",
+                                )
+                            except ValueError as exc:
+                                assert "ownership" in str(exc).lower()
+                            else:
+                                raise AssertionError("assignment failure must reject startup")
+        assert state["business_executed"] is False
+        assert process.stdin.closed is True
+        assert process.returncode is not None
+        assert not write_pid.called
+
+
 def test_windows_failed_tree_cleanup_retains_ownership_for_retry() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw).resolve()
@@ -889,6 +1071,9 @@ def main() -> None:
         test_windows_taskkill_nonzero_is_not_success,
         test_windows_fallback_without_job_never_claims_tree_clean,
         test_windows_spawn_record_attaches_injectable_job,
+        test_windows_trampoline_waits_before_business_execution,
+        test_windows_spawn_assigns_before_release_and_business_state,
+        test_windows_spawn_assignment_failure_never_releases_business,
         test_windows_failed_tree_cleanup_retains_ownership_for_retry,
         test_windows_final_live_leader_is_controlled_failure,
         test_windows_failed_handle_does_not_block_other_cleanup,
