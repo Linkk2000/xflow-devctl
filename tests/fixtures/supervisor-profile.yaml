@@ -1,0 +1,88 @@
+version: 1
+allowedEnvironment:
+  - EVENT_FILE
+  - DEP_ATTEMPTS_FILE
+  - FAIL_DEPENDENCY
+  - PLAYGROUND_BUILD_FILE
+state:
+  command:
+    argv: ["{python}", "-c", "print('state')"]
+    cwd: "{cockpit}"
+    env: {}
+preflight:
+  checks: []
+docker:
+  cliCheck:
+    argv: ["{python}", "-c", "pass"]
+    cwd: "{cockpit}"
+    env: {}
+  composeCheck:
+    argv: ["{python}", "-c", "pass"]
+    cwd: "{cockpit}"
+    env: {}
+  engineProbe:
+    argv: ["{python}", "-c", "pass"]
+    cwd: "{cockpit}"
+    env: {}
+  imageProbe: null
+  startupTimeoutSeconds: 2
+dependencies:
+  - id: database
+    cwd: "{cockpit}"
+    service: database
+    up:
+      argv: ["{python}", "{cockpit}/fixture-process.py", "dependency-up"]
+      cwd: "{cockpit}"
+      env:
+        EVENT_FILE: "{EVENT_FILE}"
+        FAIL_DEPENDENCY: "{FAIL_DEPENDENCY}"
+    ready:
+      argv: ["{python}", "{cockpit}/fixture-process.py", "dependency-ready"]
+      cwd: "{cockpit}"
+      env:
+        EVENT_FILE: "{EVENT_FILE}"
+        DEP_ATTEMPTS_FILE: "{DEP_ATTEMPTS_FILE}"
+        FAIL_DEPENDENCY: "{FAIL_DEPENDENCY}"
+    timeoutSeconds: 2
+services:
+  - id: server
+    command:
+      argv: ["{python}", "{cockpit}/fixture-process.py", "service", "server"]
+      cwd: "{cockpit}"
+      env:
+        EVENT_FILE: "{EVENT_FILE}"
+    dependencies: [database]
+    healthUrls:
+      - "http://127.0.0.1:1/unavailable"
+      - "http://127.0.0.1:1/ready"
+    logFile: "{cockpit}/.xflow/run/server.log"
+  - id: web
+    command:
+      argv: ["{python}", "{cockpit}/fixture-process.py", "service", "web"]
+      cwd: "{cockpit}"
+      env:
+        EVENT_FILE: "{EVENT_FILE}"
+    dependencies: [database]
+    healthUrls:
+      - "http://127.0.0.1:1/unavailable"
+      - "http://127.0.0.1:1/ready"
+    logFile: "{cockpit}/.xflow/run/web.log"
+scenarios:
+  - id: run
+    services: [server, web]
+    openUrl: "http://127.0.0.1:1/ready"
+playgrounds:
+  - id: flowable
+    aliases: [f, bpmn]
+    command:
+      argv: ["{python}", "{cockpit}/fixture-process.py", "playground"]
+      cwd: "{cockpit}"
+      env:
+        EVENT_FILE: "{EVENT_FILE}"
+    build:
+      argv: ["{python}", "{cockpit}/fixture-process.py", "build"]
+      cwd: "{cockpit}"
+      env:
+        EVENT_FILE: "{EVENT_FILE}"
+        PLAYGROUND_BUILD_FILE: "{PLAYGROUND_BUILD_FILE}"
+    url: "http://127.0.0.1:1/playground"
