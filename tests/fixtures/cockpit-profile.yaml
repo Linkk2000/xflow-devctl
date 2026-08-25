@@ -1,0 +1,119 @@
+version: 1
+allowedEnvironment:
+  - PROFILE_MODE
+state:
+  command:
+    argv:
+      - "{python}"
+      - "{cockpit}/_ops/portable/state.py"
+      - "show"
+    cwd: "{cockpit}"
+    env:
+      PROFILE_MODE: "{PROFILE_MODE}"
+preflight:
+  checks:
+    - id: python
+      command:
+        argv:
+          - "{python}"
+          - "-c"
+          - "print('ok')"
+        cwd: "{cockpit}"
+        env: {}
+      expectRegex: "ok"
+docker:
+  cliCheck:
+    argv: ["docker", "--version"]
+    cwd: "{cockpit}"
+    env: {}
+  composeCheck:
+    argv: ["docker", "compose", "version"]
+    cwd: "{cockpit}"
+    env: {}
+  engineProbe:
+    argv: ["docker", "info"]
+    cwd: "{cockpit}"
+    env: {}
+  imageProbe:
+    argv: ["docker", "image", "inspect", "xflow-dev"]
+    cwd: "{cockpit}"
+    env: {}
+  startupTimeoutSeconds: 90
+dependencies:
+  - id: postgres
+    cwd: "{cockpit}/docker"
+    service: postgres
+    up:
+      argv: ["docker", "compose", "up", "-d", "postgres"]
+      cwd: "{cockpit}/docker"
+      env: {}
+    ready:
+      argv: ["docker", "compose", "ps", "--status", "running", "postgres"]
+      cwd: "{cockpit}/docker"
+      env: {}
+    timeoutSeconds: 120
+services:
+  - id: postgres
+    command:
+      argv: ["docker", "compose", "logs", "-f", "postgres"]
+      cwd: "{cockpit}/docker"
+      env: {}
+    dependencies: []
+    healthUrls: []
+    logFile: "{cockpit}/.xflow/run/postgres.log"
+  - id: server
+    command:
+      argv: ["{python}", "{repo}/scripts/server.py"]
+      cwd: "{repo}"
+      env: {}
+    dependencies: [postgres]
+    healthUrls: ["http://127.0.0.1:8080/actuator/health"]
+    logFile: "{cockpit}/.xflow/run/server.log"
+  - id: web
+    command:
+      argv: ["{python}", "{repo}/scripts/web.py"]
+      cwd: "{repo}"
+      env: {}
+    dependencies: [postgres]
+    healthUrls: ["http://127.0.0.1:5173/"]
+    logFile: "{cockpit}/.xflow/run/web.log"
+  - id: worker
+    command:
+      argv: ["{python}", "{repo}/scripts/worker.py"]
+      cwd: "{repo}"
+      env: {}
+    dependencies: [postgres]
+    healthUrls: []
+    logFile: "{cockpit}/.xflow/run/worker.log"
+scenarios:
+  - id: run
+    services: [server, web]
+    openUrl: "http://127.0.0.1:5173/"
+playgrounds:
+  - id: flowable
+    aliases: [f, bpmn]
+    command:
+      argv: ["{python}", "{cockpit}/playgrounds/flowable.py"]
+      cwd: "{cockpit}"
+      env: {}
+    build:
+      argv: ["{python}", "{cockpit}/playgrounds/build.py", "flowable"]
+      cwd: "{cockpit}"
+      env: {}
+    url: "http://127.0.0.1:8001/"
+  - id: warmflow
+    aliases: [w]
+    command:
+      argv: ["{python}", "{cockpit}/playgrounds/warmflow.py"]
+      cwd: "{cockpit}"
+      env: {}
+    build: null
+    url: "http://127.0.0.1:8002/"
+  - id: viewer
+    aliases: [v]
+    command:
+      argv: ["{python}", "{cockpit}/playgrounds/viewer.py"]
+      cwd: "{cockpit}"
+      env: {}
+    build: null
+    url: "http://127.0.0.1:8003/"
