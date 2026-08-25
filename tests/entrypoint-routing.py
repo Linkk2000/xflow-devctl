@@ -68,6 +68,31 @@ def run_devctl(repo_root: Path, *args: str, expect: int = 0) -> subprocess.Compl
     return result
 
 
+def run_posix_devctl(repo_root: Path, *args: str, expect: int = 0) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.pop("DEVCTL_SKIP_PROVIDER_LOAD", None)
+    env["DEVCTL_REPO_ROOT"] = str(repo_root)
+    env["GITHUB_API_BASE"] = "http://127.0.0.1:9"
+    env["GITHUB_TOKEN"] = "entrypoint-test-token"
+    env["XFLOW_PLATFORM"] = "github"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    result = subprocess.run(
+        [str(OPS_ROOT / "devctl"), *args],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != expect:
+        print(result.stdout)
+        print(result.stderr, file=sys.stderr)
+        raise AssertionError(f"expected POSIX entrypoint exit {expect}: {' '.join(args)}")
+    return result
+
+
 def assert_dependency_check_routing(root: Path) -> None:
     repo = root / "dependency-routing"
     dependency_file = repo / ".xflow" / "issues" / "issue-IK152D" / "dependencies.yaml"
@@ -142,6 +167,7 @@ def assert_no_legacy_run_command() -> None:
     assert "select_python()" in entrypoint
     assert '"${DEVCTL_PYTHON:-}" python3 python' in entrypoint
     assert 'exec "$PYTHON" -m xflow "$@"' in entrypoint
+    assert 'export DEVCTL_SKIP_PROVIDER_LOAD=1' in entrypoint
     assert "[[" not in entrypoint
     assert "BASH_SOURCE" not in entrypoint
     assert "source " not in entrypoint
@@ -159,6 +185,7 @@ def assert_generated_wrapper_contract() -> None:
     assert 'export DEVCTL_TOOL_ROOT="$TOOL_ROOT"' in entrypoint
     assert 'DEVCTL_OPS_ROOT="$TOOL_ROOT"' in entrypoint
     assert 'exec "$PYTHON" -m xflow "$@"' in entrypoint
+    assert 'export DEVCTL_SKIP_PROVIDER_LOAD=1' in entrypoint
     assert "[[" not in entrypoint
     assert "BASH_SOURCE" not in entrypoint
     assert "source " not in entrypoint
@@ -406,7 +433,7 @@ Closes #1
 
         git(repo, "config", "--local", "devctl.issue", "draft")
         write(current_task, current_task.read_text(encoding="utf-8").replace("Issue: 1", "Issue: draft"))
-        issue_result = run_devctl(repo, "issue", "create", "Python routing", "--body-file", str(issue_file))
+        issue_result = run_posix_devctl(repo, "issue", "create", "Python routing", "--body-file", str(issue_file))
         assert "issue-create gate passed; provider skipped" in issue_result.stdout
         git(repo, "config", "--local", "devctl.issue", "1")
         write(current_task, current_task.read_text(encoding="utf-8").replace("Issue: draft", "Issue: 1"))
@@ -416,7 +443,7 @@ Closes #1
         assert "pushed feature/1-python-entrypoint" in push_result.stdout
 
         approval(repo, "1", "git-mr", mr_file)
-        mr_result = run_devctl(repo, "git", "mr", "--body-file", str(mr_file), "--issue", "1", "--base", "main")
+        mr_result = run_posix_devctl(repo, "git", "mr", "--body-file", str(mr_file), "--issue", "1", "--base", "main")
         assert "git-mr gate passed; provider skipped" in mr_result.stdout
 
         check_result = run_devctl(repo, "check", "mr-draft", "--issue", "1")

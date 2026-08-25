@@ -1489,6 +1489,11 @@ PYTHON=$(select_python) || {
   printf '%s\\n' '[ERROR] devctl requires Python 3.9+; set DEVCTL_PYTHON.' >&2
   exit 1
 }
+case "${1:-help}" in
+  -h|--help|help|check|git|issue|preflight|approval|attachment|rules|migrate|unattended|task|contract|trace)
+    export DEVCTL_SKIP_PROVIDER_LOAD=1
+    ;;
+esac
 export DEVCTL_REPO_ROOT="$ROOT"
 export DEVCTL_TOOL_ROOT="$TOOL_ROOT" DEVCTL_OPS_ROOT="$TOOL_ROOT" PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$TOOL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
