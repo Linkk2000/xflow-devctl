@@ -33,8 +33,21 @@ from .collaboration import (
     repository_locked,
     repository_mutation,
 )
-from .env import RuntimeContext, load_env_files, python_version, token_status_lines
-from .io import write_text_lf
+from .cockpit import CockpitContext, CockpitProfile, load_cockpit_profile
+from .commands import (
+    execute_state,
+    run_docker as run_cockpit_docker,
+    run_preflight as run_cockpit_preflight,
+)
+from .env import (
+    RuntimeContext,
+    cockpit_root_from_env,
+    load_env_files,
+    profile_path_from_env,
+    python_version,
+    token_status_lines,
+)
+from .io import canonical_path, write_text_lf
 from .dependencies import check_dependencies
 from .migration import apply_issue_workspace_migration, inspect, inspect_issue_workspace_migration, write_wrappers
 from .paths import default_issue_file, normalized_issue, task_state_file
@@ -53,6 +66,25 @@ from .task_state import (
     parse_task_state,
     task_authority_issues,
 )
+from .services import run_playground, run_scenario
+
+
+SUPPORTED_COCKPIT_COMMANDS = (
+    "state",
+    "state show",
+    "dev preflight",
+    "dev docker setup",
+    "dev docker status",
+    "dev all",
+    "run",
+    "dev playground",
+    "pg",
+    "playground",
+)
+
+_ACTIVE_REPO_ROOT: Path | None = None
+_ACTIVE_COCKPIT_PROFILE: CockpitProfile | None = None
+_ACTIVE_COCKPIT_CONTEXT: CockpitContext | None = None
 
 
 ISSUE_CREATE_EPILOG = """AI call recipes:
@@ -124,8 +156,51 @@ def build_parser() -> argparse.ArgumentParser:
   devctl check commit-msg --file .xflow/local/commit-message.txt --issue IK152D
 """,
     )
+    parser.add_argument(
+        "--profile",
+        type=Path,
+        help="cockpit profile path for the platform runtime",
+    )
+    parser.add_argument(
+        "--cockpit-root",
+        type=Path,
+        help="cockpit root containing the profile and runtime files",
+    )
+    parser.add_argument(
+        "--repo",
+        help="declared sibling repository name in the cockpit workspace",
+    )
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("preflight")
+
+    state = sub.add_parser(
+        "state",
+        help="read state through the configured cockpit provider",
+    )
+    state.add_argument(
+        "state_args",
+        nargs=argparse.REMAINDER,
+        help="arguments passed to the configured state provider (for example: show --json)",
+    )
+
+    dev = sub.add_parser("dev", help="run platform runtime development commands")
+    dev_sub = dev.add_subparsers(dest="dev_command", required=True)
+    dev_preflight = dev_sub.add_parser("preflight", help="check declared runtime capabilities")
+    dev_preflight.add_argument("--warn-only", action="store_true")
+    docker = dev_sub.add_parser("docker", help="inspect or prepare the Docker capability")
+    docker_sub = docker.add_subparsers(dest="docker_command", required=True)
+    docker_sub.add_parser("setup")
+    docker_sub.add_parser("status")
+    dev_sub.add_parser("all", help="run the profile's default development scenario")
+    dev_playground = dev_sub.add_parser("playground", help="run a configured playground")
+    dev_playground.add_argument("target", nargs="?", default="flowable")
+    dev_playground.add_argument("--no-browser", dest="open_browser", action="store_false")
+
+    sub.add_parser("run", help="run the profile's default development scenario")
+    for alias in ("pg", "playground"):
+        alias_parser = sub.add_parser(alias, help="run a configured playground")
+        alias_parser.add_argument("target", nargs="?", default="flowable")
+        alias_parser.add_argument("--no-browser", dest="open_browser", action="store_false")
 
     check = sub.add_parser("check")
     check_sub = check.add_subparsers(dest="check_command")
@@ -390,7 +465,213 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def context() -> RuntimeContext:
-    return RuntimeContext.from_env(Path(__file__).resolve().parents[1], os.environ)
+    env = os.environ
+    if _ACTIVE_REPO_ROOT is not None:
+        env = dict(os.environ)
+        env["DEVCTL_REPO_ROOT"] = str(_ACTIVE_REPO_ROOT)
+    return RuntimeContext.from_env(Path(__file__).resolve().parents[1], env)
+
+
+def _cockpit_command_requested(args: argparse.Namespace) -> bool:
+    return str(getattr(args, "command", "")) in {
+        "state",
+        "dev",
+        "run",
+        "pg",
+        "playground",
+    }
+
+
+def _profile_candidates(args: argparse.Namespace) -> tuple[Path, ...]:
+    candidates: list[Path] = []
+    explicit = getattr(args, "profile", None)
+    if explicit is not None:
+        candidates.append(canonical_path(Path(explicit)))
+    configured = profile_path_from_env(os.environ)
+    if configured is not None:
+        candidates.append(configured)
+
+    root = getattr(args, "cockpit_root", None)
+    if root is None:
+        root = cockpit_root_from_env(os.environ)
+    if root is not None:
+        root_path = canonical_path(Path(root))
+        candidates.extend((root_path / ".xflow" / "cockpit.yaml", root_path / "cockpit.yaml"))
+
+    if _cockpit_command_requested(args):
+        current = canonical_path(Path.cwd())
+        candidates.extend((current / ".xflow" / "cockpit.yaml", current / "cockpit.yaml"))
+
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            unique.append(candidate)
+    return tuple(unique)
+
+
+def _load_runtime_profile(args: argparse.Namespace) -> tuple[Path, CockpitProfile]:
+    candidates = _profile_candidates(args)
+    if not candidates:
+        raise ValueError(
+            "cockpit profile is required for platform runtime commands; use --profile PATH "
+            "or --cockpit-root PATH"
+        )
+    explicit = getattr(args, "profile", None)
+    if explicit is not None:
+        profile_path = candidates[0]
+        if not profile_path.is_file():
+            raise ValueError(f"cockpit profile does not exist: {profile_path}")
+    else:
+        profile_path = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if profile_path is None:
+            searched = ", ".join(str(candidate) for candidate in candidates)
+            raise ValueError(f"cockpit profile not found; searched: {searched}")
+    return profile_path, load_cockpit_profile(profile_path)
+
+
+def _cockpit_root_for(args: argparse.Namespace, profile_path: Path) -> Path:
+    configured = getattr(args, "cockpit_root", None)
+    if configured is None:
+        configured_root = cockpit_root_from_env(os.environ)
+    else:
+        configured_root = Path(configured)
+    if configured_root is not None:
+        root = canonical_path(Path(configured_root))
+    elif profile_path.parent.name == ".xflow":
+        root = canonical_path(profile_path.parent.parent)
+    else:
+        root = canonical_path(profile_path.parent)
+    if profile_path != root and root not in profile_path.parents:
+        raise ValueError(f"cockpit profile must stay under cockpit root: {profile_path}")
+    return root
+
+
+def _profile_command_values(profile: CockpitProfile) -> tuple[str, ...]:
+    values: list[str] = []
+
+    def add(command: object) -> None:
+        if command is None:
+            return
+        values.extend(str(value) for value in getattr(command, "argv", ()))
+        cwd = getattr(command, "cwd", None)
+        if cwd is not None:
+            values.append(str(cwd))
+        values.extend(str(value) for value in getattr(command, "env", {}).values())
+
+    add(profile.state_command)
+    for check in profile.checks:
+        add(check.command)
+    for command in (
+        profile.docker.cli_check,
+        profile.docker.compose_check,
+        profile.docker.engine_probe,
+        profile.docker.image_probe,
+    ):
+        add(command)
+    for dependency in profile.dependencies.values():
+        add(dependency.up)
+        add(dependency.ready)
+        values.append(dependency.cwd)
+    for service in profile.services.values():
+        add(service.command)
+        values.append(service.log_file)
+    for playground in profile.playgrounds.values():
+        add(playground.command)
+        add(playground.build)
+    return tuple(values)
+
+
+def _declared_repo_names(profile: CockpitProfile) -> frozenset[str]:
+    """Infer literal sibling names from profile paths without adding product knowledge."""
+
+    names: set[str] = set()
+    marker = "{workspace}/"
+    for value in _profile_command_values(profile):
+        start = 0
+        while True:
+            index = value.find(marker, start)
+            if index < 0:
+                break
+            suffix = value[index + len(marker) :].split("/", 1)[0]
+            if suffix and "{" not in suffix and "}" not in suffix:
+                names.add(suffix)
+            start = index + len(marker)
+    return frozenset(names)
+
+
+def _resolve_repo_name(
+    name: str,
+    *,
+    workspace_root: Path,
+    cockpit_root: Path,
+    profile: CockpitProfile,
+) -> Path:
+    if not name or name in {".", ".."} or "/" in name or "\\" in name:
+        raise ValueError(f"repository must be a declared sibling name: {name}")
+    candidate = canonical_path(workspace_root / name)
+    if candidate.parent != canonical_path(workspace_root):
+        raise ValueError(f"repository must stay under workspace root: {name}")
+    if not candidate.is_dir():
+        raise ValueError(f"repository sibling does not exist: {name}")
+    declared = _declared_repo_names(profile)
+    if declared and name not in declared and candidate != canonical_path(cockpit_root):
+        raise ValueError(f"repository is not declared by cockpit profile: {name}")
+    return candidate
+
+
+def _runtime_for(args: argparse.Namespace) -> tuple[CockpitProfile, CockpitContext]:
+    profile_path, profile = _load_runtime_profile(args)
+    cockpit_root = _cockpit_root_for(args, profile_path)
+    workspace_root = canonical_path(cockpit_root.parent)
+    selected_name = getattr(args, "repo", None)
+    if selected_name:
+        repo_root = _resolve_repo_name(
+            str(selected_name),
+            workspace_root=workspace_root,
+            cockpit_root=cockpit_root,
+            profile=profile,
+        )
+    else:
+        repo_root = canonical_path(Path(os.environ.get("DEVCTL_REPO_ROOT", Path.cwd())))
+        allowed_roots = (cockpit_root, workspace_root)
+        if not any(repo_root == root or root in repo_root.parents for root in allowed_roots):
+            raise ValueError("repository root must be the cockpit root or a workspace child")
+    runtime_env = dict(os.environ)
+    runtime_env["DEVCTL_REPO_ROOT"] = str(repo_root)
+    context_value = CockpitContext(
+        cockpit_root=cockpit_root,
+        workspace_root=workspace_root,
+        repo_root=repo_root,
+        python_executable=canonical_path(Path(sys.executable)),
+        run_dir=canonical_path(cockpit_root / ".xflow" / "run"),
+        env=runtime_env,
+    )
+    return profile, context_value
+
+
+def _prepare_runtime(args: argparse.Namespace) -> tuple[CockpitProfile | None, CockpitContext | None]:
+    needs_runtime = (
+        _cockpit_command_requested(args)
+        or getattr(args, "profile", None) is not None
+        or getattr(args, "cockpit_root", None) is not None
+        or getattr(args, "repo", None) is not None
+    )
+    if not needs_runtime:
+        return None, None
+    return _runtime_for(args)
+
+
+def _state_provider_args(profile: CockpitProfile, args: argparse.Namespace) -> tuple[str, ...]:
+    requested = tuple(str(value) for value in getattr(args, "state_args", ()))
+    if requested:
+        if profile.state_command.argv and profile.state_command.argv[-1] == "show" and requested[0] == "show":
+            return requested[1:]
+        return requested
+    if profile.state_command.argv and profile.state_command.argv[-1] == "show":
+        return ()
+    return ("show",)
 
 
 def resolve_check_file(repo_root: Path, issue: str | None, file: Path | None, filename: str) -> Path:
@@ -1986,9 +2267,38 @@ def _command_scope(args: argparse.Namespace) -> tuple[str, ...]:
     return (command, str(subcommand)) if subcommand else (command,)
 
 
+def _cockpit_runtime() -> tuple[CockpitProfile, CockpitContext]:
+    if _ACTIVE_COCKPIT_PROFILE is None or _ACTIVE_COCKPIT_CONTEXT is None:
+        raise ValueError("cockpit runtime was not initialized")
+    return _ACTIVE_COCKPIT_PROFILE, _ACTIVE_COCKPIT_CONTEXT
+
+
+def _run_cockpit(args: argparse.Namespace) -> int:
+    profile, cockpit_context = _cockpit_runtime()
+    if args.command == "state":
+        return execute_state(profile, cockpit_context, _state_provider_args(profile, args))
+    if args.command == "dev":
+        if args.dev_command == "preflight":
+            return run_cockpit_preflight(profile, cockpit_context, args.warn_only)
+        if args.dev_command == "docker":
+            return run_cockpit_docker(profile, cockpit_context, args.docker_command)
+        if args.dev_command == "all":
+            return run_scenario(profile, cockpit_context, "run")
+        if args.dev_command == "playground":
+            return run_playground(profile, cockpit_context, args.target, args.open_browser)
+    if args.command == "run":
+        return run_scenario(profile, cockpit_context, "run")
+    if args.command in {"pg", "playground"}:
+        return run_playground(profile, cockpit_context, args.target, args.open_browser)
+    supported = ", ".join(SUPPORTED_COCKPIT_COMMANDS)
+    raise ValueError(f"unsupported cockpit command: {args.command}; supported: {supported}")
+
+
 def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if args.command == "preflight":
         return run_preflight()
+    if args.command in {"state", "dev", "run", "pg", "playground"}:
+        return _run_cockpit(args)
     if args.command == "check":
         return run_check(args)
     if args.command == "task":
@@ -2020,10 +2330,19 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _ACTIVE_REPO_ROOT, _ACTIVE_COCKPIT_PROFILE, _ACTIVE_COCKPIT_CONTEXT
+    _ACTIVE_REPO_ROOT = None
+    _ACTIVE_COCKPIT_PROFILE = None
+    _ACTIVE_COCKPIT_CONTEXT = None
     load_env_files(os.environ)
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        profile, cockpit_context = _prepare_runtime(args)
+        _ACTIVE_COCKPIT_PROFILE = profile
+        _ACTIVE_COCKPIT_CONTEXT = cockpit_context
+        if cockpit_context is not None:
+            _ACTIVE_REPO_ROOT = cockpit_context.repo_root
         if inherited_lease_present():
             with inherited_lease_command(context().repo_root, _command_scope(args)):
                 return _dispatch(args, parser)
@@ -2031,3 +2350,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         return 1
+    finally:
+        _ACTIVE_REPO_ROOT = None
+        _ACTIVE_COCKPIT_PROFILE = None
+        _ACTIVE_COCKPIT_CONTEXT = None

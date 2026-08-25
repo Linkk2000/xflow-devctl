@@ -4,7 +4,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, MutableMapping
+from typing import Mapping, MutableMapping, Optional
 
 from .io import canonical_path
 
@@ -63,6 +63,31 @@ def home_from_env(env: Mapping[str, str]) -> Path:
 
 def repo_root_from_env(env: Mapping[str, str]) -> Path:
     return canonical_path(Path(env.get("DEVCTL_REPO_ROOT", Path.cwd())))
+
+
+def cockpit_root_from_env(env: Mapping[str, str]) -> Optional[Path]:
+    """Return an explicitly configured cockpit root, if one was provided."""
+
+    for name in ("XFLOW_COCKPIT_ROOT", "DEVCTL_COCKPIT_ROOT", "XFLOW_COCKPIT"):
+        value = env.get(name, "").strip()
+        if value:
+            return canonical_path(Path(value))
+    return None
+
+
+def profile_path_from_env(env: Mapping[str, str]) -> Optional[Path]:
+    """Return an explicitly configured cockpit profile, if one was provided."""
+
+    for name in (
+        "XFLOW_PROFILE",
+        "XFLOW_COCKPIT_PROFILE",
+        "DEVCTL_PROFILE",
+        "DEVCTL_COCKPIT_PROFILE",
+    ):
+        value = env.get(name, "").strip()
+        if value:
+            return canonical_path(Path(value))
+    return None
 
 
 def env_file_candidates(env: Mapping[str, str]) -> list[tuple[Path, str]]:

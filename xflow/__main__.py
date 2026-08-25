@@ -1,3 +1,5 @@
+"""Public Python entrypoint; command routing remains centralized in :mod:`xflow.cli`."""
+
 import sys
 
 

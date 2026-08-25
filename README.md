@@ -537,8 +537,8 @@ python tests/entrypoint-routing.py
 python tests/powershell-entrypoint.py
 ```
 
-The second command exits 77 when neither `pwsh` nor `powershell` is available;
-exit 77 means a capability skip, not a pass. On Windows, do not run bare
+The PowerShell-only command exits 77 when neither `pwsh` nor `powershell` is
+available; exit 77 means a capability skip, not a pass. On Windows, do not run bare
 `bash`, Git Bash, or WSL for normal XFlow validation. POSIX-only shell
 compatibility checks may use `bash -n` only when an explicit POSIX shell is
 selected outside Windows.
@@ -546,6 +546,36 @@ selected outside Windows.
 Search anchor: Normal Git, Issue, Attachment, Approval, Rules, and Migration commands route through Python core.
 Search anchor: Do not run bare bash/Git-Bash/WSL for normal XFlow validation on Windows.
 Search anchor: do not run bare `bash`, Git Bash, or WSL for normal XFlow validation.
+
+The platform runtime's first-phase cockpit commands are:
+
+```text
+devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] state [show [ARGS...]]
+devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] dev preflight [--warn-only]
+devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] dev docker setup|status
+devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] dev all
+devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] run
+devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] dev playground [TARGET] [--no-browser]
+devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] pg [TARGET] [--no-browser]
+devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] playground [TARGET] [--no-browser]
+```
+
+The profile is discovered in this order: explicit `--profile`, an explicit
+profile environment variable (`XFLOW_PROFILE`, `XFLOW_COCKPIT_PROFILE`,
+`DEVCTL_PROFILE`, or `DEVCTL_COCKPIT_PROFILE`), the selected `--cockpit-root` (or its environment equivalent)
+under `.xflow/cockpit.yaml` and then `cockpit.yaml`, and finally the current
+directory with the same two names. The profile is validated before any child
+process is started. `--repo` accepts only a direct sibling directory under the
+profile workspace; literal sibling names declared by profile command paths are
+also enforced. Invalid profiles, repository selections, and commands outside
+the first-phase list fail before process orchestration and do not silently fall
+back to a different command backend.
+
+Run the cockpit routing suite independently from the core and entrypoint suites:
+
+```text
+python tests/cockpit-cli.py
+```
 
 User-level parameters should live in `~/.xflow/env.local`:
 

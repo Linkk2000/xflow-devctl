@@ -324,6 +324,27 @@ Runtime:
   POSIX-only shell compatibility checks may use bash -n when a POSIX shell is
   explicitly selected outside Windows.
 
+Cockpit runtime commands (first phase):
+  devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] state [show [ARGS...]]
+  devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] dev preflight [--warn-only]
+  devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] dev docker setup|status
+  devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] dev all
+  devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] run
+  devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] dev playground [TARGET] [--no-browser]
+  devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] pg [TARGET] [--no-browser]
+  devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] playground [TARGET] [--no-browser]
+
+Profile discovery order is explicit --profile, XFLOW_PROFILE/XFLOW_COCKPIT_PROFILE/
+DEVCTL_PROFILE/DEVCTL_COCKPIT_PROFILE, --cockpit-root (or XFLOW_COCKPIT_ROOT/
+DEVCTL_COCKPIT_ROOT/XFLOW_COCKPIT)
+with .xflow/cockpit.yaml then cockpit.yaml, and the current directory with those
+two names. Profile validation and sibling repository resolution happen before a
+child process starts. Unsupported commands fail closed; they do not fall back to
+another backend or partially execute.
+
+Run the independent cockpit routing suite with:
+  python tests/cockpit-cli.py
+
 Config:
   XFLOW_ENV_FILE            explicit env file for one run
   ~/.xflow/env.local        preferred user-level env file
@@ -338,4 +359,11 @@ Config:
   DEVCTL_BASE_BRANCH        default base branch
   DEVCTL_BRANCH_PREFIX      task branch prefix
   DEVCTL_REPO_ROOT          target repository root
+  XFLOW_PROFILE             explicit cockpit profile path
+  XFLOW_COCKPIT_PROFILE     explicit cockpit profile path (compatibility alias)
+  DEVCTL_PROFILE            explicit cockpit profile path (compatibility alias)
+  DEVCTL_COCKPIT_PROFILE    explicit cockpit profile path (compatibility alias)
+  XFLOW_COCKPIT_ROOT        cockpit root for profile discovery
+  DEVCTL_COCKPIT_ROOT       cockpit root for profile discovery (compatibility alias)
+  XFLOW_COCKPIT             cockpit root for profile discovery (compatibility alias)
   PYTHONDONTWRITEBYTECODE   set to 1 to avoid __pycache__

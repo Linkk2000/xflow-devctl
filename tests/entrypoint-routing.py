@@ -307,6 +307,45 @@ def assert_issue_workspace_migration_is_discoverable() -> None:
         assert "issue-workspace" in result.stdout, (command, result.stdout)
 
 
+def assert_cockpit_commands_are_discoverable() -> None:
+    env = test_env()
+    commands = (
+        [sys.executable, "-m", "xflow", "--help"],
+        [sys.executable, "-m", "xflow", "state", "--help"],
+        [sys.executable, "-m", "xflow", "dev", "--help"],
+        [sys.executable, "-m", "xflow", "dev", "docker", "--help"],
+    )
+    for command in commands:
+        result = subprocess.run(
+            command,
+            cwd=OPS_ROOT,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert result.returncode == 0, result.stderr
+    help_result = subprocess.run(
+        [sys.executable, "-m", "xflow", "--help"],
+        cwd=OPS_ROOT,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    for option in ("--profile", "--cockpit-root", "--repo"):
+        assert option in help_result.stdout
+    for command_name in ("state", "dev", "run", "pg", "playground"):
+        assert command_name in help_result.stdout
+    for path in (OPS_ROOT / "README.md", OPS_ROOT / "help.txt"):
+        text = path.read_text(encoding="utf-8")
+        assert "devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] state" in text
+        assert "XFLOW_PROFILE" in text
+        assert "python tests/cockpit-cli.py" in text
+
+
 def assert_complete_command_contract_is_published() -> None:
     anchors = (
         "devctl task activate --issue IK3RR6",
@@ -341,6 +380,7 @@ def main() -> None:
     assert_contract_commands_are_discoverable()
     assert_trace_commands_are_discoverable()
     assert_issue_workspace_migration_is_discoverable()
+    assert_cockpit_commands_are_discoverable()
     assert_complete_command_contract_is_published()
 
     with tempfile.TemporaryDirectory() as raw:
