@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -20,6 +21,7 @@ sys.path.insert(0, str(OPS_ROOT))
 from tests.support import write_text_lf  # noqa: E402
 from xflow.cockpit import CockpitContext, load_cockpit_profile  # noqa: E402
 from xflow.services import (  # noqa: E402
+    ServiceHandle,
     ServiceSupervisor,
     run_playground,
     run_scenario,
@@ -31,6 +33,7 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -69,6 +72,19 @@ if mode == "build":
 if mode == "fail":
     event("fail")
     raise SystemExit(17)
+if mode == "leader-exits":
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    Path(os.environ["CHILD_PID_FILE"]).write_text(str(child.pid), encoding="utf-8")
+    raise SystemExit(0)
+if mode == "tree-ignore-term":
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+        ]
+    )
+    Path(os.environ["CHILD_PID_FILE"]).write_text(str(child.pid), encoding="utf-8")
 
 name = sys.argv[-1] if mode == "service" else "playground"
 event("start:" + name)
@@ -106,6 +122,7 @@ def _context(root: Path, *, fail_dependency: bool = False) -> CockpitContext:
             "DEP_ATTEMPTS_FILE": str(root / "dep-attempts"),
             "FAIL_DEPENDENCY": "1" if fail_dependency else "",
             "PLAYGROUND_BUILD_FILE": str(root / "build.marker"),
+            "CHILD_PID_FILE": str(root / "child.pid"),
         }
     )
     return CockpitContext(root, root.parent, root, Path(sys.executable), run_dir, env)
@@ -281,6 +298,299 @@ def test_playground_build_failure_does_not_start_process() -> None:
         assert not (context.run_dir / "flowable.pid").exists()
 
 
+def test_dependency_up_timeout_uses_absolute_budget_and_controlled_error() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+        calls = []
+
+        def timed_out(_spec: object, _context: CockpitContext, *, capture: bool = False, timeout: Optional[float] = None) -> object:
+            calls.append(timeout)
+            raise subprocess.TimeoutExpired(["dependency-up"], timeout or 0)
+
+        supervisor = ServiceSupervisor(profile, context)
+        with mock.patch("xflow.services.execute_command", side_effect=timed_out):
+            try:
+                supervisor.ensure_dependencies(("server",))
+            except ValueError as exc:
+                assert "database" in str(exc)
+                assert "up" in str(exc)
+            else:
+                raise AssertionError("dependency timeout must be controlled")
+        assert calls and calls[0] is not None and calls[0] <= 2
+
+
+def test_dependency_up_success_after_deadline_is_rejected() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        dependency = replace(profile.dependencies["database"], timeout_seconds=0.01)
+        profile = replace(
+            profile,
+            dependencies={**profile.dependencies, "database": dependency},
+        )
+        context = _context(root)
+
+        def late_success(
+            _spec: object,
+            _context: CockpitContext,
+            *,
+            capture: bool = False,
+            timeout: Optional[float] = None,
+        ) -> object:
+            time.sleep(0.03)
+            return type("Outcome", (), {"returncode": 0})()
+
+        supervisor = ServiceSupervisor(profile, context)
+        with mock.patch("xflow.services.execute_command", side_effect=late_success):
+            try:
+                supervisor.ensure_dependencies(("server",))
+            except ValueError as exc:
+                assert "database" in str(exc)
+                assert "up" in str(exc)
+                assert "timed out" in str(exc)
+            else:
+                raise AssertionError("late dependency success must not pass the deadline")
+
+
+def test_dependency_ready_execution_error_identifies_ready_stage() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+        calls = []
+
+        def ready_error(_spec: object, _context: CockpitContext, *, capture: bool = False, timeout: Optional[float] = None) -> object:
+            calls.append(timeout)
+            if len(calls) == 1:
+                return type("Outcome", (), {"returncode": 0})()
+            raise OSError("fixture readiness failure")
+
+        supervisor = ServiceSupervisor(profile, context)
+        with mock.patch("xflow.services.execute_command", side_effect=ready_error):
+            try:
+                supervisor.ensure_dependencies(("server",))
+            except ValueError as exc:
+                assert "database" in str(exc)
+                assert "ready" in str(exc)
+            else:
+                raise AssertionError("dependency readiness errors must be controlled")
+        assert len(calls) == 2 and all(timeout is not None for timeout in calls)
+
+
+def test_health_url_probe_rechecks_deadline_after_probe_returns() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        profile = replace(profile, docker=replace(profile.docker, startup_timeout_seconds=0.01))
+        context = _context(root)
+
+        class Alive:
+            pid = os.getpid()
+            returncode = None
+
+            def poll(self) -> None:
+                return None
+
+        handle = type("Handle", (), {"id": "server", "process": Alive(), "log_path": root / "server.log"})()
+        supervisor = ServiceSupervisor(profile, context)
+        supervisor._handles = [handle]
+        supervisor._handles_by_id["server"] = handle
+        service = replace(profile.services["server"], health_urls=("http://ready",))
+        supervisor.profile = replace(profile, services={**profile.services, "server": service})
+
+        def late_success(_url: str, timeout: Optional[float] = None) -> object:
+            time.sleep(0.03)
+            return object()
+
+        with mock.patch("xflow.services.urlopen", side_effect=late_success):
+            with mock.patch.object(supervisor, "stop_all"):
+                try:
+                    supervisor.wait_healthy((handle,))
+                except ValueError as exc:
+                    assert "health" in str(exc)
+                else:
+                    raise AssertionError("late URL success must not pass the deadline")
+
+
+def test_health_wait_requires_all_supervisor_handles_alive_before_return() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+
+        class Process:
+            def __init__(self) -> None:
+                self.pid = os.getpid()
+                self.returncode = None
+                self.dead = False
+
+            def poll(self) -> Optional[int]:
+                return 1 if self.dead else None
+
+        first_process = Process()
+        second_process = Process()
+        first = type("Handle", (), {"id": "server", "process": first_process, "log_path": root / "server.log"})()
+        second = type("Handle", (), {"id": "web", "process": second_process, "log_path": root / "web.log"})()
+        supervisor = ServiceSupervisor(profile, context)
+        supervisor._handles = [first, second]
+        supervisor._handles_by_id.update({"server": first, "web": second})
+
+        def ready(url: str, timeout: Optional[float] = None) -> object:
+            if url.endswith("/ready"):
+                first_process.dead = True
+            raise URLError("not ready") if url.endswith("/unavailable") else URLError("race")
+
+        with mock.patch("xflow.services.urlopen", side_effect=ready):
+            with mock.patch.object(supervisor, "stop_all") as stop:
+                try:
+                    supervisor.wait_healthy((first, second))
+                except ValueError as exc:
+                    assert "server" in str(exc)
+                    assert stop.called
+                else:
+                    raise AssertionError("all handles must be checked after each readiness")
+
+
+def _read_pid(path: Path) -> Optional[int]:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_alive(pid: Optional[int]) -> bool:
+    if pid is None or pid == os.getpid():
+        return False
+    try:
+        os.getpgid(pid)
+    except (OSError, ProcessLookupError):
+        return False
+    return True
+
+
+def _kill_pid(pid: Optional[int]) -> None:
+    if not _pid_alive(pid):
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        pass
+
+
+def test_leader_exit_still_cleans_owned_descendant_group() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+        server = replace(
+            profile.services["server"],
+            command=replace(
+                profile.services["server"].command,
+                argv=(sys.executable, str(root / "fixture-process.py"), "leader-exits"),
+            ),
+        )
+        profile = replace(profile, services={**profile.services, "server": server})
+        supervisor = ServiceSupervisor(profile, context)
+        child_pid = None
+        try:
+            try:
+                supervisor.start(("server",))
+            except ValueError as exc:
+                assert "server" in str(exc)
+            else:
+                raise AssertionError("leader exit must fail startup")
+            child_pid = _read_pid(root / "child.pid")
+            for _ in range(20):
+                if not _pid_alive(child_pid):
+                    break
+                time.sleep(0.02)
+            assert not _pid_alive(child_pid)
+        finally:
+            _kill_pid(child_pid)
+
+
+def test_tree_cleanup_forces_child_which_ignores_term() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+        server = replace(
+            profile.services["server"],
+            command=replace(
+                profile.services["server"].command,
+                argv=(sys.executable, str(root / "fixture-process.py"), "tree-ignore-term"),
+            ),
+        )
+        profile = replace(profile, services={**profile.services, "server": server})
+        supervisor = ServiceSupervisor(profile, context)
+        child_pid = None
+        try:
+            handles = supervisor.start(("server",))
+            for _ in range(20):
+                child_pid = _read_pid(root / "child.pid")
+                if child_pid is not None:
+                    break
+                time.sleep(0.02)
+            streams = list(supervisor._log_streams.values())
+            supervisor.stop_all()
+            assert handles[0].process.poll() is not None
+            assert not _pid_alive(child_pid)
+            assert all(getattr(stream, "closed", False) for stream in streams)
+        finally:
+            _kill_pid(child_pid)
+
+
+def test_stop_all_collects_pid_cleanup_errors_and_closes_every_stream() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+        supervisor = ServiceSupervisor(profile, context)
+        handles = supervisor.start(("server", "web"))
+        streams = list(supervisor._log_streams.values())
+        with mock.patch.object(supervisor, "_remove_pid", side_effect=PermissionError("denied")):
+            try:
+                supervisor.stop_all()
+            except ValueError as exc:
+                assert "cleanup" in str(exc).lower()
+            else:
+                raise AssertionError("cleanup failures must be reported after all handles")
+        assert all(handle.process.poll() is not None for handle in handles)
+        assert all(getattr(stream, "closed", False) for stream in streams)
+        assert supervisor._handles == []
+        assert supervisor._log_streams == {}
+
+
+def test_windows_tree_cleanup_uses_injectable_argv_capability() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+
+        class Process:
+            pid = 4242
+            returncode = 0
+
+            def poll(self) -> int:
+                return 0
+
+            def wait(self, timeout: Optional[float] = None) -> int:
+                return 0
+
+        supervisor = ServiceSupervisor(profile, context)
+        handle = ServiceHandle("server", Process(), root / "server.log")
+        with mock.patch("xflow.services.os.name", "nt"):
+            with mock.patch("xflow.services.subprocess.run") as run:
+                supervisor._terminate(handle)
+        assert run.call_count == 2
+        for call in run.call_args_list:
+            argv = call.args[0]
+            assert argv[:4] == ["taskkill", "/PID", "4242", "/T"]
+            assert call.kwargs["shell"] is False
+
+
 def main() -> None:
     tests: Sequence[Callable[[], None]] = (
         test_dependency_readiness_is_deduplicated_before_services,
@@ -290,6 +600,15 @@ def main() -> None:
         test_run_scenario_opens_browser_only_after_health,
         test_playground_alias_builds_before_spawn_and_opens_after_ready,
         test_playground_build_failure_does_not_start_process,
+        test_dependency_up_timeout_uses_absolute_budget_and_controlled_error,
+        test_dependency_up_success_after_deadline_is_rejected,
+        test_dependency_ready_execution_error_identifies_ready_stage,
+        test_health_url_probe_rechecks_deadline_after_probe_returns,
+        test_health_wait_requires_all_supervisor_handles_alive_before_return,
+        test_leader_exit_still_cleans_owned_descendant_group,
+        test_tree_cleanup_forces_child_which_ignores_term,
+        test_stop_all_collects_pid_cleanup_errors_and_closes_every_stream,
+        test_windows_tree_cleanup_uses_injectable_argv_capability,
     )
     for test in tests:
         test()

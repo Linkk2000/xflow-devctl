@@ -34,6 +34,19 @@ class ServiceHandle:
     log_path: Path
 
 
+@dataclass(frozen=True)
+class _ProcessRecord:
+    """Supervisor-owned process identity used for tree cleanup."""
+
+    handle: ServiceHandle
+    pid: int
+    group_id: Optional[int]
+
+
+class _HealthDeadlineExceeded(Exception):
+    pass
+
+
 def _unique_ids(service_ids: Sequence[str]) -> Tuple[str, ...]:
     result: List[str] = []
     seen = set()
@@ -75,6 +88,7 @@ class ServiceSupervisor:
         self.opener = webbrowser.open if opener is None else opener
         self._handles: List[ServiceHandle] = []
         self._handles_by_id: Dict[str, ServiceHandle] = {}
+        self._process_records: Dict[str, _ProcessRecord] = {}
         self._log_streams: Dict[str, object] = {}
         self._dependencies_started = set()
 
@@ -170,26 +184,45 @@ class ServiceSupervisor:
                     seen.add(dependency_id)
         return tuple(dependencies)
 
-    def _dependency_failure(self, dependency_id: str, stage: str, code: int) -> ValueError:
-        return ValueError(
-            f"dependency {dependency_id} {stage} failed (exit {int(code)})"
-        )
+    def _dependency_failure(
+        self, dependency_id: str, stage: str, reason: str
+    ) -> ValueError:
+        return ValueError(f"dependency {dependency_id} {stage} failed: {reason}")
 
     def _ensure_dependency(self, dependency: ComposeDependency) -> None:
+        deadline = time.monotonic() + float(dependency.timeout_seconds)
         up = self._command_for_dependency(dependency, dependency.up)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise self._dependency_failure(dependency.id, "up", "timed out")
         try:
-            outcome = execute_command(up, self.context, capture=True)
-        except BaseException:
+            outcome = execute_command(
+                up,
+                self.context,
+                capture=True,
+                timeout=remaining,
+            )
+        except KeyboardInterrupt:
             raise
+        except Exception as exc:
+            raise self._dependency_failure(
+                dependency.id, "up", f"execution error: {type(exc).__name__}"
+            ) from exc
+        if time.monotonic() >= deadline:
+            raise self._dependency_failure(dependency.id, "up", "timed out")
         if outcome.returncode != 0:
-            raise self._dependency_failure(dependency.id, "startup", outcome.returncode)
+            reason = (
+                "timed out"
+                if outcome.returncode == 124
+                else f"exit {int(outcome.returncode)}"
+            )
+            raise self._dependency_failure(dependency.id, "up", reason)
 
         ready = self._command_for_dependency(dependency, dependency.ready)
-        deadline = time.monotonic() + float(dependency.timeout_seconds)
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise self._dependency_failure(dependency.id, "readiness", 124)
+                raise self._dependency_failure(dependency.id, "ready", "timed out")
             try:
                 outcome = execute_command(
                     ready,
@@ -197,13 +230,24 @@ class ServiceSupervisor:
                     capture=True,
                     timeout=remaining,
                 )
-            except BaseException:
+            except KeyboardInterrupt:
                 raise
+            except Exception as exc:
+                raise self._dependency_failure(
+                    dependency.id, "ready", f"execution error: {type(exc).__name__}"
+                ) from exc
+            if time.monotonic() >= deadline:
+                raise self._dependency_failure(dependency.id, "ready", "timed out")
             if outcome.returncode == 0:
                 return
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise self._dependency_failure(dependency.id, "readiness", outcome.returncode)
+                reason = (
+                    "timed out"
+                    if outcome.returncode == 124
+                    else f"exit {int(outcome.returncode)}"
+                )
+                raise self._dependency_failure(dependency.id, "ready", reason)
             time.sleep(min(0.05, remaining))
 
     def ensure_dependencies(self, service_ids: Sequence[str]) -> None:
@@ -222,6 +266,22 @@ class ServiceSupervisor:
             flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             return {"creationflags": flags}
         return {"start_new_session": True}
+
+    def _process_record(self, handle: ServiceHandle) -> _ProcessRecord:
+        group_id: Optional[int] = None
+        if os.name != "nt":
+            try:
+                group_id = os.getpgid(handle.process.pid)
+            except OSError:
+                # ``start_new_session=True`` makes the child PID the group ID;
+                # retain that identity even when the leader exits immediately.
+                group_id = handle.process.pid
+            try:
+                if group_id == os.getpgrp():
+                    group_id = None
+            except OSError:
+                pass
+        return _ProcessRecord(handle, int(handle.process.pid), group_id)
 
     def _spawn(
         self,
@@ -255,34 +315,44 @@ class ServiceSupervisor:
             kwargs.update(self._session_kwargs())
             process = subprocess.Popen(list(argv), **kwargs)
             handle = ServiceHandle(service_id, process, log_path)
+            record = self._process_record(handle)
             self._write_pid_atomically(service_id, process.pid)
+            self._process_records[service_id] = record
             self._log_streams[service_id] = stream
             return handle
         except FileNotFoundError as exc:
-            if process is not None:
-                self._terminate(process)
-            if stream is not None:
-                stream.close()
+            try:
+                if process is not None:
+                    self._terminate(ServiceHandle(service_id, process, log_path))
+            finally:
+                if stream is not None:
+                    stream.close()
             raise ValueError(f"executable for service {service_id} was not found") from exc
         except PermissionError as exc:
-            if process is not None:
-                self._terminate(process)
-            if stream is not None:
-                stream.close()
+            try:
+                if process is not None:
+                    self._terminate(ServiceHandle(service_id, process, log_path))
+            finally:
+                if stream is not None:
+                    stream.close()
             raise ValueError(f"executable for service {service_id} is not permitted") from exc
         except BaseException:
-            if process is not None:
-                self._terminate(process)
-            if stream is not None:
-                stream.close()
+            try:
+                if process is not None:
+                    record = self._process_records.get(service_id)
+                    self._terminate(record or ServiceHandle(service_id, process, log_path))
+            finally:
+                if stream is not None:
+                    stream.close()
             raise
 
     def _check_early_exit(self, handle: ServiceHandle) -> None:
         # Give an immediately failing child a scheduling opportunity before
         # the next service is spawned.  This is short enough not to delay a
         # normal startup while making startup failures deterministic.
-        if handle.process.poll() is None:
-            time.sleep(0.01)
+        deadline = time.monotonic() + 0.05
+        while handle.process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.005)
         returncode = handle.process.poll()
         if returncode is not None:
             raise ValueError(
@@ -338,22 +408,39 @@ class ServiceSupervisor:
             raise
         return tuple(started)
 
-    def _url_is_healthy(self, url: str, timeout: float) -> bool:
+    def _check_all_handles_alive(self) -> None:
+        for handle in self._handles:
+            returncode = handle.process.poll()
+            if returncode is not None:
+                raise ValueError(
+                    f"service {handle.id} exited during health checks "
+                    f"(exit {int(returncode)})"
+                )
+
+    def _url_is_healthy(self, url: str, deadline: float) -> bool:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _HealthDeadlineExceeded()
         try:
-            response = urlopen(url, timeout=max(0.01, timeout))
+            response = urlopen(url, timeout=remaining)
             close = getattr(response, "close", None)
             if callable(close):
                 close()
-            return True
+        except _HealthDeadlineExceeded:
+            raise
         except Exception:
             return False
+        if time.monotonic() >= deadline:
+            raise _HealthDeadlineExceeded()
+        return True
 
     def _wait_urls(
         self,
         handle: ServiceHandle,
         urls: Sequence[str],
-        timeout_seconds: float,
+        deadline: float,
     ) -> None:
+        self._check_all_handles_alive()
         if not urls:
             if handle.process.poll() is not None:
                 raise ValueError(
@@ -362,70 +449,116 @@ class ServiceSupervisor:
                 )
             return
 
-        deadline = time.monotonic() + max(0.01, float(timeout_seconds))
         while True:
-            returncode = handle.process.poll()
-            if returncode is not None:
+            self._check_all_handles_alive()
+            if time.monotonic() >= deadline:
                 raise ValueError(
-                    f"service {handle.id} exited before readiness (exit {int(returncode)})"
-                )
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ValueError(
-                    f"service {handle.id} health check timed out: {', '.join(urls)}"
+                    f"service {handle.id} health check deadline expired: {', '.join(urls)}"
                 )
             for url in urls:
-                if self._url_is_healthy(url, remaining):
+                self._check_all_handles_alive()
+                try:
+                    healthy = self._url_is_healthy(url, deadline)
+                except _HealthDeadlineExceeded:
+                    raise ValueError(
+                        f"service {handle.id} health check deadline expired: {', '.join(urls)}"
+                    )
+                if healthy:
+                    self._check_all_handles_alive()
+                    if time.monotonic() >= deadline:
+                        raise ValueError(
+                            f"service {handle.id} health check deadline expired: {', '.join(urls)}"
+                        )
                     return
+            self._check_all_handles_alive()
+            if time.monotonic() >= deadline:
+                raise ValueError(
+                    f"service {handle.id} health check deadline expired: {', '.join(urls)}"
+                )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ValueError(
-                    f"service {handle.id} health check timed out: {', '.join(urls)}"
+                    f"service {handle.id} health check deadline expired: {', '.join(urls)}"
                 )
             time.sleep(min(0.05, remaining))
 
     def wait_healthy(self, handles: Sequence[ServiceHandle]) -> None:
         """Wait for every declared service health URL, trying URL fallbacks."""
 
-        timeout_seconds = float(self.profile.docker.startup_timeout_seconds)
+        deadline = time.monotonic() + float(self.profile.docker.startup_timeout_seconds)
         try:
             for handle in handles:
                 service = self.profile.services.get(handle.id)
                 if service is None:
                     raise ValueError(f"unknown service id: {handle.id}")
-                self._wait_urls(handle, service.health_urls, timeout_seconds)
+                self._wait_urls(handle, service.health_urls, deadline)
+            self._check_all_handles_alive()
         except BaseException:
             self.stop_all()
             raise
 
-    def _terminate(self, process: subprocess.Popen[str]) -> None:
-        if process.poll() is not None:
-            try:
-                process.wait(timeout=0)
-            except (subprocess.TimeoutExpired, OSError):
-                pass
-            return
+    def _coerce_record(self, value: object) -> _ProcessRecord:
+        if isinstance(value, _ProcessRecord):
+            return value
+        if isinstance(value, ServiceHandle):
+            return self._process_records.get(value.id) or self._process_record(value)
+        raise TypeError("process cleanup requires a supervisor process record")
 
-        if os.name == "nt":
+    def _signal_posix(self, record: _ProcessRecord, signum: int) -> bool:
+        group_id = record.group_id
+        if group_id is not None:
             try:
-                ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
-                if ctrl_break is not None:
-                    process.send_signal(ctrl_break)
-                else:
-                    process.terminate()
-            except (OSError, AttributeError):
+                if group_id != os.getpgrp():
+                    os.killpg(group_id, signum)
+                    return True
+            except (OSError, ProcessLookupError):
+                pass
+        try:
+            record.handle.process.send_signal(signum)
+            return True
+        except (OSError, AttributeError):
+            return False
+
+    def _group_alive(self, record: _ProcessRecord) -> bool:
+        if record.group_id is None:
+            return False
+        try:
+            if record.group_id == os.getpgrp():
+                return False
+            os.killpg(record.group_id, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+    def _windows_tree_signal(self, record: _ProcessRecord, force: bool) -> bool:
+        command = ["taskkill", "/PID", str(record.pid), "/T"]
+        if force:
+            command.append("/F")
+        try:
+            subprocess.run(
+                command,
+                shell=False,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except (OSError, TypeError):
+            return False
+
+    def _terminate(self, value: object) -> None:
+        record = self._coerce_record(value)
+        process = record.handle.process
+        if os.name == "nt":
+            sent = self._windows_tree_signal(record, force=False)
+            if not sent:
                 try:
                     process.terminate()
                 except OSError:
                     pass
         else:
-            try:
-                group_id = os.getpgid(process.pid)
-                if group_id == os.getpid():
-                    process.terminate()
-                else:
-                    os.killpg(group_id, signal.SIGTERM)
-            except (OSError, ProcessLookupError):
+            sent = self._signal_posix(record, signal.SIGTERM)
+            if not sent:
                 try:
                     process.terminate()
                 except OSError:
@@ -433,48 +566,55 @@ class ServiceSupervisor:
 
         try:
             process.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            if os.name == "nt":
-                try:
-                    process.kill()
-                except OSError:
-                    pass
-            else:
-                try:
-                    group_id = os.getpgid(process.pid)
-                    if group_id == os.getpid():
-                        process.kill()
-                    else:
-                        os.killpg(group_id, signal.SIGKILL)
-                except (OSError, ProcessLookupError):
-                    try:
-                        process.kill()
-                    except OSError:
-                        pass
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+        if os.name == "nt":
+            self._windows_tree_signal(record, force=True)
+        elif self._group_alive(record):
             try:
-                process.wait(timeout=1.0)
-            except (subprocess.TimeoutExpired, OSError):
+                os.killpg(record.group_id, signal.SIGKILL)  # type: ignore[arg-type]
+            except (OSError, ProcessLookupError):
                 pass
-        except OSError:
+        elif process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+        try:
+            process.wait(timeout=1.0)
+        except (subprocess.TimeoutExpired, OSError):
             pass
 
     def stop_all(self) -> None:
         """Terminate all owned process groups in reverse startup order."""
 
         handles = list(reversed(self._handles))
+        errors: List[str] = []
         for handle in handles:
             try:
-                self._terminate(handle.process)
+                record = self._process_records.get(handle.id) or self._process_record(handle)
+                self._terminate(record)
+            except Exception as exc:
+                errors.append(f"{handle.id} terminate: {type(exc).__name__}")
             finally:
-                self._remove_pid(handle)
-                stream = self._log_streams.pop(handle.id, None)
-                if stream is not None:
-                    try:
-                        stream.close()  # type: ignore[union-attr]
-                    except OSError:
-                        pass
+                try:
+                    self._remove_pid(handle)
+                except Exception as exc:
+                    errors.append(f"{handle.id} pid cleanup: {type(exc).__name__}")
+                finally:
+                    stream = self._log_streams.pop(handle.id, None)
+                    if stream is not None:
+                        try:
+                            stream.close()  # type: ignore[union-attr]
+                        except Exception as exc:
+                            errors.append(f"{handle.id} log close: {type(exc).__name__}")
         self._handles.clear()
         self._handles_by_id.clear()
+        self._process_records.clear()
+        if errors:
+            raise ValueError("service cleanup failed: " + "; ".join(errors))
 
     def _start_playground(self, playground: PlaygroundSpec) -> ServiceHandle:
         self._assert_pid_available(playground.id)
@@ -491,7 +631,8 @@ class ServiceSupervisor:
 
     def _wait_playground(self, handle: ServiceHandle, url: str) -> None:
         try:
-            self._wait_urls(handle, (url,), float(self.profile.docker.startup_timeout_seconds))
+            deadline = time.monotonic() + float(self.profile.docker.startup_timeout_seconds)
+            self._wait_urls(handle, (url,), deadline)
         except BaseException:
             self.stop_all()
             raise
@@ -520,6 +661,13 @@ def _report_failure(label: str, error: BaseException) -> None:
     print(f"[ERROR] {label}: {error}", file=sys.stderr)
 
 
+def _stop_after_failure(supervisor: ServiceSupervisor) -> None:
+    try:
+        supervisor.stop_all()
+    except Exception as exc:
+        _report_failure("service cleanup", exc)
+
+
 def run_scenario(
     profile: CockpitProfile, context: CockpitContext, scenario_id: str
 ) -> int:
@@ -533,14 +681,15 @@ def run_scenario(
         supervisor.ensure_dependencies(scenario.services)
         handles = supervisor.start(scenario.services)
         supervisor.wait_healthy(handles)
+        supervisor._check_all_handles_alive()
         if scenario.open_url:
             supervisor.open_browser(scenario.open_url)
         return 0
     except KeyboardInterrupt:
-        supervisor.stop_all()
+        _stop_after_failure(supervisor)
         return 130
     except Exception as exc:
-        supervisor.stop_all()
+        _stop_after_failure(supervisor)
         _report_failure(f"scenario {scenario_id}", exc)
         return 1
 
@@ -566,13 +715,14 @@ def run_playground(
                 return int(outcome.returncode) or 1
         handle = supervisor._start_playground(playground)
         supervisor._wait_playground(handle, playground.url)
+        supervisor._check_all_handles_alive()
         if open_browser:
             supervisor.open_browser(playground.url)
         return 0
     except KeyboardInterrupt:
-        supervisor.stop_all()
+        _stop_after_failure(supervisor)
         return 130
     except Exception as exc:
-        supervisor.stop_all()
+        _stop_after_failure(supervisor)
         _report_failure(f"playground {playground.id}", exc)
         return 1

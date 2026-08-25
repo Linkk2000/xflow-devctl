@@ -4,6 +4,7 @@ allowedEnvironment:
   - DEP_ATTEMPTS_FILE
   - FAIL_DEPENDENCY
   - PLAYGROUND_BUILD_FILE
+  - CHILD_PID_FILE
 state:
   command:
     argv: ["{python}", "-c", "print('state')"]
@@ -51,6 +52,7 @@ services:
       cwd: "{cockpit}"
       env:
         EVENT_FILE: "{EVENT_FILE}"
+        CHILD_PID_FILE: "{CHILD_PID_FILE}"
     dependencies: [database]
     healthUrls:
       - "http://127.0.0.1:1/unavailable"
