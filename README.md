@@ -525,9 +525,16 @@ PowerShell users should prefer the repository-local `devctl.ps1`, which invokes
 the Python core and sets `PYTHONDONTWRITEBYTECODE=1` to avoid `__pycache__`
 byproducts. Do not rely on a user-level PATH devctl shim for repository work.
 Normal Git, Issue, Attachment, Approval, Rules, and Migration commands route
-through Python core. On Windows, validate with Python commands such as
-`python tests/python-core.py` and `python tests/entrypoint-routing.py`; do not
-run bare `bash`, Git Bash, or WSL for normal XFlow validation. POSIX-only shell
+through Python core. The entrypoint checks are independent capability suites:
+
+```text
+python tests/entrypoint-routing.py
+python tests/powershell-entrypoint.py
+```
+
+The second command exits 77 when neither `pwsh` nor `powershell` is available;
+exit 77 means a capability skip, not a pass. On Windows, do not run bare
+`bash`, Git Bash, or WSL for normal XFlow validation. POSIX-only shell
 compatibility checks may use `bash -n` only when an explicit POSIX shell is
 selected outside Windows.
 

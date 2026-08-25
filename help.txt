@@ -309,9 +309,12 @@ Migration:
 Runtime:
   Repository-local devctl.ps1 and generated project wrappers route normal commands to Python core.
   Do not rely on a user-level PATH devctl shim for repository work.
-  On Windows, validate with Python commands such as:
+  Run the Python core regression and the two independent entrypoint capability suites:
     python tests/python-core.py
     python tests/entrypoint-routing.py
+    python tests/powershell-entrypoint.py
+  The PowerShell-only suite exits 77 when its executable capability is unavailable;
+  exit 77 is a capability skip, not a pass.
   Do not run bare bash/Git-Bash/WSL for normal XFlow validation on Windows.
   POSIX-only shell compatibility checks may use bash -n when a POSIX shell is
   explicitly selected outside Windows.
