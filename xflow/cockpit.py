@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -21,6 +22,7 @@ _COMMAND_BUILTIN_TOKENS = frozenset({"python"})
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _TEMPLATE_TOKEN = re.compile(r"\{([^{}]+)\}")
 _ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z")
+_COMPOSE_SERVICE_NAME = re.compile(r"[A-Za-z0-9_.-]+\Z")
 _MISSING = object()
 
 
@@ -500,7 +502,7 @@ def _urls(value: Any, label: str) -> tuple[str, ...]:
 
 
 def _is_http_url(value: str) -> bool:
-    if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value):
+    if any(character.isspace() or unicodedata.category(character) == "Cc" for character in value):
         return False
     try:
         parsed = urlparse(value)
@@ -533,7 +535,7 @@ def _is_legal_hostname(hostname: str) -> bool:
 
 def _compose_service_name(value: Any, label: str) -> str:
     result = _string(value, label)
-    if _ID.fullmatch(result) is None:
+    if _COMPOSE_SERVICE_NAME.fullmatch(result) is None:
         raise ValueError(f"{label} must be a valid non-empty Compose service name")
     return result
 

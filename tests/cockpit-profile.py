@@ -152,6 +152,28 @@ def test_accepts_compose_dependency_outside_application_services() -> None:
     assert profile.dependencies["postgres"].service == "external-postgres"
 
 
+def test_accepts_compose_service_name_starting_with_underscore() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["dependencies"][0]["service"] = "_service"
+
+    profile = load_mutated_profile(mutate)
+    assert profile.dependencies["postgres"].service == "_service"
+
+
+def test_rejects_empty_compose_service_name() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["dependencies"][0]["service"] = ""
+
+    assert_value_error("must not be empty", lambda: load_mutated_profile(mutate))
+
+
+def test_rejects_illegal_compose_service_name() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["dependencies"][0]["service"] = "service name"
+
+    assert_value_error("valid non-empty Compose service name", lambda: load_mutated_profile(mutate))
+
+
 def test_rejects_unknown_scenario_service_id() -> None:
     def mutate(payload: dict[str, object]) -> None:
         payload["scenarios"][0]["services"] = ["missing"]
@@ -176,6 +198,13 @@ def test_rejects_non_http_health_url() -> None:
 def test_rejects_health_url_with_whitespace_hostname() -> None:
     def mutate(payload: dict[str, object]) -> None:
         payload["services"][1]["healthUrls"] = ["http://bad host/health"]
+
+    assert_value_error("valid HTTP URL", lambda: load_mutated_profile(mutate))
+
+
+def test_rejects_health_url_with_c1_control_character() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["services"][1]["healthUrls"] = ["http://example.com/\x80health"]
 
     assert_value_error("valid HTTP URL", lambda: load_mutated_profile(mutate))
 
@@ -239,10 +268,14 @@ def main() -> None:
     test_rejects_duplicate_service_ids()
     test_rejects_unknown_dependency_id()
     test_accepts_compose_dependency_outside_application_services()
+    test_accepts_compose_service_name_starting_with_underscore()
+    test_rejects_empty_compose_service_name()
+    test_rejects_illegal_compose_service_name()
     test_rejects_unknown_scenario_service_id()
     test_rejects_nonpositive_timeouts()
     test_rejects_non_http_health_url()
     test_rejects_health_url_with_whitespace_hostname()
+    test_rejects_health_url_with_c1_control_character()
     test_rejects_scenario_url_with_out_of_range_port()
     test_rejects_playground_url_with_empty_hostname()
     test_rejects_unknown_command_field()
