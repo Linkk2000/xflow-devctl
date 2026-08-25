@@ -44,6 +44,13 @@ def load_mutated_profile(mutate: object) -> object:
         return load_cockpit_profile(path)
 
 
+def load_raw_profile(text: str) -> object:
+    with tempfile.TemporaryDirectory() as raw:
+        path = Path(raw) / "cockpit.yaml"
+        path.write_text(text, encoding="utf-8")
+        return load_cockpit_profile(path)
+
+
 def test_valid_profile() -> None:
     profile = load_cockpit_profile(FIXTURES / "cockpit-profile.yaml")
 
@@ -94,6 +101,28 @@ def test_rejects_empty_argv() -> None:
     assert_value_error("argv must not be empty", lambda: load_mutated_profile(mutate))
 
 
+def test_rejects_blank_first_argv() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["state"]["command"]["argv"] = ["", "show"]
+
+    assert_value_error("argv[0] must not be blank", lambda: load_mutated_profile(mutate))
+
+
+def test_rejects_whitespace_first_argv() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["state"]["command"]["argv"] = [" \t", "show"]
+
+    assert_value_error("argv[0] must not be blank", lambda: load_mutated_profile(mutate))
+
+
+def test_allows_blank_later_argv() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["state"]["command"]["argv"] = ["{python}", ""]
+
+    profile = load_mutated_profile(mutate)
+    assert profile.state_command.argv[1] == ""
+
+
 def test_rejects_path_escape() -> None:
     def mutate(payload: dict[str, object]) -> None:
         payload["state"]["command"]["cwd"] = "{cockpit}/../../outside"
@@ -115,6 +144,14 @@ def test_rejects_unknown_dependency_id() -> None:
     assert_value_error("unknown dependency id", lambda: load_mutated_profile(mutate))
 
 
+def test_accepts_compose_dependency_outside_application_services() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["dependencies"][0]["service"] = "external-postgres"
+
+    profile = load_mutated_profile(mutate)
+    assert profile.dependencies["postgres"].service == "external-postgres"
+
+
 def test_rejects_unknown_scenario_service_id() -> None:
     def mutate(payload: dict[str, object]) -> None:
         payload["scenarios"][0]["services"] = ["missing"]
@@ -133,7 +170,28 @@ def test_rejects_non_http_health_url() -> None:
     def mutate(payload: dict[str, object]) -> None:
         payload["services"][1]["healthUrls"] = ["file:///tmp/health"]
 
-    assert_value_error("health URL must use HTTP", lambda: load_mutated_profile(mutate))
+    assert_value_error("valid HTTP URL", lambda: load_mutated_profile(mutate))
+
+
+def test_rejects_health_url_with_whitespace_hostname() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["services"][1]["healthUrls"] = ["http://bad host/health"]
+
+    assert_value_error("valid HTTP URL", lambda: load_mutated_profile(mutate))
+
+
+def test_rejects_scenario_url_with_out_of_range_port() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["scenarios"][0]["openUrl"] = "http://example.com:99999/"
+
+    assert_value_error("valid HTTP URL", lambda: load_mutated_profile(mutate))
+
+
+def test_rejects_playground_url_with_empty_hostname() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["playgrounds"][0]["url"] = "http://:8080/"
+
+    assert_value_error("valid HTTP URL", lambda: load_mutated_profile(mutate))
 
 
 def test_rejects_unknown_command_field() -> None:
@@ -141,6 +199,11 @@ def test_rejects_unknown_command_field() -> None:
         payload["state"]["command"]["shell"] = "echo unsafe"
 
     assert_value_error("unknown field", lambda: load_mutated_profile(mutate))
+
+
+def test_rejects_duplicate_yaml_mapping_key() -> None:
+    duplicate = "version: 1\nversion: 1\n"
+    assert_value_error("invalid cockpit profile YAML", lambda: load_raw_profile(duplicate))
 
 
 def test_rejects_unknown_template_token() -> None:
@@ -169,13 +232,21 @@ def main() -> None:
     test_rejects_unknown_top_level_key()
     test_rejects_shell_string()
     test_rejects_empty_argv()
+    test_rejects_blank_first_argv()
+    test_rejects_whitespace_first_argv()
+    test_allows_blank_later_argv()
     test_rejects_path_escape()
     test_rejects_duplicate_service_ids()
     test_rejects_unknown_dependency_id()
+    test_accepts_compose_dependency_outside_application_services()
     test_rejects_unknown_scenario_service_id()
     test_rejects_nonpositive_timeouts()
     test_rejects_non_http_health_url()
+    test_rejects_health_url_with_whitespace_hostname()
+    test_rejects_scenario_url_with_out_of_range_port()
+    test_rejects_playground_url_with_empty_hostname()
     test_rejects_unknown_command_field()
+    test_rejects_duplicate_yaml_mapping_key()
     test_rejects_unknown_template_token()
     test_expand_profile_path_confines_to_declared_roots()
     print("cockpit profile ok")

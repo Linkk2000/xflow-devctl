@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import re
 import sys
 from dataclasses import dataclass
@@ -394,6 +395,8 @@ def _command(
     argv = []
     for index, item in enumerate(argv_values):
         argument = _string(item, f"{label}.argv[{index}]", non_empty=False)
+        if index == 0 and not argument.strip():
+            raise ValueError(f"{label}.argv[0] must not be blank")
         tokens = _template_tokens(argument, f"{label}.argv[{index}]")
         allowed = ALLOWED_PATH_TOKENS | _COMMAND_BUILTIN_TOKENS | allowed_environment
         unknown = sorted(set(tokens) - allowed)
@@ -457,7 +460,9 @@ def _dependency(
     return ComposeDependency(
         id=_id(_required(dependency, "id", "dependency"), "dependency.id"),
         cwd=cwd,
-        service=_string(_required(dependency, "service", "dependency"), "dependency.service"),
+        service=_compose_service_name(
+            _required(dependency, "service", "dependency"), "dependency.service"
+        ),
         up=_command(dependency.get("up"), "dependency.up", roots, allowed_environment),
         ready=_command(dependency.get("ready"), "dependency.ready", roots, allowed_environment),
         timeout_seconds=_int(dependency, "timeoutSeconds", "dependency", minimum=1),
@@ -489,14 +494,48 @@ def _urls(value: Any, label: str) -> tuple[str, ...]:
     for index, item in enumerate(values):
         url = _string(item, f"{label}[{index}]")
         if not _is_http_url(url):
-            raise ValueError(f"{label}[{index}] health URL must use HTTP")
+            raise ValueError(f"{label}[{index}] must be a valid HTTP URL")
         result.append(url)
     return tuple(result)
 
 
 def _is_http_url(value: str) -> bool:
-    parsed = urlparse(value)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    if any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in value):
+        return False
+    try:
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return False
+        hostname = parsed.hostname
+        if not hostname or not _is_legal_hostname(hostname):
+            return False
+        parsed.port
+    except ValueError:
+        return False
+    return True
+
+
+def _is_legal_hostname(hostname: str) -> bool:
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        pass
+    try:
+        ascii_hostname = hostname.encode("idna").decode("ascii").rstrip(".")
+    except UnicodeError:
+        return False
+    if not ascii_hostname or len(ascii_hostname) > 253:
+        return False
+    label = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    return re.fullmatch(rf"{label}(?:\.{label})*", ascii_hostname) is not None
+
+
+def _compose_service_name(value: Any, label: str) -> str:
+    result = _string(value, label)
+    if _ID.fullmatch(result) is None:
+        raise ValueError(f"{label} must be a valid non-empty Compose service name")
+    return result
 
 
 def _scenario(value: Any) -> ScenarioSpec:
@@ -506,7 +545,7 @@ def _scenario(value: Any) -> ScenarioSpec:
     if open_url is not None:
         open_url = _string(open_url, "scenario.openUrl")
         if not _is_http_url(open_url):
-            raise ValueError("scenario.openUrl must use HTTP")
+            raise ValueError("scenario.openUrl must be a valid HTTP URL")
     return ScenarioSpec(
         services=_string_tuple(
             _required(scenario, "services", "scenario"), "scenario.services", ids=True
@@ -530,7 +569,7 @@ def _playground(
     _fields(playground, {"id", "aliases", "command", "build", "url"}, "playground")
     url = _string(_required(playground, "url", "playground"), "playground.url")
     if not _is_http_url(url):
-        raise ValueError("playground.url must use HTTP")
+        raise ValueError("playground.url must be a valid HTTP URL")
     build = playground.get("build")
     return PlaygroundSpec(
         id=_id(_required(playground, "id", "playground"), "playground.id"),
@@ -581,9 +620,6 @@ def _validate_references(
         for dependency_id in service.dependencies:
             if dependency_id not in dependencies:
                 raise ValueError(f"unknown dependency id: {dependency_id}")
-    for dependency in dependencies.values():
-        if dependency.service not in services:
-            raise ValueError(f"unknown service id in dependency: {dependency.service}")
     for scenario_id, scenario in scenarios.items():
         for service_id in scenario.services:
             if service_id not in services:
