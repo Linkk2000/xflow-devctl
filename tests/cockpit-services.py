@@ -602,7 +602,7 @@ def test_windows_tree_cleanup_uses_injectable_argv_capability() -> None:
                         supervisor, "_windows_job_active_processes", return_value=0
                     ):
                         with mock.patch.object(supervisor, "_windows_job_close", return_value=True):
-                            record = _ProcessRecord(handle, 4242, None, job, True)
+                            record = _ProcessRecord(handle, 4242, None, job, True, True)
                             supervisor._terminate(record)
         assert run.call_count == 1
         for call in run.call_args_list:
@@ -636,7 +636,7 @@ def test_windows_taskkill_nonzero_is_not_success() -> None:
                 "xflow.services.subprocess.run",
                 return_value=type("Outcome", (), {"returncode": 1})(),
             ) as run:
-                record = _ProcessRecord(handle, 4242, None, None, False)
+                record = _ProcessRecord(handle, 4242, None, None, False, True)
                 assert supervisor._windows_tree_signal(record, force=False) is False
                 try:
                     supervisor._terminate(record)
@@ -664,7 +664,7 @@ def test_windows_fallback_without_job_never_claims_tree_clean() -> None:
                 return self.returncode
 
         handle = ServiceHandle("server", Process(), root / "server.log")
-        record = _ProcessRecord(handle, 4242, None, None, False)
+        record = _ProcessRecord(handle, 4242, None, None, False, True)
         with mock.patch("xflow.services.os.name", "nt"):
             with mock.patch(
                 "xflow.services.subprocess.run",
@@ -846,6 +846,7 @@ def test_windows_spawn_assigns_before_release_and_business_state() -> None:
             "pid_written",
         ]
         assert state["business_executed"] is True
+        assert supervisor._process_records["server"].business_released is True
         assert not (context.run_dir / "server.ack").exists()
         supervisor._log_streams["server"].close()
 
@@ -1137,9 +1138,220 @@ def test_windows_abort_failure_retains_live_trampoline_ownership() -> None:
                                 raise AssertionError("live abort must report cleanup failure")
         assert "server" in supervisor._process_records
         assert supervisor._process_records["server"].pid == process.pid
+        assert supervisor._process_records["server"].business_released is False
         assert supervisor._handles_by_id["server"].process is process
         assert write_pid.called
         assert supervisor._log_streams["server"].closed
+
+
+def test_windows_prerelease_retry_clears_after_trampoline_exits() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+        supervisor = ServiceSupervisor(profile, context)
+
+        class Pipe:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        class Process:
+            pid = 5252
+            returncode = None
+
+            def __init__(self) -> None:
+                self.stdin = Pipe()
+
+            def poll(self) -> Optional[int]:
+                return self.returncode
+
+            def terminate(self) -> None:
+                raise OSError("abort unavailable")
+
+            def kill(self) -> None:
+                raise OSError("kill unavailable")
+
+            def wait(self, timeout: Optional[float] = None) -> int:
+                raise subprocess.TimeoutExpired("trampoline", timeout)
+
+        process = Process()
+        handle = ServiceHandle("server", process, root / "server.log")
+        record = _ProcessRecord(handle, process.pid, None, None, False, False)
+        supervisor._handles = [handle]
+        supervisor._handles_by_id[handle.id] = handle
+        supervisor._process_records[handle.id] = record
+        stream = (root / "server.log").open("w", encoding="utf-8")
+        supervisor._log_streams[handle.id] = stream
+        supervisor._write_pid_atomically(handle.id, process.pid)
+        pid_path = context.run_dir / "server.pid"
+
+        with mock.patch("xflow.services.os.name", "nt"):
+            with mock.patch.object(supervisor, "_pid_path", return_value=pid_path):
+                try:
+                    supervisor.stop_all()
+                except ValueError as exc:
+                    assert "server" in str(exc)
+                else:
+                    raise AssertionError("failed pre-release abort must be retained")
+                assert supervisor._process_records[handle.id].business_released is False
+                assert supervisor._handles == [handle]
+                assert pid_path.exists()
+                assert stream.closed
+
+                process.returncode = 0
+                supervisor.stop_all()
+        assert supervisor._handles == []
+        assert supervisor._process_records == {}
+        assert not pid_path.exists()
+
+
+def test_windows_prerelease_retry_clears_when_abort_later_succeeds() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+        supervisor = ServiceSupervisor(profile, context)
+
+        class Pipe:
+            def close(self) -> None:
+                return None
+
+        class Process:
+            pid = 5353
+            returncode = None
+
+            def __init__(self) -> None:
+                self.stdin = Pipe()
+                self.attempts = 0
+
+            def poll(self) -> Optional[int]:
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.attempts += 1
+                if self.attempts < 2:
+                    raise OSError("first abort unavailable")
+                self.returncode = 0
+
+            def kill(self) -> None:
+                raise OSError("kill not expected")
+
+            def wait(self, timeout: Optional[float] = None) -> int:
+                if self.returncode is None:
+                    raise subprocess.TimeoutExpired("trampoline", timeout)
+                return self.returncode
+
+        process = Process()
+        handle = ServiceHandle("server", process, root / "server.log")
+        record = _ProcessRecord(handle, process.pid, None, None, False, False)
+        supervisor._handles = [handle]
+        supervisor._handles_by_id[handle.id] = handle
+        supervisor._process_records[handle.id] = record
+        stream = (root / "server.log").open("w", encoding="utf-8")
+        supervisor._log_streams[handle.id] = stream
+        supervisor._write_pid_atomically(handle.id, process.pid)
+        pid_path = context.run_dir / "server.pid"
+
+        with mock.patch("xflow.services.os.name", "nt"):
+            with mock.patch.object(supervisor, "_pid_path", return_value=pid_path):
+                try:
+                    supervisor.stop_all()
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("first pre-release abort must be retained")
+                assert supervisor._handles == [handle]
+                supervisor.stop_all()
+        assert supervisor._handles == []
+        assert supervisor._process_records == {}
+        assert not pid_path.exists()
+        assert stream.closed
+
+
+def test_windows_prerelease_retry_still_retains_when_abort_fails() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+        supervisor = ServiceSupervisor(profile, context)
+
+        class Pipe:
+            def close(self) -> None:
+                return None
+
+        class Process:
+            pid = 5454
+            returncode = None
+
+            def __init__(self) -> None:
+                self.stdin = Pipe()
+
+            def poll(self) -> Optional[int]:
+                return None
+
+            def terminate(self) -> None:
+                raise OSError("terminate unavailable")
+
+            def kill(self) -> None:
+                raise OSError("kill unavailable")
+
+            def wait(self, timeout: Optional[float] = None) -> int:
+                raise subprocess.TimeoutExpired("trampoline", timeout)
+
+        process = Process()
+        handle = ServiceHandle("server", process, root / "server.log")
+        record = _ProcessRecord(handle, process.pid, None, None, False, False)
+        supervisor._handles = [handle]
+        supervisor._handles_by_id[handle.id] = handle
+        supervisor._process_records[handle.id] = record
+        stream = (root / "server.log").open("w", encoding="utf-8")
+        supervisor._log_streams[handle.id] = stream
+        supervisor._write_pid_atomically(handle.id, process.pid)
+        pid_path = context.run_dir / "server.pid"
+
+        with mock.patch("xflow.services.os.name", "nt"):
+            with mock.patch.object(supervisor, "_pid_path", return_value=pid_path):
+                for _ in range(2):
+                    try:
+                        supervisor.stop_all()
+                    except ValueError as exc:
+                        assert "server" in str(exc)
+                    else:
+                        raise AssertionError("failed pre-release abort must remain owned")
+                assert supervisor._handles == [handle]
+                assert supervisor._process_records[handle.id].business_released is False
+                assert pid_path.exists()
+        assert stream.closed
+
+
+def test_windows_released_unknown_tree_still_rejects_cleanup() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        supervisor = ServiceSupervisor(profile, _context(root))
+
+        class Process:
+            pid = 5555
+            returncode = 0
+
+            def poll(self) -> Optional[int]:
+                return self.returncode
+
+            def wait(self, timeout: Optional[float] = None) -> int:
+                return self.returncode
+
+        handle = ServiceHandle("server", Process(), root / "server.log")
+        record = _ProcessRecord(handle, handle.process.pid, None, None, False, True)
+        with mock.patch("xflow.services.os.name", "nt"):
+            try:
+                supervisor._terminate(record)
+            except ValueError as exc:
+                assert "owned tree unknown" in str(exc)
+            else:
+                raise AssertionError("released unknown tree must not be weakened")
 
 
 def test_windows_failed_tree_cleanup_retains_ownership_for_retry() -> None:
@@ -1166,7 +1378,7 @@ def test_windows_failed_tree_cleanup_retains_ownership_for_retry() -> None:
         process = Process()
         job = Job()
         handle = ServiceHandle("server", process, root / "server.log")
-        record = _ProcessRecord(handle, 4242, None, job, True)
+        record = _ProcessRecord(handle, 4242, None, job, True, True)
         supervisor._handles = [handle]
         supervisor._handles_by_id[handle.id] = handle
         supervisor._process_records[handle.id] = record
@@ -1225,7 +1437,7 @@ def test_windows_final_live_leader_is_controlled_failure() -> None:
                 raise subprocess.TimeoutExpired(["fixture"], timeout or 0)
 
         handle = ServiceHandle("server", Process(), root / "server.log")
-        record = _ProcessRecord(handle, 4242, None, object(), True)
+        record = _ProcessRecord(handle, 4242, None, object(), True, True)
         with mock.patch("xflow.services.os.name", "nt"):
             with mock.patch.object(supervisor, "_windows_job_terminate", return_value=True):
                 with mock.patch.object(
@@ -1269,8 +1481,8 @@ def test_windows_failed_handle_does_not_block_other_cleanup() -> None:
         supervisor._handles_by_id.update({"server": server, "web": web})
         supervisor._process_records.update(
             {
-                "server": _ProcessRecord(server, 4242, None, server_job, True),
-                "web": _ProcessRecord(web, 4243, None, web_job, True),
+                "server": _ProcessRecord(server, 4242, None, server_job, True, True),
+                "web": _ProcessRecord(web, 4243, None, web_job, True, True),
             }
         )
         server_stream = (root / "server.log").open("w", encoding="utf-8")
@@ -1337,6 +1549,10 @@ def main() -> None:
         test_windows_spawn_ack_timeout_is_controlled_and_cleans_process,
         test_windows_spawn_error_ack_is_synchronous_start_failure,
         test_windows_abort_failure_retains_live_trampoline_ownership,
+        test_windows_prerelease_retry_clears_after_trampoline_exits,
+        test_windows_prerelease_retry_clears_when_abort_later_succeeds,
+        test_windows_prerelease_retry_still_retains_when_abort_fails,
+        test_windows_released_unknown_tree_still_rejects_cleanup,
         test_windows_failed_tree_cleanup_retains_ownership_for_retry,
         test_windows_final_live_leader_is_controlled_failure,
         test_windows_failed_handle_does_not_block_other_cleanup,

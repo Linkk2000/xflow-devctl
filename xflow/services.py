@@ -45,6 +45,10 @@ class _ProcessRecord:
     group_id: Optional[int]
     windows_job: Optional[object] = None
     windows_tree_known: bool = False
+    # The conservative default is pre-release.  Callers that adopt an already
+    # running handle must explicitly mark it released; the spawn gate flips
+    # this only after the payload has been released to the assigned trampoline.
+    business_released: bool = False
 
 
 class _TerminationFailure(ValueError):
@@ -421,7 +425,11 @@ class ServiceSupervisor:
             return None
 
     def _process_record(
-        self, handle: ServiceHandle, *, attach_job: bool = False
+        self,
+        handle: ServiceHandle,
+        *,
+        attach_job: bool = False,
+        business_released: bool = True,
     ) -> _ProcessRecord:
         group_id: Optional[int] = None
         if os.name != "nt":
@@ -450,6 +458,7 @@ class ServiceSupervisor:
             group_id,
             windows_job,
             windows_tree_known,
+            business_released,
         )
 
     def _windows_trampoline_code(self) -> str:
@@ -558,14 +567,6 @@ class ServiceSupervisor:
                 stdin.close()
             except Exception as exc:
                 errors.append(f"stdin close: {type(exc).__name__}")
-        try:
-            process.terminate()
-        except Exception as exc:
-            errors.append(f"terminate: {type(exc).__name__}")
-        try:
-            process.wait(timeout=1.0)
-        except Exception as exc:
-            errors.append(f"wait: {type(exc).__name__}")
         poll = getattr(process, "poll", None)
         if not callable(poll):
             errors.append("poll: unavailable")
@@ -575,6 +576,20 @@ class ServiceSupervisor:
                 alive = poll() is None
             except Exception as exc:
                 errors.append(f"poll: {type(exc).__name__}")
+                alive = True
+        if alive:
+            try:
+                process.terminate()
+            except Exception as exc:
+                errors.append(f"terminate: {type(exc).__name__}")
+            try:
+                process.wait(timeout=1.0)
+            except Exception as exc:
+                errors.append(f"wait: {type(exc).__name__}")
+            try:
+                alive = poll() is None if callable(poll) else True
+            except Exception as exc:
+                errors.append(f"poll after terminate: {type(exc).__name__}")
                 alive = True
         if alive:
             try:
@@ -625,20 +640,18 @@ class ServiceSupervisor:
         log_path: Path,
         stream: Optional[object],
         windows_trampoline: bool,
-        released: bool,
     ) -> Optional[BaseException]:
         if process is None:
             return None
         try:
-            if windows_trampoline and not released:
-                if record is not None and record.windows_tree_known:
-                    stopped = self._terminate(record)
-                    if stopped is False:
-                        raise _TerminationFailure(
-                            f"service {service_id} trampoline cleanup was not confirmed"
-                        )
-                else:
-                    self._abort_windows_trampoline(process)
+            if windows_trampoline and record is not None and not record.business_released:
+                stopped = self._terminate(record)
+                if stopped is False:
+                    raise _TerminationFailure(
+                        f"service {service_id} trampoline cleanup was not confirmed"
+                    )
+            elif windows_trampoline and record is None:
+                self._abort_windows_trampoline(process)
             else:
                 stopped = self._terminate(
                     record or ServiceHandle(service_id, process, log_path)
@@ -677,7 +690,6 @@ class ServiceSupervisor:
         process = None
         record: Optional[_ProcessRecord] = None
         windows_trampoline = os.name == "nt"
-        released = False
         ack_path: Optional[Path] = None
         try:
             if windows_trampoline:
@@ -701,7 +713,9 @@ class ServiceSupervisor:
             kwargs.update(self._session_kwargs())
             process = subprocess.Popen(launch_argv, **kwargs)
             handle = ServiceHandle(service_id, process, log_path)
-            record = self._process_record(handle, attach_job=True)
+            record = self._process_record(
+                handle, attach_job=True, business_released=False
+            )
             if windows_trampoline:
                 if record.windows_job is None or not record.windows_tree_known:
                     raise ValueError(
@@ -710,7 +724,7 @@ class ServiceSupervisor:
                 if ack_path is None:
                     raise ValueError("Windows service ACK path was not prepared")
                 self._release_windows_trampoline(process, argv, cwd_path, ack_path)
-                released = True
+                record = replace(record, business_released=True)
                 self._wait_windows_ack(process, ack_path)
             self._write_pid_atomically(service_id, process.pid)
             self._process_records[service_id] = record
@@ -724,7 +738,6 @@ class ServiceSupervisor:
                 log_path,
                 stream,
                 windows_trampoline,
-                released,
             )
             ack_error: Optional[BaseException] = None
             if ack_path is not None:
@@ -1008,6 +1021,29 @@ class ServiceSupervisor:
         record = self._coerce_record(value)
         process = record.handle.process
         if os.name == "nt":
+            if not record.business_released:
+                # A pre-release trampoline cannot have started the business
+                # executable.  Retry its own abort and confirm the leader;
+                # do not require business-tree ownership that does not exist.
+                self._abort_windows_trampoline(process)
+                if process.poll() is None:
+                    raise _TerminationFailure(
+                        f"service {record.handle.id} termination failed: "
+                        "pre-release trampoline still alive"
+                    )
+                if record.windows_job is not None:
+                    active = self._wait_windows_job_stopped(record.windows_job)
+                    if active is not None and active != 0:
+                        raise _TerminationFailure(
+                            f"service {record.handle.id} termination failed: "
+                            "pre-release job still active"
+                        )
+                    if not self._windows_job_close(record.windows_job):
+                        raise _TerminationFailure(
+                            f"service {record.handle.id} termination failed: "
+                            "pre-release job close failed"
+                        )
+                return True
             job_known = record.windows_job is not None and record.windows_tree_known
             sent = False
             if job_known:
