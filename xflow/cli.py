@@ -34,6 +34,7 @@ from .collaboration import (
     repository_mutation,
 )
 from .env import RuntimeContext, load_env_files, python_version, token_status_lines
+from .io import write_text_lf
 from .dependencies import check_dependencies
 from .migration import apply_issue_workspace_migration, inspect, inspect_issue_workspace_migration, write_wrappers
 from .paths import default_issue_file, normalized_issue, task_state_file
@@ -1270,7 +1271,7 @@ def update_current_task_for_pr(repo_root: Path, issue: str, pr_number: str, pr_u
         lines[section_start + 1 : section_end] = section
     updated = "\n".join(lines).rstrip() + "\n"
     if updated != text:
-        path.write_text(updated, encoding="utf-8", newline="\n")
+        write_text_lf(path, updated)
         return [path]
     return []
 

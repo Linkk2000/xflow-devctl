@@ -13,6 +13,8 @@ import yaml
 OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
+from tests.support import write_text_lf
+
 from xflow.contracts import diff_contracts, load_contract
 
 
@@ -45,7 +47,7 @@ def copied_contract(repo: Path, fixture: str, name: str | None = None) -> Path:
 
 
 def write(path: Path, payload: dict[str, object]) -> None:
-    path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8", newline="\n")
+    write_text_lf(path, yaml.safe_dump(payload, sort_keys=False, allow_unicode=True))
 
 
 def run_devctl(repo_root: Path, *args: str, expect: int) -> subprocess.CompletedProcess[str]:

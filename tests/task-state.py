@@ -20,6 +20,8 @@ import yaml
 OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
+from tests.support import write_text_lf
+
 from xflow import approval, unattended
 from xflow import cli as cli_module
 from xflow import local_artifacts as local_artifacts_module
@@ -62,8 +64,7 @@ def git(repo_root: Path, *args: str) -> None:
 
 
 def write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+    write_text_lf(path, text)
 
 
 def assert_value_error(expected: str, action: object) -> None:
@@ -2251,7 +2252,7 @@ def main() -> None:
         write(legacy, "# XFlow Current Task\n\nIssue: LEGACY7\nState: S5_LOCAL_VERIFICATION\n\n## Allowed Actions\n- verify\n\n## Forbidden Actions\n- push\n")
         assert_value_error("legacy task authority source provenance mismatch", lambda: migrate_legacy_current_task(worktree_a))
         assert migrated_path.read_bytes() == migrated_bytes
-        legacy.write_text("# XFlow Current Task\n\nIssue: ../invalid\n", encoding="utf-8", newline="\n")
+        write_text_lf(legacy, "# XFlow Current Task\n\nIssue: ../invalid\n")
         assert_value_error("current task Issue", lambda: migrate_legacy_current_task(worktree_a))
         assert not (worktree_a / ".xflow" / "issues" / "issue-invalid" / "task-state.md").exists()
         write(legacy, "# XFlow Current Task\n\nIssue: LEGACY7\nState: S2_REMOTE_ISSUE_CREATED\n\n## Allowed Actions\n- clarify-contract\n\n## Forbidden Actions\n- push\n")

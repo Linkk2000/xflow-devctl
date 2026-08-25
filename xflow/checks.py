@@ -5,7 +5,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .io import read_text
+from .io import read_text, write_text_lf
 from .local_artifacts import (
     MAX_IMAGE_EVIDENCE_BYTES,
     MAX_STRUCTURED_EVIDENCE_BYTES,
@@ -680,7 +680,8 @@ def write_pr_state_update_suggestion(repo_root: Path, issue: str, pr_number: str
     path = repo_root / ".xflow" / "issues" / f"issue-{normalized_issue(issue)}" / "state-update-suggestion.md"
     url_line = f"PR URL: {pr_url}\n" if pr_url else ""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    write_text_lf(
+        path,
         f"""# State Update Suggestion
 
 Issue: {normalized_issue(issue)}
@@ -691,9 +692,7 @@ PR: {pr_number}
 - Update `.xflow/current-task.md` to `State: S9_REMOTE_REVIEW_AND_CI`.
 - Record the PR number and URL in the task evidence if needed.
 - Do not create a follow-up PR only to commit this local state note after the PR has already been merged.
-""",
-        encoding="utf-8",
-        newline="\n",
+        """,
     )
     return path
 

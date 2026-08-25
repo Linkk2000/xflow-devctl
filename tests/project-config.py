@@ -13,14 +13,15 @@ from unittest.mock import patch
 OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
+from tests.support import write_text_lf
+
 from xflow import migration
 from xflow.migration import apply_issue_workspace_migration, inspect_issue_workspace_migration
 from xflow.project_config import load_project_config
 
 
 def write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+    write_text_lf(path, text)
 
 
 def write_json(path: Path, payload: dict[str, object]) -> None:

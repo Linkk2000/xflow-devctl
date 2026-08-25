@@ -23,6 +23,8 @@ from PIL import Image
 OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
+from tests.support import write_text_lf
+
 from xflow.checks import check_resolution_report, write_pr_state_update_suggestion
 from xflow import approval as approval_gate
 from xflow import cli as cli_module
@@ -98,8 +100,7 @@ def run_devctl_with_env(repo_root: Path, extra_env: dict[str, str], *args: str, 
 
 
 def write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+    write_text_lf(path, text)
 
 
 def git(repo_root: Path, *args: str) -> None:
@@ -1098,8 +1099,8 @@ def test_env_loading_policy(repo: Path) -> None:
     write(project_env, "XFLOW_PLATFORM=gitee\n")
     env = {"USERPROFILE": str(fake_home), "HOME": str(fake_home), "DEVCTL_REPO_ROOT": str(repo)}
     loaded = load_env_files(env)
-    assert global_env in loaded
-    assert project_env in loaded
+    assert global_env.resolve() in loaded
+    assert project_env.resolve() in loaded
     assert env["GITHUB_TOKEN"] == "global-gh"
     assert env["GITEE_TOKEN"] == "global-ge"
     assert env["XFLOW_PLATFORM"] == "gitee"
@@ -2039,11 +2040,7 @@ def test_python_core_git_and_app_commands(parent: Path) -> None:
         "git-cleanup",
         cleanup_evidence,
     )
-    wrong_cleanup_review.write_text(
-        wrong_cleanup_review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"),
-        encoding="utf-8",
-        newline="\n",
-    )
+    write_text_lf(wrong_cleanup_review, wrong_cleanup_review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"))
     wrong_cleanup = run_devctl(
         work,
         "git",
@@ -2070,11 +2067,7 @@ def test_python_core_git_and_app_commands(parent: Path) -> None:
         f"Suggested Command: devctl git done --force --issue 9 --file "
         f"{cleanup_evidence.relative_to(work).as_posix()}"
     ) in cleanup_review_text
-    cleanup_review.write_text(
-        cleanup_review_text.replace("Approved: no", "Approved: yes"),
-        encoding="utf-8",
-        newline="\n",
-    )
+    write_text_lf(cleanup_review, cleanup_review_text.replace("Approved: no", "Approved: yes"))
     cleanup_status = git_text(work, "status", "--porcelain")
     assert not cleanup_status, cleanup_status
     run_devctl(
@@ -2127,11 +2120,7 @@ def test_git_done_requires_exact_human_cleanup_approval(parent: Path) -> None:
         lambda: approval_gate.prepare(work, "8", "remote-write", evidence),
     )
     wrong_action = approval_gate.prepare(work, "8", "git-push", evidence)
-    wrong_action.write_text(
-        wrong_action.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"),
-        encoding="utf-8",
-        newline="\n",
-    )
+    write_text_lf(wrong_action, wrong_action.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"))
     rejected = run_devctl(
         work,
         "git",
@@ -2151,11 +2140,7 @@ def test_git_done_requires_exact_human_cleanup_approval(parent: Path) -> None:
     exact = approval_gate.prepare(work, "8", "git-cleanup", evidence, force=True)
     exact_text = exact.read_text(encoding="utf-8")
     assert f"Suggested Command: devctl git done --issue 8 --file {evidence.relative_to(work).as_posix()}" in exact_text
-    exact.write_text(
-        exact_text.replace("Approved: no", "Approved: yes"),
-        encoding="utf-8",
-        newline="\n",
-    )
+    write_text_lf(exact, exact_text.replace("Approved: no", "Approved: yes"))
     cleanup_status = git_text(work, "status", "--porcelain")
     assert not cleanup_status, cleanup_status
     run_devctl(
@@ -2182,11 +2167,7 @@ def test_git_done_requires_exact_human_cleanup_approval(parent: Path) -> None:
     git(work, "commit", "-m", "unmerged cleanup fixture", "-q")
     enable(work, "9", "XFLOW_HUMAN_UNATTENDED_ALL")
     unmerged_review = approval_gate.prepare(work, "9", "git-cleanup", unmerged_evidence)
-    unmerged_review.write_text(
-        unmerged_review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"),
-        encoding="utf-8",
-        newline="\n",
-    )
+    write_text_lf(unmerged_review, unmerged_review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"))
     rejected_unmerged = run_devctl(
         work,
         "git",
@@ -2850,7 +2831,7 @@ Closes #1
         env_file = repo / ".xflow" / "local" / "env.local"
         write(env_file, "GITHUB_TOKEN=secret-token-value\nGITEE_TOKEN=other-secret\n")
         preflight = run_devctl_with_env(repo, {"XFLOW_ENV_FILE": str(env_file)}, "preflight")
-        assert f"env_file: {env_file}" in preflight.stdout
+        assert f"env_file: {env_file.resolve()}" in preflight.stdout
         assert "GITHUB_TOKEN=SET" in preflight.stdout
         assert "GITEE_TOKEN=SET" in preflight.stdout
         assert "secret-token-value" not in preflight.stdout
@@ -3274,11 +3255,10 @@ Reason: The gap check now exists.
         assert data["items"][0]["markdown"] == "![pasted-image.png](xflow-attachment://att-001)"
 
         attachment_body = repo / ".xflow" / "issues" / "issue-draft" / "issue-with-attachment.md"
-        attachment_body.write_text(
+        write_text_lf(
+            attachment_body,
             issue_file.read_text(encoding="utf-8")
             + "\n## Attachments\n- ![pasted-image.png](xflow-attachment://att-001)\n",
-            encoding="utf-8",
-            newline="\n",
         )
         run_devctl(repo, "attachment", "check", "--issue", "draft", "--manifest", str(manifest), "--body-file", str(attachment_body))
         run_devctl(repo, "issue", "create", "Attachment gate", "--body-file", str(attachment_body), "--attachments", str(manifest), expect=1)
@@ -3310,7 +3290,7 @@ Reason: The gap check now exists.
         run_devctl(repo, "attachment", "render", "--issue", "draft", "--manifest", str(published_manifest), "--input", str(attachment_body), "--output", str(issue_dir_final_body), expect=1)
 
         local_path_body = final_body.with_name("issue-with-local-path.md")
-        local_path_body.write_text(final_text + "\n![bad](C:\\temp\\bad.png)\n", encoding="utf-8", newline="\n")
+        write_text_lf(local_path_body, final_text + "\n![bad](C:\\temp\\bad.png)\n")
         run_devctl(repo, "attachment", "check", "--issue", "draft", "--manifest", str(published_manifest), "--body-file", str(local_path_body), "--final", expect=1)
 
         run_devctl(
@@ -3606,7 +3586,7 @@ Fail before remote writes when an issue body includes an image attachment.
         auto_image = repo / "auto-image.png"
         auto_image.write_bytes(b"\x89PNG\r\n\x1a\nauto-github-image")
         auto_file = repo / "notes.txt"
-        auto_file.write_text("generic attachment notes\n", encoding="utf-8", newline="\n")
+        write_text_lf(auto_file, "generic attachment notes\n")
         git(repo, "config", "--worktree", "devctl.issue", "draft")
         enable(repo, "draft", "XFLOW_HUMAN_UNATTENDED_ALL")
         auto_manifest = repo / ".xflow" / "issues" / "issue-draft" / "attachments" / "manifest.json"

@@ -20,6 +20,8 @@ import yaml
 OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
+from tests.support import write_text_lf
+
 from xflow import approval
 from xflow import contracts as contracts_module
 from xflow import project_config
@@ -53,8 +55,7 @@ def git(repo_root: Path, *args: str) -> None:
 
 
 def write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+    write_text_lf(path, text)
 
 
 def approve(path: Path) -> None:
@@ -128,7 +129,7 @@ def copied_contract(repo_root: Path, name: str = "contract.yaml") -> Path:
 
 
 def replace(path: Path, old: str, new: str) -> None:
-    path.write_text(path.read_text(encoding="utf-8").replace(old, new), encoding="utf-8", newline="\n")
+    write_text_lf(path, path.read_text(encoding="utf-8").replace(old, new))
 
 
 def configure_contract_root(repo_root: Path) -> None:

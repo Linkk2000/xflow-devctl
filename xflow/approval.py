@@ -17,7 +17,7 @@ import yaml
 
 from .bindings import GitBindings, git_path, resolve_bindings
 from .classification import _decode_classification_bytes, _load_yaml, _read_stable_bytes
-from .io import read_text
+from .io import read_text, write_text_lf
 from .local_artifacts import MAX_TEXT_ARTIFACT_BYTES, StableFileSnapshot, capture_stable_file
 from .paths import (
     active_task_pointer_file,
@@ -481,7 +481,7 @@ def prepare(
         "- If the approved file changes, run `devctl approval prepare` again before remote write.\n"
     )
     review_file.parent.mkdir(parents=True, exist_ok=True)
-    review_file.write_text(text, encoding="utf-8", newline="\n")
+    write_text_lf(review_file, text)
     return review_file
 
 

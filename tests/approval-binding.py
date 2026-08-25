@@ -19,6 +19,8 @@ import yaml
 OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
+from tests.support import write_text_lf
+
 from xflow import approval
 from xflow import cli, providers
 from xflow.bindings import git_path, resolve_bindings
@@ -56,8 +58,7 @@ def run_devctl(repo_root: Path, extra_env: dict[str, str], *args: str, expect: i
 
 
 def write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+    write_text_lf(path, text)
 
 
 def assert_value_error(expected: str, action: object) -> None:
@@ -159,7 +160,7 @@ def activate(repo_root: Path, issue: str) -> None:
 
 
 def approve(path: Path) -> None:
-    path.write_text(path.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"), encoding="utf-8", newline="\n")
+    write_text_lf(path, path.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"))
 
 
 def init_active_repo(root: Path, name: str, issue: str = "202") -> tuple[Path, Path]:
@@ -210,7 +211,7 @@ def test_consumed_record(repo_root: Path, approved_file: Path) -> None:
     assert grant.source == "local-review"
     assert grant.action == "git-push"
     assert grant.approved_sha256 == approval.sha256_file(approved_file)
-    approved_file.write_text("mutated after gate\n", encoding="utf-8", newline="\n")
+    write_text_lf(approved_file, "mutated after gate\n")
     review.write_text(review.read_text(encoding="utf-8").replace("trusted local reviewer", "changed reviewer"), encoding="utf-8")
     record = approval.record_consumed_approval(repo_root, grant, "success")
     text = record.read_text(encoding="utf-8")
@@ -226,7 +227,7 @@ def test_consumed_record(repo_root: Path, approved_file: Path) -> None:
     assert payload["reviewerSummary"] == "trusted local reviewer"
     assert "Approved: yes" not in text
     assert "GITHUB_TOKEN" not in text
-    approved_file.write_text(original_artifact, encoding="utf-8", newline="\n")
+    write_text_lf(approved_file, original_artifact)
     assert_value_error(
         "approval already consumed",
         lambda: approval.require_remote(repo_root, "git-push", approved_file, "202"),
@@ -1321,11 +1322,10 @@ def test_mr_replay_completes_partial_current_task_fields(repo_root: Path, approv
 
     def write_partial_task(root: Path, issue: str, number: str, _url: str) -> list[Path]:
         path = root / ".xflow" / "current-task.md"
-        path.write_text(
+        write_text_lf(
+            path,
             f"# XFlow Current Task\n\nIssue: {issue}\nState: S9_REMOTE_REVIEW_AND_CI\n\n"
             f"## Remote Review\nPR: {number}\n",
-            encoding="utf-8",
-            newline="\n",
         )
         raise RuntimeError("injected failure after partial current-task metadata")
 

@@ -11,6 +11,8 @@ from pathlib import Path
 OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
+from tests.support import write_text_lf
+
 from xflow import approval as approval_gate
 from xflow.cli import build_parser
 
@@ -29,8 +31,7 @@ def git(repo_root: Path, *args: str) -> None:
 
 
 def write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+    write_text_lf(path, text)
 
 
 def approval(repo_root: Path, issue: str, action: str, approved_file: Path) -> None:
@@ -42,11 +43,7 @@ def approval(repo_root: Path, issue: str, action: str, approved_file: Path) -> N
         reviewer="user",
         force=True,
     )
-    review.write_text(
-        review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"),
-        encoding="utf-8",
-        newline="\n",
-    )
+    write_text_lf(review, review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"))
 
 
 def run_devctl(repo_root: Path, *args: str, expect: int = 0) -> subprocess.CompletedProcess[str]:

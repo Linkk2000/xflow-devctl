@@ -9,6 +9,8 @@ from pathlib import Path
 OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
+from tests.support import write_text_lf
+
 from xflow.bindings import resolve_bindings
 
 
@@ -27,7 +29,7 @@ def init_repo(repo_root: Path) -> None:
     git(repo_root, "config", "user.email", "test@example.com")
     git(repo_root, "config", "user.name", "Test User")
     git(repo_root, "checkout", "-b", "feature/101-a", "-q")
-    (repo_root / "README.md").write_text("# Demo\n", encoding="utf-8", newline="\n")
+    write_text_lf(repo_root / "README.md", "# Demo\n")
     git(repo_root, "add", "README.md")
     git(repo_root, "commit", "-m", "init", "-q")
 

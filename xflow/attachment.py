@@ -10,7 +10,7 @@ from typing import Mapping
 from urllib.parse import urlparse
 
 from . import object_storage, providers
-from .io import read_text
+from .io import read_text, write_text_lf
 from .paths import normalized_issue
 
 
@@ -87,7 +87,7 @@ def load_manifest(path: Path, issue: str | None = None) -> dict[str, object]:
 
 def write_manifest(path: Path, data: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+    write_text_lf(path, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
 
 def write_published_manifest(repo_root: Path, issue: str, source_manifest: Path, data: dict[str, object]) -> Path:
@@ -445,7 +445,7 @@ def append_markdown_to_body(repo_root: Path, body_file: Path, markdown_items: li
         text = f"{text}\n\n## Attachments\n{bullet_lines}\n"
     else:
         text = f"{text}\n"
-    output.write_text(text, encoding="utf-8", newline="\n")
+    write_text_lf(output, text)
     return output
 
 
@@ -467,7 +467,7 @@ def render_body(repo_root: Path, issue: str, manifest_path: Path, input_path: Pa
     else:
         raise ValueError("rendered remote bodies must stay outside .xflow/issues; use .xflow/publish/issues/issue-<id>")
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(text, encoding="utf-8", newline="\n")
+    write_text_lf(output, text)
     return output
 
 

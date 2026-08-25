@@ -19,6 +19,8 @@ from PIL import Image
 OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
+from tests.support import write_text_lf
+
 from xflow import approval, dependencies as dependencies_module, traceability as traceability_module
 from xflow.bindings import git_path, resolve_bindings
 from xflow.checks import check_resolution_report
@@ -42,8 +44,7 @@ def git(repo: Path, *args: str) -> None:
 
 
 def write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+    write_text_lf(path, text)
 
 
 def write_bytes(path: Path, content: bytes) -> None:

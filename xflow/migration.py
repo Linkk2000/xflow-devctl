@@ -23,6 +23,7 @@ from .commit_message import (
     UNC_OR_DEVICE_PATH_RE,
     WINDOWS_ABSOLUTE_PATH_RE,
 )
+from .io import write_text_lf
 from .project_config import ProjectConfig, _is_reparse_point, parse_project_config, require_safe_repo_path
 
 
@@ -1517,6 +1518,6 @@ def write_wrappers(repo_root: Path) -> list[Path]:
     written: list[Path] = []
     for name, content in wrapper_files().items():
         path = repo_root / name
-        path.write_text(content, encoding="utf-8", newline="\n")
+        write_text_lf(path, content)
         written.append(path)
     return written

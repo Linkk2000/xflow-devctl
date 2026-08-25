@@ -11,6 +11,8 @@ from pathlib import Path
 OPS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(OPS_ROOT))
 
+from tests.support import write_text_lf
+
 from xflow.classification import check_classification
 from xflow import classification as classification_module
 
@@ -55,8 +57,7 @@ decisionSource: ai-proposed
 
 
 def write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8", newline="\n")
+    write_text_lf(path, text)
 
 
 def assert_value_error(expected: str, callback: object) -> None:

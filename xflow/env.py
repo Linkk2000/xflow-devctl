@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, MutableMapping
 
+from .io import canonical_path
+
 
 TOKEN_NAMES = ("GITHUB_TOKEN", "GITHUB_ACCESS_TOKEN", "GITHUB_PRIVATE_TOKEN", "GITEE_TOKEN", "GITEE_ACCESS_TOKEN", "GITEE_PRIVATE_TOKEN")
 PROJECT_SCOPED_KEYS = {"XFLOW_PLATFORM"}
@@ -20,8 +22,8 @@ class RuntimeContext:
     @classmethod
     def from_env(cls, tool_root: Path, env: Mapping[str, str]) -> "RuntimeContext":
         return cls(
-            tool_root=tool_root.resolve(),
-            repo_root=Path(env.get("DEVCTL_REPO_ROOT", Path.cwd())).resolve(),
+            tool_root=canonical_path(tool_root),
+            repo_root=canonical_path(Path(env.get("DEVCTL_REPO_ROOT", Path.cwd()))),
             product_line=env.get("DEVCTL_PRODUCT_LINE", ""),
         )
 
@@ -55,12 +57,12 @@ def home_from_env(env: Mapping[str, str]) -> Path:
     for name in ("HOME", "USERPROFILE"):
         value = env.get(name, "").strip()
         if value:
-            return Path(value)
-    return Path.home()
+            return canonical_path(Path(value))
+    return canonical_path(Path.home())
 
 
 def repo_root_from_env(env: Mapping[str, str]) -> Path:
-    return Path(env.get("DEVCTL_REPO_ROOT", Path.cwd())).resolve()
+    return canonical_path(Path(env.get("DEVCTL_REPO_ROOT", Path.cwd())))
 
 
 def env_file_candidates(env: Mapping[str, str]) -> list[tuple[Path, str]]:
@@ -73,7 +75,7 @@ def env_file_candidates(env: Mapping[str, str]) -> list[tuple[Path, str]]:
     ]
     explicit = env.get("XFLOW_ENV_FILE", "").strip()
     if explicit:
-        candidates.append((Path(explicit), "explicit"))
+        candidates.append((canonical_path(Path(explicit)), "explicit"))
     return candidates
 
 
@@ -83,7 +85,7 @@ def load_env_files(env: MutableMapping[str, str]) -> list[Path]:
     loaded: list[Path] = []
 
     for path, scope in env_file_candidates(env):
-        expanded = path.expanduser()
+        expanded = canonical_path(path)
         if not expanded.is_file():
             continue
         values = parse_env_file(expanded)
