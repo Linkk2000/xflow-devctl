@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import signal
 import subprocess
@@ -104,15 +105,47 @@ class _WindowsJob:
 
 
 _WINDOWS_TRAMPOLINE_CODE = (
-    "import subprocess,sys\n"
-    "if len(sys.argv) < 3 or sys.argv[1] != '--': raise SystemExit(125)\n"
-    "if sys.stdin.read(1) != '1': raise SystemExit(125)\n"
+    # ``sys`` is frozen in supported CPython builds.  It is the only module
+    # touched before the release line, so a cwd-local module, PYTHONPATH, or
+    # sitecustomize cannot run before Job assignment.
+    "import sys\n"
+    "_input = sys.stdin.buffer\n"
+    "if _input.readline().strip() != b'1': raise SystemExit(125)\n"
+    "_ack_path = None\n"
+    "_write_ack = None\n"
     "try:\n"
-    "    child = subprocess.Popen(sys.argv[2:], shell=False)\n"
-    "    code = child.wait()\n"
-    "except Exception:\n"
+    "    import json\n"
+    "    import os\n"
+    "    import subprocess\n"
+    "    payload = json.loads(_input.readline().decode('utf-8'))\n"
+    "    _ack_path = str(payload['ack'])\n"
+    "    def _write_ack(value):\n"
+    "        temporary = _ack_path + '.tmp'\n"
+    "        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n"
+    "        try:\n"
+    "            with os.fdopen(descriptor, 'w', encoding='ascii') as stream:\n"
+    "                stream.write(value)\n"
+    "            os.replace(temporary, _ack_path)\n"
+    "        except BaseException:\n"
+    "            try: os.close(descriptor)\n"
+    "            except BaseException: pass\n"
+    "            try: os.unlink(temporary)\n"
+    "            except OSError: pass\n"
+    "            raise\n"
+    "    child = subprocess.Popen(payload['argv'], cwd=str(payload['cwd']), shell=False)\n"
+    "    try:\n"
+    "        _write_ack('ready')\n"
+    "    except BaseException:\n"
+    "        try: child.terminate()\n"
+    "        except BaseException: pass\n"
+    "        raise\n"
+    "    _exit_code = int(child.wait())\n"
+    "except BaseException:\n"
+    "    if _write_ack is not None:\n"
+    "        try: _write_ack('error')\n"
+    "        except BaseException: pass\n"
     "    raise SystemExit(126)\n"
-    "raise SystemExit(int(code))\n"
+    "raise SystemExit(_exit_code)\n"
 )
 
 
@@ -422,20 +455,54 @@ class ServiceSupervisor:
     def _windows_trampoline_code(self) -> str:
         return _WINDOWS_TRAMPOLINE_CODE
 
-    def _windows_trampoline_argv(self, argv: Sequence[str]) -> List[str]:
+    def _windows_trampoline_argv(self) -> List[str]:
         return [
             str(self.context.python_executable),
+            "-I",
+            "-S",
             "-c",
             self._windows_trampoline_code(),
-            "--",
-        ] + [str(argument) for argument in argv]
+        ]
 
-    def _release_windows_trampoline(self, process: object) -> None:
+    def _windows_ack_path(self, service_id: str) -> Path:
+        return self._run_dir() / (service_id + ".ack")
+
+    def _clear_windows_ack(self, ack_path: Path) -> None:
+        for path in (ack_path, Path(str(ack_path) + ".tmp")):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise ValueError(f"cannot clear Windows service ACK {path}") from exc
+
+    def _cleanup_windows_ack(self, ack_path: Path) -> None:
+        errors: List[str] = []
+        for path in (ack_path, Path(str(ack_path) + ".tmp")):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                errors.append(f"{path}: {type(exc).__name__}")
+        if errors:
+            raise ValueError("Windows service ACK cleanup failed: " + ", ".join(errors))
+
+    def _windows_ack_timeout(self) -> float:
+        return 2.0
+
+    def _release_windows_trampoline(
+        self, process: object, argv: Sequence[str], cwd: Path, ack_path: Path
+    ) -> None:
         stdin = getattr(process, "stdin", None)
         if stdin is None:
             raise ValueError("Windows service trampoline has no release channel")
+        payload = json.dumps(
+            {"argv": [str(argument) for argument in argv], "cwd": str(cwd), "ack": str(ack_path)},
+            separators=(",", ":"),
+        )
         try:
-            stdin.write("1")
+            stdin.write("1\n" + payload + "\n")
             stdin.flush()
         finally:
             try:
@@ -443,30 +510,152 @@ class ServiceSupervisor:
             except Exception:
                 pass
 
+    def _wait_windows_ack(self, process: object, ack_path: Path) -> None:
+        deadline = time.monotonic() + float(self._windows_ack_timeout())
+        try:
+            while True:
+                if ack_path.exists():
+                    if time.monotonic() >= deadline:
+                        raise ValueError(
+                            f"Windows service {ack_path.stem} business ACK timed out"
+                        )
+                    try:
+                        status = ack_path.read_text(encoding="ascii").strip()
+                    except OSError as exc:
+                        raise ValueError(
+                            f"Windows service ACK for {ack_path.stem} is unreadable"
+                        ) from exc
+                    if status == "ready":
+                        return
+                    if status == "error":
+                        raise ValueError(
+                            f"Windows service {ack_path.stem} executable failed before ACK"
+                        )
+                    raise ValueError(
+                        f"Windows service {ack_path.stem} returned an invalid ACK"
+                    )
+                poll = getattr(process, "poll", None)
+                if not callable(poll):
+                    raise ValueError("Windows service trampoline has no poll channel")
+                if poll() is not None:
+                    raise ValueError(
+                        f"Windows service {ack_path.stem} exited before business ACK"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ValueError(
+                        f"Windows service {ack_path.stem} business ACK timed out"
+                    )
+                time.sleep(min(0.01, remaining))
+        finally:
+            self._cleanup_windows_ack(ack_path)
+
     def _abort_windows_trampoline(self, process: object) -> None:
+        errors: List[str] = []
         stdin = getattr(process, "stdin", None)
         if stdin is not None:
             try:
                 stdin.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(f"stdin close: {type(exc).__name__}")
         try:
             process.terminate()
-        except (OSError, AttributeError):
-            pass
+        except Exception as exc:
+            errors.append(f"terminate: {type(exc).__name__}")
         try:
             process.wait(timeout=1.0)
-        except (subprocess.TimeoutExpired, OSError, AttributeError):
-            pass
-        if getattr(process, "poll", lambda: None)() is None:
+        except Exception as exc:
+            errors.append(f"wait: {type(exc).__name__}")
+        poll = getattr(process, "poll", None)
+        if not callable(poll):
+            errors.append("poll: unavailable")
+            alive = True
+        else:
+            try:
+                alive = poll() is None
+            except Exception as exc:
+                errors.append(f"poll: {type(exc).__name__}")
+                alive = True
+        if alive:
             try:
                 process.kill()
-            except (OSError, AttributeError):
-                pass
+            except Exception as exc:
+                errors.append(f"kill: {type(exc).__name__}")
             try:
                 process.wait(timeout=1.0)
-            except (subprocess.TimeoutExpired, OSError, AttributeError):
-                pass
+            except Exception as exc:
+                errors.append(f"kill wait: {type(exc).__name__}")
+        try:
+            still_alive = poll() is None if callable(poll) else True
+        except Exception as exc:
+            errors.append(f"final poll: {type(exc).__name__}")
+            still_alive = True
+        if still_alive:
+            errors.append("process still alive")
+        if errors:
+            raise _TerminationFailure(
+                "Windows service trampoline cleanup failed: " + "; ".join(errors)
+            )
+
+    def _retain_failed_spawn(
+        self,
+        service_id: str,
+        record: _ProcessRecord,
+        stream: Optional[object],
+    ) -> Optional[BaseException]:
+        """Keep unresolved ownership available for a later stop/retry."""
+
+        self._process_records[service_id] = record
+        if service_id not in self._handles_by_id:
+            self._handles.append(record.handle)
+            self._handles_by_id[service_id] = record.handle
+        if stream is not None:
+            self._log_streams[service_id] = stream
+        try:
+            self._write_pid_atomically(service_id, record.pid)
+        except BaseException as exc:
+            return exc
+        return None
+
+    def _cleanup_failed_spawn(
+        self,
+        service_id: str,
+        process: Optional[object],
+        record: Optional[_ProcessRecord],
+        log_path: Path,
+        stream: Optional[object],
+        windows_trampoline: bool,
+        released: bool,
+    ) -> Optional[BaseException]:
+        if process is None:
+            return None
+        try:
+            if windows_trampoline and not released:
+                if record is not None and record.windows_tree_known:
+                    stopped = self._terminate(record)
+                    if stopped is False:
+                        raise _TerminationFailure(
+                            f"service {service_id} trampoline cleanup was not confirmed"
+                        )
+                else:
+                    self._abort_windows_trampoline(process)
+            else:
+                stopped = self._terminate(
+                    record or ServiceHandle(service_id, process, log_path)
+                )
+                if stopped is False:
+                    raise _TerminationFailure(
+                        f"service {service_id} cleanup was not confirmed"
+                    )
+        except BaseException as exc:
+            if record is not None:
+                retention_error = self._retain_failed_spawn(service_id, record, stream)
+                if retention_error is not None:
+                    return ValueError(
+                        f"{exc}; ownership retention failed: {retention_error}"
+                    )
+            return exc
+        return None
 
     def _spawn(
         self,
@@ -489,13 +678,17 @@ class ServiceSupervisor:
         record: Optional[_ProcessRecord] = None
         windows_trampoline = os.name == "nt"
         released = False
+        ack_path: Optional[Path] = None
         try:
+            if windows_trampoline:
+                ack_path = self._windows_ack_path(service_id)
+                self._clear_windows_ack(ack_path)
             stream = log_path.open("a", encoding="utf-8")
             launch_argv = (
-                self._windows_trampoline_argv(argv) if windows_trampoline else list(argv)
+                self._windows_trampoline_argv() if windows_trampoline else list(argv)
             )
             kwargs = {
-                "cwd": str(cwd_path),
+                "cwd": str(self._run_dir() if windows_trampoline else cwd_path),
                 "env": dict(child_env),
                 "stdout": stream,
                 "stderr": subprocess.STDOUT,
@@ -514,56 +707,51 @@ class ServiceSupervisor:
                     raise ValueError(
                         f"Windows Job Object ownership unavailable for service {service_id}"
                     )
-                self._release_windows_trampoline(process)
+                if ack_path is None:
+                    raise ValueError("Windows service ACK path was not prepared")
+                self._release_windows_trampoline(process, argv, cwd_path, ack_path)
                 released = True
+                self._wait_windows_ack(process, ack_path)
             self._write_pid_atomically(service_id, process.pid)
             self._process_records[service_id] = record
             self._log_streams[service_id] = stream
             return handle
-        except FileNotFoundError as exc:
-            try:
-                if process is not None:
-                    if windows_trampoline and not released:
-                        if record is not None and record.windows_tree_known:
-                            self._terminate(record)
-                        else:
-                            self._abort_windows_trampoline(process)
-                    else:
-                        self._terminate(record or ServiceHandle(service_id, process, log_path))
-            finally:
-                if stream is not None:
+        except BaseException as exc:
+            cleanup_error = self._cleanup_failed_spawn(
+                service_id,
+                process,
+                record,
+                log_path,
+                stream,
+                windows_trampoline,
+                released,
+            )
+            ack_error: Optional[BaseException] = None
+            if ack_path is not None:
+                try:
+                    self._cleanup_windows_ack(ack_path)
+                except BaseException as cleanup_exc:
+                    ack_error = cleanup_exc
+            stream_error: Optional[BaseException] = None
+            if stream is not None:
+                try:
                     stream.close()
-            raise ValueError(f"executable for service {service_id} was not found") from exc
-        except PermissionError as exc:
-            try:
-                if process is not None:
-                    if windows_trampoline and not released:
-                        if record is not None and record.windows_tree_known:
-                            self._terminate(record)
-                        else:
-                            self._abort_windows_trampoline(process)
-                    else:
-                        self._terminate(record or ServiceHandle(service_id, process, log_path))
-            finally:
-                if stream is not None:
-                    stream.close()
-            raise ValueError(f"executable for service {service_id} is not permitted") from exc
-        except BaseException:
-            try:
-                if process is not None:
-                    tracked = self._process_records.get(service_id)
-                    if windows_trampoline and not released:
-                        if record is not None and record.windows_tree_known:
-                            self._terminate(record)
-                        else:
-                            self._abort_windows_trampoline(process)
-                    else:
-                        self._terminate(
-                            tracked or record or ServiceHandle(service_id, process, log_path)
-                        )
-            finally:
-                if stream is not None:
-                    stream.close()
+                except BaseException as close_exc:
+                    stream_error = close_exc
+            errors = [error for error in (cleanup_error, ack_error, stream_error) if error]
+            if errors:
+                detail = "; ".join(str(error) or type(error).__name__ for error in errors)
+                raise ValueError(
+                    f"service {service_id} startup failed: {exc}; cleanup failed: {detail}"
+                ) from exc
+            if isinstance(exc, FileNotFoundError):
+                raise ValueError(
+                    f"executable for service {service_id} was not found"
+                ) from exc
+            if isinstance(exc, PermissionError):
+                raise ValueError(
+                    f"executable for service {service_id} is not permitted"
+                ) from exc
             raise
 
     def _check_early_exit(self, handle: ServiceHandle) -> None:

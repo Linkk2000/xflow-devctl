@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -706,40 +707,58 @@ def test_windows_trampoline_waits_before_business_execution() -> None:
         root = Path(raw).resolve()
         profile = _profile(root)
         supervisor = ServiceSupervisor(profile, _context(root))
+        neutral = root / "neutral"
+        neutral.mkdir()
+        cwd = root / "business-cwd"
+        cwd.mkdir()
         marker = root / "business.marker"
+        local_module_marker = root / "local-module.marker"
+        local_module = (
+            "from pathlib import Path; "
+            f"Path({str(local_module_marker)!r}).write_text('imported', encoding='utf-8')"
+        )
+        (neutral / "subprocess.py").write_text(local_module, encoding="utf-8")
+        (neutral / "sitecustomize.py").write_text(local_module, encoding="utf-8")
         business_code = (
             "from pathlib import Path; "
             f"Path({str(marker)!r}).write_text('executed', encoding='utf-8')"
         )
         command = [sys.executable, "-c", business_code]
+        ack = root / "business.ack"
+        payload = json.dumps(
+            {"argv": command, "cwd": str(cwd), "ack": str(ack)},
+            separators=(",", ":"),
+        )
+        environment = dict(os.environ)
+        environment["PYTHONPATH"] = str(neutral)
         process = subprocess.Popen(
-            [
-                sys.executable,
-                "-c",
-                supervisor._windows_trampoline_code(),
-                "--",
-            ]
-            + command,
-            cwd=str(root),
+            supervisor._windows_trampoline_argv(),
+            cwd=str(neutral),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=environment,
             text=True,
             shell=False,
         )
         try:
             time.sleep(0.05)
+            assert not local_module_marker.exists()
             assert not marker.exists()
             assert process.stdin is not None
-            process.stdin.write("1")
+            process.stdin.write("1\n" + payload + "\n")
             process.stdin.flush()
             process.stdin.close()
             assert process.wait(timeout=5) == 0
             assert marker.read_text(encoding="utf-8") == "executed"
+            assert ack.read_text(encoding="utf-8") == "ready"
+            assert "executed" not in ack.read_text(encoding="utf-8")
         finally:
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=2)
+            if ack.exists():
+                ack.unlink()
             if process.stdout is not None:
                 process.stdout.close()
             if process.stderr is not None:
@@ -756,16 +775,25 @@ def test_windows_spawn_assigns_before_release_and_business_state() -> None:
         state = {"business_executed": False}
 
         class Pipe:
+            def __init__(self) -> None:
+                self.closed = False
+                self.payload = None
+
             def write(self, value: str) -> int:
-                assert value == "1"
-                events.append("release_written")
-                return 1
+                assert value.startswith("1\n")
+                self.payload = json.loads(value.splitlines()[1])
+                events.append("payload_release")
+                return len(value)
 
             def flush(self) -> None:
-                events.append("release_flushed")
+                assert self.payload is not None
+                events.append("business_popen")
+                type(root)(self.payload["ack"]).write_text("ready", encoding="ascii")
+                events.append("ack_written")
                 state["business_executed"] = True
 
             def close(self) -> None:
+                self.closed = True
                 events.append("release_closed")
 
         class Process:
@@ -783,13 +811,12 @@ def test_windows_spawn_assigns_before_release_and_business_state() -> None:
 
         def popen(argv: Sequence[str], **kwargs: object) -> Process:
             events.append("trampoline_started")
-            assert "--" in argv
-            marker = argv.index("--")
-            assert list(argv[marker + 1 :]) == list(
-                (sys.executable, str(root / "fixture-process.py"), "service", "server")
-            )
+            assert list(argv[:2]) == [sys.executable, "-I"]
+            assert argv[2] == "-S"
+            assert "--" not in argv
             assert kwargs["stdin"] == subprocess.PIPE
             assert kwargs["shell"] is False
+            assert kwargs["cwd"] == str(context.run_dir)
             return process
 
         def assign(_process: object) -> object:
@@ -801,18 +828,25 @@ def test_windows_spawn_assigns_before_release_and_business_state() -> None:
             with mock.patch("xflow.services.Path", type(root)):
                 with mock.patch("xflow.services.subprocess.Popen", side_effect=popen):
                     with mock.patch.object(supervisor, "_windows_create_job", side_effect=assign):
-                        with mock.patch.object(supervisor, "_write_pid_atomically") as write_pid:
+                        with mock.patch.object(
+                            supervisor,
+                            "_write_pid_atomically",
+                            side_effect=lambda _service_id, _pid: events.append("pid_written"),
+                        ) as write_pid:
                             handle = supervisor._spawn("server", command, root / "server.log")
                             assert handle.process is process
                             assert write_pid.called
         assert events == [
             "trampoline_started",
             "job_assigned",
-            "release_written",
-            "release_flushed",
+            "payload_release",
+            "business_popen",
+            "ack_written",
             "release_closed",
+            "pid_written",
         ]
         assert state["business_executed"] is True
+        assert not (context.run_dir / "server.ack").exists()
         supervisor._log_streams["server"].close()
 
 
@@ -881,6 +915,231 @@ def test_windows_spawn_assignment_failure_never_releases_business() -> None:
         assert process.stdin.closed is True
         assert process.returncode is not None
         assert not write_pid.called
+
+
+def test_windows_trampoline_missing_executable_reports_failure_ack() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        supervisor = ServiceSupervisor(profile, _context(root))
+        ack = root / "missing.ack"
+        process = subprocess.Popen(
+            supervisor._windows_trampoline_argv(),
+            cwd=str(root),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=False,
+        )
+        payload = json.dumps(
+            {
+                "argv": [str(root / "does-not-exist")],
+                "cwd": str(root),
+                "ack": str(ack),
+            },
+            separators=(",", ":"),
+        )
+        try:
+            assert process.stdin is not None
+            process.stdin.write("1\n" + payload + "\n")
+            process.stdin.flush()
+            process.stdin.close()
+            assert process.wait(timeout=5) == 126
+            assert ack.read_text(encoding="ascii") == "error"
+            assert "does-not-exist" not in ack.read_text(encoding="ascii")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            if ack.exists():
+                ack.unlink()
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+
+
+def test_windows_spawn_ack_timeout_is_controlled_and_cleans_process() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+        supervisor = ServiceSupervisor(profile, context)
+
+        class Pipe:
+            def write(self, _value: str) -> int:
+                return 1
+
+            def flush(self) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        class Process:
+            pid = 4242
+            returncode = None
+
+            def __init__(self) -> None:
+                self.stdin = Pipe()
+
+            def poll(self) -> Optional[int]:
+                return self.returncode
+
+            def wait(self, timeout: Optional[float] = None) -> int:
+                return int(self.returncode or 0)
+
+            def terminate(self) -> None:
+                self.returncode = 143
+
+            def kill(self) -> None:
+                self.returncode = 137
+
+        process = Process()
+        with mock.patch("xflow.services.os.name", "nt"):
+            with mock.patch("xflow.services.Path", type(root)):
+                with mock.patch("xflow.services.subprocess.Popen", return_value=process):
+                    with mock.patch.object(
+                        supervisor, "_windows_create_job", return_value=object()
+                    ):
+                        with mock.patch.object(
+                            supervisor, "_windows_ack_timeout", return_value=0.01
+                        ):
+                            with mock.patch.object(
+                                supervisor, "_terminate", return_value=True
+                            ) as terminate:
+                                with mock.patch.object(
+                                    supervisor, "_write_pid_atomically"
+                                ) as write_pid:
+                                    try:
+                                        supervisor._spawn(
+                                            "server",
+                                            profile.services["server"].command,
+                                            root / "server.log",
+                                        )
+                                    except ValueError as exc:
+                                        assert "ack" in str(exc).lower()
+                                    else:
+                                        raise AssertionError("ACK timeout must fail startup")
+        assert terminate.called
+        assert not write_pid.called
+        assert not (context.run_dir / "server.ack").exists()
+        assert supervisor._log_streams == {}
+
+
+def test_windows_spawn_error_ack_is_synchronous_start_failure() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+        supervisor = ServiceSupervisor(profile, context)
+
+        class Pipe:
+            def __init__(self) -> None:
+                self.payload = None
+
+            def write(self, value: str) -> int:
+                self.payload = json.loads(value.splitlines()[1])
+                return len(value)
+
+            def flush(self) -> None:
+                assert self.payload is not None
+                type(root)(self.payload["ack"]).write_text("error", encoding="ascii")
+
+            def close(self) -> None:
+                return None
+
+        class Process:
+            pid = 4343
+            returncode = None
+
+            def __init__(self) -> None:
+                self.stdin = Pipe()
+
+            def poll(self) -> Optional[int]:
+                return self.returncode
+
+        process = Process()
+        with mock.patch("xflow.services.os.name", "nt"):
+            with mock.patch("xflow.services.Path", type(root)):
+                with mock.patch("xflow.services.subprocess.Popen", return_value=process):
+                    with mock.patch.object(
+                        supervisor, "_windows_create_job", return_value=object()
+                    ):
+                        with mock.patch.object(
+                            supervisor, "_terminate", return_value=True
+                        ) as terminate:
+                            with mock.patch.object(
+                                supervisor, "_write_pid_atomically"
+                            ) as write_pid:
+                                try:
+                                    supervisor._spawn(
+                                        "server",
+                                        profile.services["server"].command,
+                                        root / "server.log",
+                                    )
+                                except ValueError as exc:
+                                    assert "executable failed before ack" in str(exc).lower()
+                                else:
+                                    raise AssertionError("error ACK must fail synchronously")
+        assert terminate.called
+        assert not write_pid.called
+        assert not (context.run_dir / "server.ack").exists()
+
+
+def test_windows_abort_failure_retains_live_trampoline_ownership() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+        supervisor = ServiceSupervisor(profile, context)
+
+        class Pipe:
+            def close(self) -> None:
+                raise OSError("pipe close failed")
+
+        class Process:
+            pid = 5151
+            returncode = None
+
+            def __init__(self) -> None:
+                self.stdin = Pipe()
+
+            def poll(self) -> Optional[int]:
+                return None
+
+            def terminate(self) -> None:
+                raise OSError("terminate failed")
+
+            def kill(self) -> None:
+                raise OSError("kill failed")
+
+            def wait(self, timeout: Optional[float] = None) -> int:
+                raise subprocess.TimeoutExpired("trampoline", timeout)
+
+        process = Process()
+
+        with mock.patch("xflow.services.os.name", "nt"):
+            with mock.patch("xflow.services.Path", type(root)):
+                with mock.patch("xflow.services.subprocess.Popen", return_value=process):
+                    with mock.patch.object(supervisor, "_windows_create_job", return_value=None):
+                        with mock.patch.object(supervisor, "_write_pid_atomically") as write_pid:
+                            try:
+                                supervisor._spawn(
+                                    "server",
+                                    profile.services["server"].command,
+                                    root / "server.log",
+                                )
+                            except ValueError as exc:
+                                assert "cleanup" in str(exc).lower()
+                            else:
+                                raise AssertionError("live abort must report cleanup failure")
+        assert "server" in supervisor._process_records
+        assert supervisor._process_records["server"].pid == process.pid
+        assert supervisor._handles_by_id["server"].process is process
+        assert write_pid.called
+        assert supervisor._log_streams["server"].closed
 
 
 def test_windows_failed_tree_cleanup_retains_ownership_for_retry() -> None:
@@ -1074,6 +1333,10 @@ def main() -> None:
         test_windows_trampoline_waits_before_business_execution,
         test_windows_spawn_assigns_before_release_and_business_state,
         test_windows_spawn_assignment_failure_never_releases_business,
+        test_windows_trampoline_missing_executable_reports_failure_ack,
+        test_windows_spawn_ack_timeout_is_controlled_and_cleans_process,
+        test_windows_spawn_error_ack_is_synchronous_start_failure,
+        test_windows_abort_failure_retains_live_trampoline_ownership,
         test_windows_failed_tree_cleanup_retains_ownership_for_retry,
         test_windows_final_live_leader_is_controlled_failure,
         test_windows_failed_handle_does_not_block_other_cleanup,
