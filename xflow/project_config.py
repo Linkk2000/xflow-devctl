@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Literal
 
+from .io import canonical_path
+
 
 if TYPE_CHECKING:
     from .local_artifacts import StableFileSnapshot
@@ -44,14 +46,31 @@ def _canonical_repo_path(path: Path) -> Path:
     return Path(os.path.abspath(_normalize_windows_final_path(str(path))))
 
 
+def _equivalent_root_relative_parts(root: Path, target: Path) -> tuple[str, ...] | None:
+    target_parts = target.parts
+    for index in range(1, len(target_parts) + 1):
+        prefix = Path(*target_parts[:index])
+        try:
+            resolved_prefix = _canonical_repo_path(canonical_path(prefix))
+        except (OSError, RuntimeError):
+            continue
+        if os.path.normcase(str(resolved_prefix)) == os.path.normcase(str(root)):
+            return target_parts[index:]
+    return None
+
+
 def require_safe_repo_path(repo_root: Path, path: Path, label: str) -> Path:
-    root = _canonical_repo_path(repo_root.resolve(strict=False))
+    root = _canonical_repo_path(canonical_path(repo_root))
     target = path if path.is_absolute() else root / path
     target = _canonical_repo_path(target)
     try:
         relative = target.relative_to(root)
     except ValueError as exc:
-        raise ValueError(f"{label} is outside repository: {target}") from exc
+        relative_parts = _equivalent_root_relative_parts(root, target)
+        if relative_parts is None:
+            raise ValueError(f"{label} is outside repository: {target}") from exc
+        target = root.joinpath(*relative_parts)
+        relative = target.relative_to(root)
 
     current = root
     for part in relative.parts:

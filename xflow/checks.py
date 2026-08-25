@@ -680,19 +680,19 @@ def write_pr_state_update_suggestion(repo_root: Path, issue: str, pr_number: str
     path = repo_root / ".xflow" / "issues" / f"issue-{normalized_issue(issue)}" / "state-update-suggestion.md"
     url_line = f"PR URL: {pr_url}\n" if pr_url else ""
     path.parent.mkdir(parents=True, exist_ok=True)
+    text = (
+        "# State Update Suggestion\n\n"
+        f"Issue: {normalized_issue(issue)}\n"
+        f"PR: {pr_number}\n"
+        f"{url_line}Suggested State: S9_REMOTE_REVIEW_AND_CI\n\n"
+        "## Suggested Local Update\n"
+        "- Update `.xflow/current-task.md` to `State: S9_REMOTE_REVIEW_AND_CI`.\n"
+        "- Record the PR number and URL in the task evidence if needed.\n"
+        "- Do not create a follow-up PR only to commit this local state note after the PR has already been merged.\n"
+    )
     write_text_lf(
         path,
-        f"""# State Update Suggestion
-
-Issue: {normalized_issue(issue)}
-PR: {pr_number}
-{url_line}Suggested State: S9_REMOTE_REVIEW_AND_CI
-
-## Suggested Local Update
-- Update `.xflow/current-task.md` to `State: S9_REMOTE_REVIEW_AND_CI`.
-- Record the PR number and URL in the task evidence if needed.
-- Do not create a follow-up PR only to commit this local state note after the PR has already been merged.
-        """,
+        text,
     )
     return path
 

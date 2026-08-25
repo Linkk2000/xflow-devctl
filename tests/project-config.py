@@ -17,7 +17,7 @@ from tests.support import write_text_lf
 
 from xflow import migration
 from xflow.migration import apply_issue_workspace_migration, inspect_issue_workspace_migration
-from xflow.project_config import load_project_config
+from xflow.project_config import load_project_config, require_safe_repo_path
 
 
 def write(path: Path, text: str) -> None:
@@ -182,7 +182,7 @@ def test_apply_blocks_active_approvals_and_unsafe_issue_content(repo_root: Path)
     approval = repo_root / ".xflow" / "issues" / "issue-IK152D" / "approvals" / "local-review.md"
     write(approval, "Approved: yes\n")
     report = inspect_issue_workspace_migration(repo_root, "tracked")
-    assert report.active_approvals == (approval,)
+    assert report.active_approvals == (approval.resolve(strict=False),)
     assert "active approval" in report.blockers[0]
     assert_value_error("active approvals", lambda: apply_issue_workspace_migration(repo_root, "tracked"))
     assert not (repo_root / ".xflow" / "xflow.json").exists()
@@ -193,9 +193,9 @@ def test_apply_blocks_active_approvals_and_unsafe_issue_content(repo_root: Path)
     oversized = repo_root / ".xflow" / "issues" / "issue-IK152D" / "evidence.bin"
     oversized.write_bytes(b"x" * (10 * 1024 * 1024 + 1))
     report = inspect_issue_workspace_migration(repo_root, "tracked")
-    assert report.credential_files == (unsafe,)
-    assert report.absolute_path_files == (unsafe,)
-    assert report.oversized_files == (oversized,)
+    assert report.credential_files == (unsafe.resolve(strict=False),)
+    assert report.absolute_path_files == (unsafe.resolve(strict=False),)
+    assert report.oversized_files == (oversized.resolve(strict=False),)
     assert_value_error("unsafe issue workspace", lambda: apply_issue_workspace_migration(repo_root, "tracked"))
 
 
@@ -218,6 +218,33 @@ def test_reparse_points_are_rejected(root: Path) -> None:
     report = inspect_issue_workspace_migration(linked_issue_repo, "tracked")
     assert any("reparse" in error for error in report.scan_errors), report.scan_errors
     assert_value_error("scan errors", lambda: apply_issue_workspace_migration(linked_issue_repo, "tracked"))
+
+
+def test_safe_repo_path_accepts_equivalent_root_spelling(root: Path) -> None:
+    repo = root / "equivalent-root"
+    write(repo / "inside.txt", "safe\n")
+    alias = Path(str(repo).replace("/private/var/", "/var/"))
+    if alias == repo:
+        alias = root / "equivalent-root-alias"
+        make_directory_link(alias, repo)
+    accepted = require_safe_repo_path(alias, alias / "inside.txt", "safe path")
+    assert accepted.resolve(strict=False) == (repo / "inside.txt").resolve(strict=False)
+
+
+def test_safe_repo_path_rejects_explicit_symlink(root: Path) -> None:
+    repo = root / "explicit-symlink"
+    repo.mkdir(parents=True)
+    outside = root / "outside-evidence.txt"
+    write(outside, "outside\n")
+    linked = repo / "linked.txt"
+    try:
+        linked.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        return
+    assert_value_error(
+        "must not traverse a symlink, junction, or reparse point",
+        lambda: require_safe_repo_path(repo, linked, "safe path"),
+    )
 
 
 def test_contract_root_must_resolve_inside_repository(root: Path) -> None:
@@ -310,7 +337,7 @@ def test_scan_failures_and_growth_block_apply(root: Path) -> None:
     real_open = migration.os.open
 
     def deny_open(path: object, *args: object, **kwargs: object) -> int:
-        if Path(path) == unreadable:
+        if Path(path).resolve(strict=False) == unreadable.resolve(strict=False):
             raise PermissionError("denied for test")
         return real_open(path, *args, **kwargs)  # type: ignore[arg-type]
 
@@ -764,6 +791,8 @@ def main() -> None:
         test_apply_retains_configured_contract_root(root / "configured-contract-root")
         test_apply_blocks_active_approvals_and_unsafe_issue_content(root / "unsafe")
         test_reparse_points_are_rejected(root / "reparse")
+        test_safe_repo_path_accepts_equivalent_root_spelling(root / "safe-path-alias")
+        test_safe_repo_path_rejects_explicit_symlink(root / "safe-path-symlink")
         test_contract_root_must_resolve_inside_repository(root / "contract-containment")
         test_effective_ignore_sources_block_manual_actions(root / "ignore-sources")
         test_tracked_apply_verifies_effective_ignore_and_rolls_back(root / "ignore-rollback")

@@ -1382,13 +1382,13 @@ dependencies:
             invalid_root,
             "IK152D",
             base.replace("evidence/logs/c-004-integration-tests.txt", "evidence/logs/outside-link.txt"),
-            "inside the issue directory",
+            "must not traverse a symlink, junction, or reparse point",
         )
         assert_dependency_error(
             invalid_root,
             "IK152D",
             base.replace("evidence/logs/c-004-integration-tests.txt", "evidence/logs/broken-link.txt"),
-            "does not exist",
+            "must not traverse a symlink, junction, or reparse point",
         )
 
 
@@ -2901,7 +2901,18 @@ State: S6_PREPARE_COMMIT_AND_MR_DRAFT
         run_devctl(repo, "check", "current-task", "--issue", "1")
         suggestion = write_pr_state_update_suggestion(repo, "1", "9", "https://example.test/pull/9")
         assert suggestion.is_file()
-        assert "Suggested State: S9_REMOTE_REVIEW_AND_CI" in suggestion.read_text(encoding="utf-8")
+        expected_suggestion = (
+            "# State Update Suggestion\n\n"
+            "Issue: 1\n"
+            "PR: 9\n"
+            "PR URL: https://example.test/pull/9\n"
+            "Suggested State: S9_REMOTE_REVIEW_AND_CI\n\n"
+            "## Suggested Local Update\n"
+            "- Update `.xflow/current-task.md` to `State: S9_REMOTE_REVIEW_AND_CI`.\n"
+            "- Record the PR number and URL in the task evidence if needed.\n"
+            "- Do not create a follow-up PR only to commit this local state note after the PR has already been merged.\n"
+        ).encode("utf-8")
+        assert suggestion.read_bytes() == expected_suggestion
 
         walkthrough = repo / ".xflow" / "issues" / "issue-1" / "walkthrough.md"
         write(walkthrough, "# Walkthrough\n\nIssue evidence source.\n")
