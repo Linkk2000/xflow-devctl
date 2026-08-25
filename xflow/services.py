@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import signal
 import subprocess
@@ -41,6 +42,65 @@ class _ProcessRecord:
     handle: ServiceHandle
     pid: int
     group_id: Optional[int]
+    windows_job: Optional[object] = None
+    windows_tree_known: bool = False
+
+
+class _TerminationFailure(ValueError):
+    """Raised when a supervisor cannot prove that an owned tree stopped."""
+
+
+class _WindowsJob:
+    """Small stdlib-only Job Object wrapper, constructed only on Windows."""
+
+    def __init__(self, kernel32: object, handle: int) -> None:
+        self._kernel32 = kernel32
+        self._handle: Optional[int] = int(handle)
+
+    def terminate(self) -> bool:
+        if self._handle is None:
+            return False
+        return bool(self._kernel32.TerminateJobObject(self._handle, 1))
+
+    def active_processes(self) -> Optional[int]:
+        if self._handle is None:
+            return None
+        try:
+            import ctypes
+
+            class _BasicAccounting(ctypes.Structure):
+                _fields_ = [
+                    ("TotalUserTime", ctypes.c_longlong),
+                    ("TotalKernelTime", ctypes.c_longlong),
+                    ("ThisPeriodTotalUserTime", ctypes.c_longlong),
+                    ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+                    ("TotalPageFaultCount", ctypes.c_uint32),
+                    ("TotalProcesses", ctypes.c_uint32),
+                    ("ActiveProcesses", ctypes.c_uint32),
+                    ("TotalTerminatedProcesses", ctypes.c_uint32),
+                ]
+
+            info = _BasicAccounting()
+            ok = self._kernel32.QueryInformationJobObject(
+                self._handle,
+                1,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+                None,
+            )
+            if not ok:
+                return None
+            return int(info.ActiveProcesses)
+        except (AttributeError, ImportError, OSError, TypeError, ValueError):
+            return None
+
+    def close(self) -> bool:
+        if self._handle is None:
+            return True
+        ok = bool(self._kernel32.CloseHandle(self._handle))
+        if ok:
+            self._handle = None
+        return ok
 
 
 class _HealthDeadlineExceeded(Exception):
@@ -267,7 +327,56 @@ class ServiceSupervisor:
             return {"creationflags": flags}
         return {"start_new_session": True}
 
-    def _process_record(self, handle: ServiceHandle) -> _ProcessRecord:
+    def _windows_create_job(self, process: object) -> Optional[object]:
+        """Create and assign a Job Object, or safely report unavailable."""
+
+        if os.name != "nt":
+            return None
+        job: Optional[_WindowsJob] = None
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+            kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+            kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+            kernel32.AssignProcessToJobObject.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ]
+            kernel32.CloseHandle.restype = ctypes.c_int
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.TerminateJobObject.restype = ctypes.c_int
+            kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            kernel32.QueryInformationJobObject.restype = ctypes.c_int
+            kernel32.QueryInformationJobObject.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_uint32),
+            ]
+
+            raw_job = kernel32.CreateJobObjectW(None, None)
+            if not raw_job:
+                return None
+            job = _WindowsJob(kernel32, int(getattr(raw_job, "value", raw_job)))
+            raw_process = getattr(process, "_handle", None)
+            process_value = getattr(raw_process, "value", raw_process)
+            if process_value is None or not kernel32.AssignProcessToJobObject(
+                job._handle, int(process_value)
+            ):
+                job.close()
+                return None
+            return job
+        except (AttributeError, ImportError, OSError, TypeError, ValueError):
+            if job is not None:
+                job.close()
+            return None
+
+    def _process_record(
+        self, handle: ServiceHandle, *, attach_job: bool = False
+    ) -> _ProcessRecord:
         group_id: Optional[int] = None
         if os.name != "nt":
             try:
@@ -281,7 +390,21 @@ class ServiceSupervisor:
                     group_id = None
             except OSError:
                 pass
-        return _ProcessRecord(handle, int(handle.process.pid), group_id)
+        windows_job = None
+        windows_tree_known = False
+        if os.name == "nt" and attach_job:
+            try:
+                windows_job = self._windows_create_job(handle.process)
+            except Exception:
+                windows_job = None
+            windows_tree_known = windows_job is not None
+        return _ProcessRecord(
+            handle,
+            int(handle.process.pid),
+            group_id,
+            windows_job,
+            windows_tree_known,
+        )
 
     def _spawn(
         self,
@@ -301,6 +424,7 @@ class ServiceSupervisor:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         stream = None
         process = None
+        record: Optional[_ProcessRecord] = None
         try:
             stream = log_path.open("a", encoding="utf-8")
             kwargs = {
@@ -315,7 +439,7 @@ class ServiceSupervisor:
             kwargs.update(self._session_kwargs())
             process = subprocess.Popen(list(argv), **kwargs)
             handle = ServiceHandle(service_id, process, log_path)
-            record = self._process_record(handle)
+            record = self._process_record(handle, attach_job=True)
             self._write_pid_atomically(service_id, process.pid)
             self._process_records[service_id] = record
             self._log_streams[service_id] = stream
@@ -323,7 +447,7 @@ class ServiceSupervisor:
         except FileNotFoundError as exc:
             try:
                 if process is not None:
-                    self._terminate(ServiceHandle(service_id, process, log_path))
+                    self._terminate(record or ServiceHandle(service_id, process, log_path))
             finally:
                 if stream is not None:
                     stream.close()
@@ -331,7 +455,7 @@ class ServiceSupervisor:
         except PermissionError as exc:
             try:
                 if process is not None:
-                    self._terminate(ServiceHandle(service_id, process, log_path))
+                    self._terminate(record or ServiceHandle(service_id, process, log_path))
             finally:
                 if stream is not None:
                     stream.close()
@@ -339,8 +463,8 @@ class ServiceSupervisor:
         except BaseException:
             try:
                 if process is not None:
-                    record = self._process_records.get(service_id)
-                    self._terminate(record or ServiceHandle(service_id, process, log_path))
+                    tracked = self._process_records.get(service_id)
+                    self._terminate(tracked or record or ServiceHandle(service_id, process, log_path))
             finally:
                 if stream is not None:
                     stream.close()
@@ -519,59 +643,130 @@ class ServiceSupervisor:
         except (OSError, AttributeError):
             return False
 
-    def _group_alive(self, record: _ProcessRecord) -> bool:
+    def _group_state(self, record: _ProcessRecord) -> Optional[bool]:
+        """Return True=live, False=absent, None=unable to verify."""
+
         if record.group_id is None:
-            return False
+            return None
         try:
             if record.group_id == os.getpgrp():
-                return False
+                return None
             os.killpg(record.group_id, 0)
             return True
-        except (OSError, ProcessLookupError):
+        except ProcessLookupError:
             return False
+        except PermissionError:
+            return None
+        except OSError as exc:
+            if getattr(exc, "errno", None) == errno.ESRCH:
+                return False
+            return None
+
+    def _wait_group_stopped(
+        self, record: _ProcessRecord, timeout: float = 1.0
+    ) -> Optional[bool]:
+        deadline = time.monotonic() + timeout
+        state = self._group_state(record)
+        while state is True and time.monotonic() < deadline:
+            time.sleep(0.01)
+            state = self._group_state(record)
+        return state
+
+    def _windows_job_terminate(self, job: object) -> bool:
+        try:
+            terminate = getattr(job, "terminate")
+            return bool(terminate())
+        except (AttributeError, OSError, TypeError, ValueError):
+            return False
+
+    def _windows_job_active_processes(self, job: object) -> Optional[int]:
+        try:
+            active = getattr(job, "active_processes")
+            value = active()
+            return None if value is None else int(value)
+        except (AttributeError, OSError, TypeError, ValueError):
+            return None
+
+    def _windows_job_close(self, job: object) -> bool:
+        try:
+            close = getattr(job, "close")
+            return bool(close())
+        except (AttributeError, OSError, TypeError, ValueError):
+            return False
+
+    def _wait_windows_job_stopped(
+        self, job: object, timeout: float = 1.0
+    ) -> Optional[int]:
+        deadline = time.monotonic() + timeout
+        active = self._windows_job_active_processes(job)
+        while active is not None and active > 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+            active = self._windows_job_active_processes(job)
+        return active
 
     def _windows_tree_signal(self, record: _ProcessRecord, force: bool) -> bool:
         command = ["taskkill", "/PID", str(record.pid), "/T"]
         if force:
             command.append("/F")
         try:
-            subprocess.run(
+            outcome = subprocess.run(
                 command,
                 shell=False,
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            return True
-        except (OSError, TypeError):
+            return int(getattr(outcome, "returncode", 1)) == 0
+        except (OSError, TypeError, ValueError, subprocess.SubprocessError):
             return False
 
-    def _terminate(self, value: object) -> None:
+    def _terminate(self, value: object) -> bool:
         record = self._coerce_record(value)
         process = record.handle.process
         if os.name == "nt":
-            sent = self._windows_tree_signal(record, force=False)
+            job_known = record.windows_job is not None and record.windows_tree_known
+            sent = False
+            if job_known:
+                sent = self._windows_job_terminate(record.windows_job)
+            if not sent:
+                sent = self._windows_tree_signal(record, force=False)
             if not sent:
                 try:
                     process.terminate()
-                except OSError:
+                except (OSError, AttributeError):
                     pass
         else:
             sent = self._signal_posix(record, signal.SIGTERM)
             if not sent:
                 try:
                     process.terminate()
-                except OSError:
+                except (OSError, AttributeError):
                     pass
 
         try:
             process.wait(timeout=1.0)
-        except (subprocess.TimeoutExpired, OSError):
+        except (subprocess.TimeoutExpired, OSError, AttributeError):
             pass
 
         if os.name == "nt":
-            self._windows_tree_signal(record, force=True)
-        elif self._group_alive(record):
+            active = (
+                self._windows_job_active_processes(record.windows_job)
+                if job_known
+                else None
+            )
+            leader_alive = process.poll() is None
+            if (not job_known) or leader_alive or active != 0:
+                forced = False
+                if job_known:
+                    forced = self._windows_job_terminate(record.windows_job)
+                if not forced:
+                    forced = self._windows_tree_signal(record, force=True)
+                if not forced:
+                    try:
+                        process.kill()
+                    except (OSError, AttributeError):
+                        pass
+        elif self._group_state(record) is True:
             try:
                 os.killpg(record.group_id, signal.SIGKILL)  # type: ignore[arg-type]
             except (OSError, ProcessLookupError):
@@ -579,40 +774,90 @@ class ServiceSupervisor:
         elif process.poll() is None:
             try:
                 process.kill()
-            except OSError:
+            except (OSError, AttributeError):
                 pass
 
         try:
             process.wait(timeout=1.0)
-        except (subprocess.TimeoutExpired, OSError):
+        except (subprocess.TimeoutExpired, OSError, AttributeError):
             pass
+
+        if os.name == "nt":
+            leader_alive = process.poll() is None
+            if leader_alive:
+                raise _TerminationFailure(
+                    f"service {record.handle.id} termination failed: leader still alive"
+                )
+            if not record.windows_tree_known:
+                raise _TerminationFailure(
+                    f"service {record.handle.id} termination failed: owned tree unknown"
+                )
+            active = self._wait_windows_job_stopped(record.windows_job)
+            if active is None:
+                raise _TerminationFailure(
+                    f"service {record.handle.id} termination failed: owned tree unverified"
+                )
+            if active != 0:
+                raise _TerminationFailure(
+                    f"service {record.handle.id} termination failed: owned tree still alive"
+                )
+            if record.windows_job is not None and not self._windows_job_close(
+                record.windows_job
+            ):
+                raise _TerminationFailure(
+                    f"service {record.handle.id} termination failed: job close failed"
+                )
+            return True
+
+        leader_alive = process.poll() is None
+        group_state = self._wait_group_stopped(record)
+        if leader_alive:
+            raise _TerminationFailure(
+                f"service {record.handle.id} termination failed: leader still alive"
+            )
+        if group_state is not False:
+            raise _TerminationFailure(
+                f"service {record.handle.id} termination failed: owned group unverified"
+            )
+        return True
 
     def stop_all(self) -> None:
         """Terminate all owned process groups in reverse startup order."""
 
         handles = list(reversed(self._handles))
         errors: List[str] = []
+        failed_ids = set()
         for handle in handles:
+            terminated = False
             try:
                 record = self._process_records.get(handle.id) or self._process_record(handle)
-                self._terminate(record)
+                terminated = self._terminate(record) is not False
+                if not terminated:
+                    raise _TerminationFailure(
+                        f"service {handle.id} termination did not confirm stopped"
+                    )
             except Exception as exc:
-                errors.append(f"{handle.id} terminate: {type(exc).__name__}")
+                failed_ids.add(handle.id)
+                detail = str(exc) or type(exc).__name__
+                errors.append(f"{handle.id} terminate: {detail}")
             finally:
-                try:
-                    self._remove_pid(handle)
-                except Exception as exc:
-                    errors.append(f"{handle.id} pid cleanup: {type(exc).__name__}")
-                finally:
-                    stream = self._log_streams.pop(handle.id, None)
-                    if stream is not None:
-                        try:
-                            stream.close()  # type: ignore[union-attr]
-                        except Exception as exc:
-                            errors.append(f"{handle.id} log close: {type(exc).__name__}")
-        self._handles.clear()
-        self._handles_by_id.clear()
-        self._process_records.clear()
+                if terminated:
+                    try:
+                        self._remove_pid(handle)
+                    except Exception as exc:
+                        errors.append(f"{handle.id} pid cleanup: {type(exc).__name__}")
+                stream = self._log_streams.pop(handle.id, None)
+                if stream is not None:
+                    try:
+                        stream.close()  # type: ignore[union-attr]
+                    except Exception as exc:
+                        errors.append(f"{handle.id} log close: {type(exc).__name__}")
+
+        for handle in list(self._handles):
+            if handle.id not in failed_ids:
+                self._handles_by_id.pop(handle.id, None)
+                self._process_records.pop(handle.id, None)
+        self._handles = [handle for handle in self._handles if handle.id in failed_ids]
         if errors:
             raise ValueError("service cleanup failed: " + "; ".join(errors))
 

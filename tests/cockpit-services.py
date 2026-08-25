@@ -21,6 +21,7 @@ sys.path.insert(0, str(OPS_ROOT))
 from tests.support import write_text_lf  # noqa: E402
 from xflow.cockpit import CockpitContext, load_cockpit_profile  # noqa: E402
 from xflow.services import (  # noqa: E402
+    _ProcessRecord,
     ServiceHandle,
     ServiceSupervisor,
     run_playground,
@@ -572,23 +573,299 @@ def test_windows_tree_cleanup_uses_injectable_argv_capability() -> None:
         class Process:
             pid = 4242
             returncode = 0
+            waits = 0
 
-            def poll(self) -> int:
-                return 0
+            def poll(self) -> Optional[int]:
+                return self.returncode
 
             def wait(self, timeout: Optional[float] = None) -> int:
+                self.waits += 1
+                if self.waits == 1:
+                    raise subprocess.TimeoutExpired(["fixture"], timeout or 0)
+                self.returncode = 0
                 return 0
+
+            def terminate(self) -> None:
+                self.returncode = 0
 
         supervisor = ServiceSupervisor(profile, context)
         handle = ServiceHandle("server", Process(), root / "server.log")
+        job = object()
         with mock.patch("xflow.services.os.name", "nt"):
-            with mock.patch("xflow.services.subprocess.run") as run:
-                supervisor._terminate(handle)
-        assert run.call_count == 2
+            with mock.patch(
+                "xflow.services.subprocess.run",
+                return_value=type("Outcome", (), {"returncode": 0})(),
+            ) as run:
+                with mock.patch.object(supervisor, "_windows_job_terminate", return_value=False):
+                    with mock.patch.object(
+                        supervisor, "_windows_job_active_processes", return_value=0
+                    ):
+                        with mock.patch.object(supervisor, "_windows_job_close", return_value=True):
+                            record = _ProcessRecord(handle, 4242, None, job, True)
+                            supervisor._terminate(record)
+        assert run.call_count == 1
         for call in run.call_args_list:
             argv = call.args[0]
             assert argv[:4] == ["taskkill", "/PID", "4242", "/T"]
             assert call.kwargs["shell"] is False
+
+
+def test_windows_taskkill_nonzero_is_not_success() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        supervisor = ServiceSupervisor(profile, _context(root))
+
+        class Process:
+            pid = 4242
+            returncode = 0
+
+            def poll(self) -> int:
+                return self.returncode
+
+            def wait(self, timeout: Optional[float] = None) -> int:
+                return self.returncode
+
+            def terminate(self) -> None:
+                return None
+
+        handle = ServiceHandle("server", Process(), root / "server.log")
+        with mock.patch("xflow.services.os.name", "nt"):
+            with mock.patch(
+                "xflow.services.subprocess.run",
+                return_value=type("Outcome", (), {"returncode": 1})(),
+            ) as run:
+                record = _ProcessRecord(handle, 4242, None, None, False)
+                assert supervisor._windows_tree_signal(record, force=False) is False
+                try:
+                    supervisor._terminate(record)
+                except ValueError as exc:
+                    assert "termination" in str(exc).lower()
+                else:
+                    raise AssertionError("non-zero taskkill must not be success")
+        assert run.call_count == 3
+
+
+def test_windows_fallback_without_job_never_claims_tree_clean() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        supervisor = ServiceSupervisor(profile, _context(root))
+
+        class Process:
+            pid = 4242
+            returncode = 0
+
+            def poll(self) -> int:
+                return self.returncode
+
+            def wait(self, timeout: Optional[float] = None) -> int:
+                return self.returncode
+
+        handle = ServiceHandle("server", Process(), root / "server.log")
+        record = _ProcessRecord(handle, 4242, None, None, False)
+        with mock.patch("xflow.services.os.name", "nt"):
+            with mock.patch(
+                "xflow.services.subprocess.run",
+                return_value=type("Outcome", (), {"returncode": 0})(),
+            ):
+                try:
+                    supervisor._terminate(record)
+                except ValueError as exc:
+                    assert "owned tree unknown" in str(exc)
+                else:
+                    raise AssertionError("fallback must not claim unknown tree cleanup")
+
+
+def test_windows_spawn_record_attaches_injectable_job() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        supervisor = ServiceSupervisor(profile, _context(root))
+
+        class Process:
+            pid = 4242
+
+        handle = ServiceHandle("server", Process(), root / "server.log")
+        job = object()
+        with mock.patch("xflow.services.os.name", "nt"):
+            with mock.patch.object(supervisor, "_windows_create_job", return_value=job) as create:
+                record = supervisor._process_record(handle, attach_job=True)
+        assert create.call_args.args == (handle.process,)
+        assert record.windows_job is job
+        assert record.windows_tree_known is True
+        with mock.patch("xflow.services.os.name", "nt"):
+            with mock.patch.object(supervisor, "_windows_create_job", return_value=None):
+                degraded = supervisor._process_record(handle, attach_job=True)
+        assert degraded.windows_job is None
+        assert degraded.windows_tree_known is False
+
+
+def test_windows_failed_tree_cleanup_retains_ownership_for_retry() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+        supervisor = ServiceSupervisor(profile, context)
+
+        class Process:
+            pid = 4242
+            returncode = 0
+
+            def poll(self) -> Optional[int]:
+                return self.returncode
+
+            def wait(self, timeout: Optional[float] = None) -> int:
+                return self.returncode
+
+        class Job:
+            active = 1
+            closed = False
+
+        process = Process()
+        job = Job()
+        handle = ServiceHandle("server", process, root / "server.log")
+        record = _ProcessRecord(handle, 4242, None, job, True)
+        supervisor._handles = [handle]
+        supervisor._handles_by_id[handle.id] = handle
+        supervisor._process_records[handle.id] = record
+        stream = (root / "server.log").open("w", encoding="utf-8")
+        supervisor._log_streams[handle.id] = stream
+        supervisor._write_pid_atomically(handle.id, process.pid)
+        pid_path = context.run_dir / "server.pid"
+
+        with mock.patch("xflow.services.os.name", "nt"):
+            with mock.patch.object(
+                supervisor, "_pid_path", return_value=pid_path
+            ):
+                with mock.patch.object(supervisor, "_windows_job_terminate", return_value=True):
+                    with mock.patch.object(
+                        supervisor,
+                        "_windows_job_active_processes",
+                        side_effect=lambda _job: job.active,
+                    ):
+                        with mock.patch.object(supervisor, "_windows_job_close") as close:
+                            try:
+                                supervisor.stop_all()
+                            except ValueError as exc:
+                                assert "terminate" in str(exc)
+                            else:
+                                raise AssertionError("live owned tree must remain owned")
+                            assert supervisor._handles == [handle]
+                            assert supervisor._handles_by_id[handle.id] is handle
+                            assert handle.id in supervisor._process_records
+                            assert pid_path.exists()
+                            assert stream.closed
+                            assert not close.called
+
+                            job.active = 0
+                            process.returncode = 0
+                            supervisor.stop_all()
+                            assert supervisor._handles == []
+                            assert supervisor._process_records == {}
+                            assert not pid_path.exists()
+                            assert close.called
+
+
+def test_windows_final_live_leader_is_controlled_failure() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        supervisor = ServiceSupervisor(profile, _context(root))
+
+        class Process:
+            pid = 4242
+            returncode = None
+
+            def poll(self) -> Optional[int]:
+                return self.returncode
+
+            def wait(self, timeout: Optional[float] = None) -> int:
+                raise subprocess.TimeoutExpired(["fixture"], timeout or 0)
+
+        handle = ServiceHandle("server", Process(), root / "server.log")
+        record = _ProcessRecord(handle, 4242, None, object(), True)
+        with mock.patch("xflow.services.os.name", "nt"):
+            with mock.patch.object(supervisor, "_windows_job_terminate", return_value=True):
+                with mock.patch.object(
+                    supervisor, "_windows_job_active_processes", return_value=0
+                ):
+                    try:
+                        supervisor._terminate(record)
+                    except ValueError as exc:
+                        assert "alive" in str(exc).lower()
+                    else:
+                        raise AssertionError("live leader must fail controlled cleanup")
+
+
+def test_windows_failed_handle_does_not_block_other_cleanup() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+        supervisor = ServiceSupervisor(profile, context)
+
+        class Process:
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+                self.returncode = 0
+
+            def poll(self) -> int:
+                return self.returncode
+
+            def wait(self, timeout: Optional[float] = None) -> int:
+                return self.returncode
+
+        class Job:
+            def __init__(self, active: int) -> None:
+                self.active = active
+
+        server = ServiceHandle("server", Process(4242), root / "server.log")
+        web = ServiceHandle("web", Process(4243), root / "web.log")
+        server_job = Job(1)
+        web_job = Job(0)
+        supervisor._handles = [server, web]
+        supervisor._handles_by_id.update({"server": server, "web": web})
+        supervisor._process_records.update(
+            {
+                "server": _ProcessRecord(server, 4242, None, server_job, True),
+                "web": _ProcessRecord(web, 4243, None, web_job, True),
+            }
+        )
+        server_stream = (root / "server.log").open("w", encoding="utf-8")
+        web_stream = (root / "web.log").open("w", encoding="utf-8")
+        supervisor._log_streams.update({"server": server_stream, "web": web_stream})
+        supervisor._write_pid_atomically("server", 4242)
+        supervisor._write_pid_atomically("web", 4243)
+        pid_paths = {
+            "server": context.run_dir / "server.pid",
+            "web": context.run_dir / "web.pid",
+        }
+
+        with mock.patch("xflow.services.os.name", "nt"):
+            with mock.patch.object(
+                supervisor, "_pid_path", side_effect=lambda service_id: pid_paths[service_id]
+            ):
+                with mock.patch.object(supervisor, "_windows_job_terminate", return_value=True):
+                    with mock.patch.object(
+                        supervisor,
+                        "_windows_job_active_processes",
+                        side_effect=lambda job: job.active,
+                    ):
+                        with mock.patch.object(supervisor, "_windows_job_close", return_value=True):
+                            try:
+                                supervisor.stop_all()
+                            except ValueError as exc:
+                                assert "server" in str(exc)
+                            else:
+                                raise AssertionError("live handle cleanup must be reported")
+        assert supervisor._handles == [server]
+        assert supervisor._handles_by_id == {"server": server}
+        assert "server" in supervisor._process_records
+        assert "web" not in supervisor._process_records
+        assert pid_paths["server"].exists()
+        assert not pid_paths["web"].exists()
+        assert server_stream.closed and web_stream.closed
 
 
 def main() -> None:
@@ -609,6 +886,12 @@ def main() -> None:
         test_tree_cleanup_forces_child_which_ignores_term,
         test_stop_all_collects_pid_cleanup_errors_and_closes_every_stream,
         test_windows_tree_cleanup_uses_injectable_argv_capability,
+        test_windows_taskkill_nonzero_is_not_success,
+        test_windows_fallback_without_job_never_claims_tree_clean,
+        test_windows_spawn_record_attaches_injectable_job,
+        test_windows_failed_tree_cleanup_retains_ownership_for_retry,
+        test_windows_final_live_leader_is_controlled_failure,
+        test_windows_failed_handle_does_not_block_other_cleanup,
     )
     for test in tests:
         test()
