@@ -572,10 +572,14 @@ uses an explicit `TEST_PYTHON` for its helper, an explicit `DEVCTL_PYTHON`
 supplies both roles when `TEST_PYTHON` is absent, and otherwise it selects
 `python3` then `python` from `PATH`. The focused
 `tests/review-gate-binding.py` check verifies these overrides with a restricted
-`PATH` and an interpreter path containing spaces. The optional PowerShell suite
-is run once with the current-Python lane and accepts exit 77 only when its
-executable capability is unavailable. Set `PYTHON39`, `PYTHON_CURRENT`, and
-optionally `BASE_REF` to override the interpreters and branch baseline, for
+`PATH` and an interpreter path containing spaces. Before creating any fixture,
+the gate validates both selected roles as Python 3.9+ interpreters with the
+required `xflow`, PyYAML, jsonschema, and Pillow imports. An explicit invalid
+override fails closed and never reaches the launcher's own fallback; an
+omitted role is bound to the other validated role. The optional PowerShell
+suite is run once with the current-Python lane and accepts exit 77 only when
+its executable capability is unavailable. Set `PYTHON39`, `PYTHON_CURRENT`,
+and optionally `BASE_REF` to override the interpreters and branch baseline, for
 example:
 
 ```text

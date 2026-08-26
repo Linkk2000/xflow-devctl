@@ -4,33 +4,112 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-resolve_test_python() {
-  if [ -n "${TEST_PYTHON:-}" ]; then
-    printf '%s\n' "$TEST_PYTHON"
-    return 0
+validate_python() {
+  label="$1"
+  candidate="$2"
+
+  if [ -z "$candidate" ]; then
+    printf '[ERROR] %s interpreter is empty; set %s.\n' "$label" "$label" >&2
+    return 1
   fi
-  if [ -n "${DEVCTL_PYTHON:-}" ]; then
-    printf '%s\n' "$DEVCTL_PYTHON"
-    return 0
+  if ! command -v "$candidate" >/dev/null 2>&1 && [ ! -x "$candidate" ]; then
+    printf '[ERROR] %s interpreter is not executable or not on PATH: %s\n' "$label" "$candidate" >&2
+    return 1
   fi
+
+  if probe_output=$(
+    PYTHONPATH="$OPS_ROOT${PYTHONPATH:+:$PYTHONPATH}" "$candidate" -c '
+import importlib
+import os
+import platform
+import sys
+
+label = sys.argv[1]
+print(
+    "REVIEW_GATE_PREFLIGHT label={label} path={path} version={version}".format(
+        label=label,
+        path=os.path.realpath(sys.executable),
+        version=platform.python_version(),
+    )
+)
+if sys.version_info < (3, 9):
+    print(
+        "[ERROR] {label} requires Python 3.9 or newer; got {version}".format(
+            label=label, version=platform.python_version()
+        ),
+        file=sys.stderr,
+    )
+    raise SystemExit(3)
+
+missing = []
+for module_name in ("xflow", "yaml", "jsonschema", "PIL"):
+    try:
+        importlib.import_module(module_name)
+    except Exception as exc:
+        missing.append("{name} ({kind}: {detail})".format(
+            name=module_name,
+            kind=type(exc).__name__,
+            detail=exc,
+        ))
+if missing:
+    print(
+        "[ERROR] {label} missing required imports: {missing}".format(
+            label=label, missing=", ".join(missing)
+        ),
+        file=sys.stderr,
+    )
+    raise SystemExit(4)
+' "$label" 2>&1
+  ); then
+    :
+  else
+    probe_status=$?
+    [ -n "$probe_output" ] && printf '%s\n' "$probe_output" >&2
+    printf '[ERROR] %s preflight failed for %s (exit %s).\n' "$label" "$candidate" "$probe_status" >&2
+    return 1
+  fi
+
+  case "$probe_output" in
+    *"REVIEW_GATE_PREFLIGHT label=$label"*)
+      printf '%s\n' "$probe_output" >&2
+      ;;
+    *)
+      [ -n "$probe_output" ] && printf '%s\n' "$probe_output" >&2
+      printf '[ERROR] %s did not identify itself as Python: %s\n' "$label" "$candidate" >&2
+      return 1
+      ;;
+  esac
+}
+
+resolve_default_python() {
   for candidate in python3 python; do
-    if command -v "$candidate" >/dev/null 2>&1; then
-      printf '%s\n' "$candidate"
-      return 0
+    if command -v "$candidate" >/dev/null 2>&1 || [ -x "$candidate" ]; then
+      if validate_python DEFAULT "$candidate"; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
     fi
   done
+  echo "[ERROR] review-gate could not find a dependency-complete Python 3.9+ interpreter (tried python3, python)." >&2
   return 1
 }
 
-TEST_PYTHON="$(resolve_test_python)" || {
-  echo "[ERROR] review-gate requires TEST_PYTHON, DEVCTL_PYTHON, python3, or python." >&2
-  exit 1
-}
-if ! command -v "$TEST_PYTHON" >/dev/null 2>&1 && [ ! -x "$TEST_PYTHON" ]; then
-  printf '[ERROR] review-gate interpreter is not executable or not on PATH: %s\n' "$TEST_PYTHON" >&2
-  exit 1
+test_python_explicit=0
+devctl_python_explicit=0
+[ "${TEST_PYTHON+x}" = x ] && test_python_explicit=1
+[ "${DEVCTL_PYTHON+x}" = x ] && devctl_python_explicit=1
+
+if [ "$test_python_explicit" -eq 0 ] && [ "$devctl_python_explicit" -eq 0 ]; then
+  TEST_PYTHON="$(resolve_default_python)" || exit 1
+elif [ "$test_python_explicit" -eq 0 ]; then
+  TEST_PYTHON="${DEVCTL_PYTHON-}"
 fi
-DEVCTL_PYTHON="${DEVCTL_PYTHON:-$TEST_PYTHON}"
+if [ "$devctl_python_explicit" -eq 0 ]; then
+  DEVCTL_PYTHON="$TEST_PYTHON"
+fi
+
+validate_python TEST_PYTHON "${TEST_PYTHON-}" || exit 1
+validate_python DEVCTL_PYTHON "${DEVCTL_PYTHON-}" || exit 1
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
