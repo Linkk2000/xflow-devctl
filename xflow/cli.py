@@ -89,6 +89,15 @@ _ACTIVE_COCKPIT_PROFILE: CockpitProfile | None = None
 _ACTIVE_COCKPIT_CONTEXT: CockpitContext | None = None
 
 
+@dataclass(frozen=True)
+class _RuntimeProfileSelection:
+    """The validated profile and the one canonical root it belongs to."""
+
+    profile_path: Path
+    profile: CockpitProfile
+    cockpit_root: Path
+
+
 ISSUE_CREATE_EPILOG = """AI call recipes:
   Reviewed non-image attachment issue:
     devctl attachment add --issue draft --file notes.txt --as file
@@ -309,7 +318,7 @@ def build_parser() -> argparse.ArgumentParser:
     issue_create.add_argument("--attach-file", action="append", default=[], type=Path)
     issue_create.add_argument("--attach-as", choices=("auto", "image", "file"), default="auto")
     issue_create.add_argument("--upload-attachments", choices=("github", "github-release"), nargs="?", const="github")
-    issue_create.add_argument("--release-tag", default=os.environ.get("XFLOW_GITHUB_ATTACHMENT_RELEASE_TAG", "xflow-attachments"))
+    issue_create.add_argument("--release-tag", default=None)
     issue_create.add_argument("--rendered-body-file", type=Path)
     issue_create.add_argument("--no-local-review", action="store_true")
     issue_list = issue_sub.add_parser("list")
@@ -329,7 +338,7 @@ def build_parser() -> argparse.ArgumentParser:
     issue_comment.add_argument("--attach-file", action="append", default=[], type=Path)
     issue_comment.add_argument("--attach-as", choices=("auto", "image", "file"), default="auto")
     issue_comment.add_argument("--upload-attachments", choices=("github", "github-release"), nargs="?", const="github")
-    issue_comment.add_argument("--release-tag", default=os.environ.get("XFLOW_GITHUB_ATTACHMENT_RELEASE_TAG", "xflow-attachments"))
+    issue_comment.add_argument("--release-tag", default=None)
     issue_comment.add_argument("--rendered-body-file", type=Path)
     issue_comment.add_argument("--no-local-review", action="store_true")
     issue_close = issue_sub.add_parser("close")
@@ -436,7 +445,7 @@ def build_parser() -> argparse.ArgumentParser:
     attachment_publish.add_argument("--issue", default="draft")
     attachment_publish.add_argument("--manifest", type=Path)
     attachment_publish.add_argument("--backend", choices=("manual", "github", "github-release", "aliyun-oss", "object"))
-    attachment_publish.add_argument("--release-tag", default=os.environ.get("XFLOW_GITHUB_ATTACHMENT_RELEASE_TAG", "xflow-attachments"))
+    attachment_publish.add_argument("--release-tag", default=None)
     attachment_publish.add_argument("--url", action="append", default=[])
     attachment_publish.add_argument("--body-file", type=Path)
     attachment_publish.add_argument("--output", type=Path)
@@ -560,13 +569,10 @@ def _profile_candidates_with_roots(
     explicit = getattr(args, "profile", None)
     if explicit is not None:
         profile_path = _lexical_path(Path(explicit))
-        configured_root = getattr(args, "cockpit_root", None)
-        root = (
-            _lexical_path(Path(configured_root))
-            if configured_root is not None
-            else _profile_inferred_root(profile_path)
-        )
-        candidates.append((profile_path, root))
+        # An explicit profile owns its inferred root.  In particular, an
+        # ambient XFLOW_COCKPIT_ROOT must not rebind a nested profile to an
+        # outer runtime after the profile has been validated.
+        candidates.append((profile_path, _profile_inferred_root(profile_path)))
 
     configured = _profile_env_path(
         os.environ,
@@ -605,6 +611,7 @@ def _profile_candidates_with_roots(
     unique: list[tuple[Path, Path]] = []
     seen: set[Path] = set()
     for candidate, root_path in candidates:
+        root_path = canonical_path(Path(root_path))
         if candidate not in seen:
             seen.add(candidate)
             unique.append((candidate, root_path))
@@ -625,7 +632,7 @@ def _validate_profile_binding(profile_path: Path, discovery_root: Path) -> Path:
     return canonical_profile
 
 
-def _load_runtime_profile(args: argparse.Namespace) -> tuple[Path, CockpitProfile]:
+def _select_runtime_profile(args: argparse.Namespace) -> _RuntimeProfileSelection:
     candidates_with_roots = _profile_candidates_with_roots(args)
     candidates = tuple(candidate for candidate, _root in candidates_with_roots)
     if not candidates:
@@ -651,25 +658,44 @@ def _load_runtime_profile(args: argparse.Namespace) -> tuple[Path, CockpitProfil
             searched = ", ".join(str(candidate) for candidate in candidates)
             raise ValueError(f"cockpit profile not found; searched: {searched}")
         profile_path, discovery_root = selected
-    canonical_profile = _validate_profile_binding(profile_path, discovery_root)
-    return canonical_profile, load_cockpit_profile(canonical_profile)
+
+    canonical_root = canonical_path(Path(discovery_root))
+    if explicit is not None:
+        owning_root = canonical_path(_profile_inferred_root(profile_path))
+        configured_root = getattr(args, "cockpit_root", None)
+        if configured_root is not None:
+            configured_canonical = canonical_path(Path(configured_root))
+            if configured_canonical != owning_root:
+                raise ValueError(
+                    "explicit cockpit profile root conflicts with --cockpit-root: "
+                    f"{configured_canonical} (profile root {owning_root})"
+                )
+        # The explicit profile's canonical owning root is the single source
+        # for validation and execution; environment discovery is ignored.
+        canonical_root = owning_root
+
+    canonical_profile = _validate_profile_binding(profile_path, canonical_root)
+    return _RuntimeProfileSelection(
+        profile_path=canonical_profile,
+        profile=load_cockpit_profile(canonical_profile),
+        cockpit_root=canonical_root,
+    )
+
+
+def _load_runtime_profile(args: argparse.Namespace) -> tuple[Path, CockpitProfile]:
+    """Load a profile while keeping the historical tuple return contract."""
+
+    selection = _select_runtime_profile(args)
+    return selection.profile_path, selection.profile
 
 
 def _cockpit_root_for(args: argparse.Namespace, profile_path: Path) -> Path:
-    configured = getattr(args, "cockpit_root", None)
-    if configured is None:
-        configured_root = cockpit_root_from_env(os.environ)
-    else:
-        configured_root = Path(configured)
-    if configured_root is not None:
-        root = canonical_path(Path(configured_root))
-    elif profile_path.parent.name == ".xflow":
-        root = canonical_path(profile_path.parent.parent)
-    else:
-        root = canonical_path(profile_path.parent)
-    if profile_path != root and root not in profile_path.parents:
-        raise ValueError(f"cockpit profile must stay under cockpit root: {profile_path}")
-    return root
+    # Keep this compatibility helper on the same selection path as runtime
+    # construction; no second root-discovery policy is allowed here.
+    selection = _select_runtime_profile(args)
+    if canonical_path(Path(profile_path)) != selection.profile_path:
+        raise ValueError(f"cockpit profile selection mismatch: {profile_path}")
+    return selection.cockpit_root
 
 
 def _profile_command_values(profile: CockpitProfile) -> tuple[str, ...]:
@@ -746,8 +772,9 @@ def _resolve_repo_name(
 
 
 def _runtime_for(args: argparse.Namespace) -> tuple[CockpitProfile, CockpitContext]:
-    profile_path, profile = _load_runtime_profile(args)
-    cockpit_root = _cockpit_root_for(args, profile_path)
+    selection = _select_runtime_profile(args)
+    profile = selection.profile
+    cockpit_root = selection.cockpit_root
     workspace_root = canonical_path(cockpit_root.parent)
     selected_name = getattr(args, "repo", None)
     if selected_name:
@@ -2458,6 +2485,15 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     return 0
 
 
+def _apply_parser_env_defaults(args: argparse.Namespace) -> None:
+    """Resolve project-sensitive parser defaults after target env loading."""
+
+    if hasattr(args, "release_tag") and args.release_tag is None:
+        args.release_tag = os.environ.get(
+            "XFLOW_GITHUB_ATTACHMENT_RELEASE_TAG", "xflow-attachments"
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     global _ACTIVE_REPO_ROOT, _ACTIVE_COCKPIT_PROFILE, _ACTIVE_COCKPIT_CONTEXT
     _ACTIVE_REPO_ROOT = None
@@ -2497,6 +2533,7 @@ def main(argv: list[str] | None = None) -> int:
             runtime_env = dict(os.environ)
             runtime_env["DEVCTL_REPO_ROOT"] = str(cockpit_context.repo_root)
             cockpit_context = replace(cockpit_context, env=runtime_env)
+        _apply_parser_env_defaults(args)
         _ACTIVE_COCKPIT_PROFILE = profile
         _ACTIVE_COCKPIT_CONTEXT = cockpit_context
         if cockpit_context is not None:

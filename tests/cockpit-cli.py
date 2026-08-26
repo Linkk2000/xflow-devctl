@@ -261,6 +261,131 @@ def test_discovered_profile_symlink_cannot_escape_cockpit_root() -> None:
         shutil.rmtree(root)
 
 
+def test_explicit_profile_root_wins_over_environment_root() -> None:
+    root, _workspace, cockpit, profile = _fixture()
+    try:
+        nested = cockpit / "nested"
+        nested_profile = nested / ".xflow" / "cockpit.yaml"
+        nested_profile.parent.mkdir(parents=True)
+        shutil.copyfile(profile, nested_profile)
+        nested_state = nested / "_ops" / "portable" / "state.py"
+        nested_state.parent.mkdir(parents=True)
+        write_text_lf(
+            nested_state,
+            "import sys\n"
+            "print('nested-state:' + '|'.join(sys.argv[1:]))\n",
+        )
+
+        result = _run(
+            cockpit,
+            "--profile",
+            str(nested_profile),
+            "state",
+            env_updates={"XFLOW_COCKPIT_ROOT": str(cockpit)},
+        )
+        assert "nested-state:show" in result.stdout
+    finally:
+        shutil.rmtree(root)
+
+
+def test_parser_project_env_defaults_are_resolved_after_loading() -> None:
+    root, workspace, cockpit, profile = _fixture()
+    release_tag_key = "XFLOW_GITHUB_ATTACHMENT_RELEASE_TAG"
+    try:
+        target_local = workspace / "xflow-web" / ".xflow" / "local"
+        target_local.mkdir(parents=True, exist_ok=True)
+        write_text_lf(target_local / "env.local", f"{release_tag_key}=target-tag\n")
+
+        def capture(argv: list[str], host_tag: str | None = None) -> str:
+            previous = os.environ.pop(release_tag_key, None)
+            env = {
+                "DEVCTL_REPO_ROOT": str(cockpit),
+                "DEVCTL_SKIP_PROVIDER_LOAD": "1",
+                "PYTHONPATH": str(OPS_ROOT),
+            }
+            if host_tag is not None:
+                env[release_tag_key] = host_tag
+            captured: list[str] = []
+            try:
+                with mock.patch.dict(os.environ, env, clear=False):
+                    with mock.patch.object(
+                        cli,
+                        "run_attachment",
+                        side_effect=lambda args: captured.append(args.release_tag) or 0,
+                    ):
+                        assert cli.main(argv) == 0
+                    return captured[-1]
+            finally:
+                os.environ.pop(release_tag_key, None)
+                if previous is not None:
+                    os.environ[release_tag_key] = previous
+
+        target_default = capture(
+            [
+                "--profile",
+                str(profile),
+                "--repo",
+                "xflow-web",
+                "attachment",
+                "publish",
+            ]
+        )
+        assert target_default == "target-tag"
+        assert capture(
+            [
+                "--profile",
+                str(profile),
+                "--repo",
+                "xflow-web",
+                "attachment",
+                "publish",
+                "--release-tag",
+                "explicit-tag",
+            ]
+        ) == "explicit-tag"
+        assert capture(
+            [
+                "--profile",
+                str(profile),
+                "--repo",
+                "xflow-web",
+                "attachment",
+                "publish",
+            ],
+            host_tag="host-tag",
+        ) == "host-tag"
+
+        plain = _repo(root, "plain")
+        plain_local = plain / ".xflow" / "local"
+        plain_local.mkdir(parents=True, exist_ok=True)
+        write_text_lf(plain_local / "env.local", f"{release_tag_key}=legacy-tag\n")
+        previous = os.environ.pop(release_tag_key, None)
+        captured: list[str] = []
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "DEVCTL_REPO_ROOT": str(plain),
+                    "DEVCTL_SKIP_PROVIDER_LOAD": "1",
+                    "PYTHONPATH": str(OPS_ROOT),
+                },
+                clear=False,
+            ):
+                with mock.patch.object(
+                    cli,
+                    "run_attachment",
+                    side_effect=lambda args: captured.append(args.release_tag) or 0,
+                ):
+                    assert cli.main(["attachment", "publish"]) == 0
+            assert captured == ["legacy-tag"]
+        finally:
+            os.environ.pop(release_tag_key, None)
+            if previous is not None:
+                os.environ[release_tag_key] = previous
+    finally:
+        shutil.rmtree(root)
+
+
 def test_cockpit_routes_and_all_preflight_order() -> None:
     root, _workspace, cockpit, profile = _fixture()
     try:
@@ -443,6 +568,8 @@ def main() -> None:
     test_unknown_option_fails_closed_for_legacy_command()
     test_target_project_env_is_loaded_after_repo_resolution()
     test_discovered_profile_symlink_cannot_escape_cockpit_root()
+    test_explicit_profile_root_wins_over_environment_root()
+    test_parser_project_env_defaults_are_resolved_after_loading()
     test_cockpit_routes_and_all_preflight_order()
     test_repo_resolution_rejects_non_sibling_and_missing_repositories()
     test_repo_resolution_honors_literal_profile_siblings()
