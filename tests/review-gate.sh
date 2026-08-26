@@ -4,6 +4,34 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OPS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+resolve_test_python() {
+  if [ -n "${TEST_PYTHON:-}" ]; then
+    printf '%s\n' "$TEST_PYTHON"
+    return 0
+  fi
+  if [ -n "${DEVCTL_PYTHON:-}" ]; then
+    printf '%s\n' "$DEVCTL_PYTHON"
+    return 0
+  fi
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+TEST_PYTHON="$(resolve_test_python)" || {
+  echo "[ERROR] review-gate requires TEST_PYTHON, DEVCTL_PYTHON, python3, or python." >&2
+  exit 1
+}
+if ! command -v "$TEST_PYTHON" >/dev/null 2>&1 && [ ! -x "$TEST_PYTHON" ]; then
+  printf '[ERROR] review-gate interpreter is not executable or not on PATH: %s\n' "$TEST_PYTHON" >&2
+  exit 1
+fi
+DEVCTL_PYTHON="${DEVCTL_PYTHON:-$TEST_PYTHON}"
+
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
@@ -16,7 +44,8 @@ git -C "$tmpdir" add README.md
 git -C "$tmpdir" commit -m init -q
 
 run_devctl() {
-  DEVCTL_REPO_ROOT="$tmpdir" DEVCTL_SKIP_PROVIDER_LOAD=1 bash "$OPS_ROOT/devctl" "$@"
+  DEVCTL_REPO_ROOT="$tmpdir" DEVCTL_SKIP_PROVIDER_LOAD=1 DEVCTL_PYTHON="$DEVCTL_PYTHON" \
+    bash "$OPS_ROOT/devctl" "$@"
 }
 
 expect_fail() {
@@ -37,7 +66,7 @@ expect_pass() {
 write_review() {
   local issue="$1" action="$2" file="$3"
   DEVCTL_REPO_ROOT="$tmpdir" PYTHONPATH="$OPS_ROOT${PYTHONPATH:+:$PYTHONPATH}" \
-    python - "$issue" "$action" "$file" <<'PY_REVIEW'
+    "$TEST_PYTHON" - "$issue" "$action" "$file" <<'PY_REVIEW'
 import os
 import sys
 from pathlib import Path
@@ -99,7 +128,7 @@ EOF_ISSUE
 
 expect_pass check issue-draft --file "$tmpdir/.xflow/issues/issue-draft/issue-draft.md"
 env -u DEVCTL_SKIP_PROVIDER_LOAD -u GITHUB_TOKEN -u GITHUB_ACCESS_TOKEN -u GITEE_TOKEN -u GITEE_ACCESS_TOKEN \
-  DEVCTL_REPO_ROOT="$tmpdir" GITEE_ENV_FILE="$tmpdir/missing.env" \
+  DEVCTL_REPO_ROOT="$tmpdir" DEVCTL_PYTHON="$DEVCTL_PYTHON" GITEE_ENV_FILE="$tmpdir/missing.env" \
   bash "$OPS_ROOT/devctl" check issue-draft --file "$tmpdir/.xflow/issues/issue-draft/issue-draft.md" >/dev/null
 
 cp "$tmpdir/.xflow/issues/issue-draft/issue-draft.md" "$tmpdir/.xflow/issues/issue-draft/issue-draft.valid.md"

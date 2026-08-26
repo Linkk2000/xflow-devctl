@@ -559,11 +559,24 @@ started from any current directory.
 
 It runs the declared Python 3.9 and current-Python lanes, including the POSIX
 launcher, legacy approval/project/classification/contract/task/trace gates, and
-cockpit profile, command, service, and CLI suites. It also runs the local
-`tests/review-gate.sh` shell gate. The optional PowerShell suite is run once with
-the current-Python lane and accepts exit 77 only when its executable capability
-is unavailable. Set `PYTHON39`, `PYTHON_CURRENT`, and optionally `BASE_REF` to
-override the interpreters and branch baseline, for example:
+cockpit profile, command, service, and CLI suites.
+
+Each lane scopes its own preflighted interpreter as `DEVCTL_PYTHON` while its
+tests run, keeping shell launchers on the same version even when `PATH` has no
+Python alias; the current interpreter is not injected into the Python 3.9 lane.
+The runner also runs the local `tests/review-gate.sh` shell gate and passes the
+preflighted current interpreter to the gate as both `TEST_PYTHON` (the gate's
+helper Python) and `DEVCTL_PYTHON` (the devctl launcher override); this scoped
+binding does not change the Python 3.9 lane. When run independently, the gate
+uses an explicit `TEST_PYTHON` for its helper, an explicit `DEVCTL_PYTHON`
+supplies both roles when `TEST_PYTHON` is absent, and otherwise it selects
+`python3` then `python` from `PATH`. The focused
+`tests/review-gate-binding.py` check verifies these overrides with a restricted
+`PATH` and an interpreter path containing spaces. The optional PowerShell suite
+is run once with the current-Python lane and accepts exit 77 only when its
+executable capability is unavailable. Set `PYTHON39`, `PYTHON_CURRENT`, and
+optionally `BASE_REF` to override the interpreters and branch baseline, for
+example:
 
 ```text
 PYTHON39=/path/to/python3.9 PYTHON_CURRENT=/path/to/python3.12 BASE_REF=origin/main sh tests/run-platform-runtime.sh

@@ -138,10 +138,10 @@ run_python_suite() {
     tests/trace-core.py
   do
     printf '[runner] %s %s\n' "$label" "$test_file"
-    "$python" "$test_file"
+    DEVCTL_PYTHON="$python" "$python" "$test_file"
   done
   printf '[runner] %s pycompile\n' "$label"
-  "$python" -m compileall -q xflow tests
+  DEVCTL_PYTHON="$python" "$python" -m compileall -q xflow tests
 }
 
 export PYTHONDONTWRITEBYTECODE=1
@@ -155,7 +155,10 @@ run_python_suite PYTHON39 "$PYTHON39"
 run_python_suite PYTHON_CURRENT "$PYTHON_CURRENT"
 
 printf '[runner] review-gate.sh\n'
-bash tests/review-gate.sh
+TEST_PYTHON="$PYTHON_CURRENT" DEVCTL_PYTHON="$PYTHON_CURRENT" bash tests/review-gate.sh
+
+printf '[runner] review-gate-binding.py\n'
+"$PYTHON_CURRENT" tests/review-gate-binding.py
 
 if "$PYTHON_CURRENT" tests/powershell-entrypoint.py; then
   :
