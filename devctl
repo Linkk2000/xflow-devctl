@@ -17,11 +17,48 @@ PYTHON=$(select_python) || {
   printf '%s\n' '[ERROR] devctl requires Python 3.9+; set DEVCTL_PYTHON.' >&2
   exit 1
 }
-case "${1:-help}" in
-  -h|--help|help|check|git|issue|preflight|approval|attachment|rules|migrate|unattended|task|contract|trace)
-    export DEVCTL_SKIP_PROVIDER_LOAD=1
-    ;;
-esac
+mark_provider_skip_for_command() {
+  scan_command=help
+  scan_value=
+  scan_after_options=
+  for scan_arg in "$@"; do
+    if [ -n "$scan_value" ]; then
+      scan_value=
+      continue
+    fi
+    if [ -n "$scan_after_options" ]; then
+      scan_command="$scan_arg"
+      break
+    fi
+    case "$scan_arg" in
+      --profile|--cockpit-root|--repo)
+        scan_value=1
+        ;;
+      --profile=*|--cockpit-root=*|--repo=*)
+        ;;
+      --)
+        scan_after_options=1
+        ;;
+      -h|--help|help|check|git|issue|preflight|approval|attachment|rules|migrate|unattended|task|contract|trace)
+        scan_command="$scan_arg"
+        break
+        ;;
+      -*)
+        break
+        ;;
+      *)
+        scan_command="$scan_arg"
+        break
+        ;;
+    esac
+  done
+  case "$scan_command" in
+    -h|--help|help|check|git|issue|preflight|approval|attachment|rules|migrate|unattended|task|contract|trace)
+      export DEVCTL_SKIP_PROVIDER_LOAD=1
+      ;;
+  esac
+}
+mark_provider_skip_for_command "$@"
 export DEVCTL_TOOL_ROOT="$ROOT" DEVCTL_OPS_ROOT="$ROOT" PYTHONDONTWRITEBYTECODE=1
 export DEVCTL_REPO_ROOT="${DEVCTL_REPO_ROOT:-$(pwd)}"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"

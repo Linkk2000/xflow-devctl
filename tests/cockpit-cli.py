@@ -38,8 +38,19 @@ def _repo(path: Path, name: str) -> Path:
     return result
 
 
-def _run(cockpit: Path, *args: str, expect: int = 0) -> subprocess.CompletedProcess[str]:
+def _run(
+    cockpit: Path,
+    *args: str,
+    expect: int = 0,
+    env_updates: dict[str, str | None] | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
+    if env_updates:
+        for key, value in env_updates.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
     env.update(
         {
             "DEVCTL_REPO_ROOT": str(cockpit),
@@ -124,12 +135,209 @@ def test_profile_repo_state_and_alias_routes() -> None:
             "--json",
         )
         assert "fixture-state:show|--json" in state_show.stdout
+        state_after_globals = _run(
+            cockpit,
+            "state",
+            "--profile",
+            str(profile),
+            "--repo",
+            "xflow-web",
+            "--json",
+        )
+        assert "fixture-state:show|--json" in state_after_globals.stdout
+        state_equals_globals = _run(
+            cockpit,
+            "--profile=" + str(profile),
+            "--cockpit-root=" + str(cockpit),
+            "--repo=xflow-web",
+            "state",
+        )
+        assert "fixture-state:show" in state_equals_globals.stdout
+
+        cwd_discovered = _run(cockpit, "--repo", "xflow-web", "git", "status")
+        assert "branch:" in cwd_discovered.stdout
 
         selected: list[tuple[str, bool]] = []
         with mock.patch.object(cli, "run_playground", side_effect=lambda _p, _c, target, opened: selected.append((target, opened)) or 0):
             assert cli.main(["--profile", str(profile), "--repo", "xflow-web", "pg", "f", "--no-browser"]) == 0
             assert cli.main(["--profile", str(profile), "--repo", "xflow-web", "playground", "bpmn", "--no-browser"]) == 0
         assert selected == [("f", False), ("bpmn", False)]
+    finally:
+        shutil.rmtree(root)
+
+
+def test_legacy_command_without_globals_does_not_require_profile() -> None:
+    root = Path(tempfile.mkdtemp(prefix="xflow-legacy-cli-"))
+    try:
+        repo = _repo(root, "plain")
+        result = _run(repo, "git", "status")
+        assert "branch:" in result.stdout
+    finally:
+        shutil.rmtree(root)
+
+
+def test_unknown_option_fails_closed_for_legacy_command() -> None:
+    root, _workspace, cockpit, _profile = _fixture()
+    try:
+        result = _run(cockpit, "git", "status", "--typo", expect=2)
+        assert "unrecognized arguments" in result.stderr
+    finally:
+        shutil.rmtree(root)
+
+
+def test_target_project_env_is_loaded_after_repo_resolution() -> None:
+    root, workspace, cockpit, profile = _fixture()
+    try:
+        local = cockpit / ".xflow" / "local"
+        local.mkdir(parents=True, exist_ok=True)
+        write_text_lf(local / "env.local", "TARGET_MARKER=cockpit\nXFLOW_PLATFORM=cockpit\n")
+        target = workspace / "xflow-web" / ".xflow" / "local"
+        target.mkdir(parents=True, exist_ok=True)
+        write_text_lf(target / "env.local", "TARGET_MARKER=target\nXFLOW_PLATFORM=target\n")
+
+        profile_text = profile.read_text(encoding="utf-8")
+        profile_text = profile_text.replace(
+            "  - PROFILE_MODE\n",
+            "  - PROFILE_MODE\n  - TARGET_MARKER\n  - XFLOW_PLATFORM\n",
+        )
+        profile_text = profile_text.replace(
+            "      PROFILE_MODE: \"{PROFILE_MODE}\"\n",
+            "      PROFILE_MODE: \"{PROFILE_MODE}\"\n"
+            "      TARGET_MARKER: \"{TARGET_MARKER}\"\n"
+            "      XFLOW_PLATFORM: \"{XFLOW_PLATFORM}\"\n",
+        )
+        write_text_lf(profile, profile_text)
+        state = cockpit / "_ops" / "portable" / "state.py"
+        write_text_lf(
+            state,
+            "import os\n"
+            "import sys\n"
+            "print('fixture-env:' + os.environ.get('TARGET_MARKER', '') + ':' + os.environ.get('XFLOW_PLATFORM', '') + '|' + '|'.join(sys.argv[1:]))\n",
+        )
+
+        target_result = _run(
+            cockpit,
+            "--profile",
+            str(profile),
+            "--cockpit-root",
+            str(cockpit),
+            "--repo",
+            "xflow-web",
+            "state",
+            env_updates={"TARGET_MARKER": None, "XFLOW_PLATFORM": None},
+        )
+        assert "fixture-env:target:target|" in target_result.stdout
+
+        host_result = _run(
+            cockpit,
+            "--profile",
+            str(profile),
+            "--cockpit-root",
+            str(cockpit),
+            "--repo",
+            "xflow-web",
+            "state",
+            env_updates={"TARGET_MARKER": "host", "XFLOW_PLATFORM": "host"},
+        )
+        assert "fixture-env:host:host|" in host_result.stdout
+    finally:
+        shutil.rmtree(root)
+
+
+def test_discovered_profile_symlink_cannot_escape_cockpit_root() -> None:
+    root, _workspace, cockpit, _profile = _fixture()
+    try:
+        outside = root / "outside"
+        outside.mkdir()
+        outside_profile = outside / "cockpit.yaml"
+        shutil.copyfile(FIXTURES / "cockpit-profile.yaml", outside_profile)
+        profile = cockpit / ".xflow" / "cockpit.yaml"
+        profile.unlink()
+        profile.symlink_to(outside_profile)
+        result = _run(cockpit, "--cockpit-root", str(cockpit), "state", expect=1)
+        assert "escapes" in result.stderr.lower() or "under cockpit root" in result.stderr.lower()
+        assert "fixture-state:" not in result.stdout
+    finally:
+        shutil.rmtree(root)
+
+
+def test_cockpit_routes_and_all_preflight_order() -> None:
+    root, _workspace, cockpit, profile = _fixture()
+    try:
+        env = {
+            "DEVCTL_REPO_ROOT": str(cockpit),
+            "DEVCTL_SKIP_PROVIDER_LOAD": "1",
+            "PYTHONPATH": str(OPS_ROOT),
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            calls: list[tuple[str, object]] = []
+            with mock.patch.object(
+                cli,
+                "run_cockpit_preflight",
+                side_effect=lambda _p, _c, warn: calls.append(("preflight", warn)) or 3,
+            ):
+                assert cli.main(["--profile", str(profile), "--repo", "xflow-web", "dev", "preflight", "--warn-only"]) == 3
+            assert calls == [("preflight", True)]
+
+            calls.clear()
+            with mock.patch.object(
+                cli,
+                "run_cockpit_docker",
+                side_effect=lambda _p, _c, action: calls.append(("docker", action)) or 0,
+            ):
+                assert cli.main(["--profile", str(profile), "--repo", "xflow-web", "dev", "docker", "setup"]) == 0
+                assert cli.main(["--profile", str(profile), "--repo", "xflow-web", "dev", "docker", "status"]) == 0
+            assert calls == [("docker", "setup"), ("docker", "status")]
+
+            calls.clear()
+            with mock.patch.object(
+                cli,
+                "run_playground",
+                side_effect=lambda _p, _c, target, opened: calls.append(("playground", (target, opened))) or 0,
+            ):
+                assert cli.main(
+                    ["--profile", str(profile), "--repo", "xflow-web", "dev", "playground", "w", "--no-browser"]
+                ) == 0
+            assert calls == [("playground", ("w", False))]
+
+            calls.clear()
+            with mock.patch.object(
+                cli,
+                "run_cockpit_preflight",
+                side_effect=lambda _p, _c, warn: calls.append(("preflight", warn)) or 1,
+            ), mock.patch.object(
+                cli,
+                "run_scenario",
+                side_effect=lambda _p, _c, scenario: calls.append(("scenario", scenario)) or 0,
+            ):
+                assert cli.main(["--profile", str(profile), "--repo", "xflow-web", "dev", "all"]) == 1
+            assert calls == [("preflight", False)]
+
+            calls.clear()
+            with mock.patch.object(
+                cli,
+                "run_cockpit_preflight",
+                side_effect=lambda _p, _c, warn: calls.append(("preflight", warn)) or 0,
+            ), mock.patch.object(
+                cli,
+                "run_scenario",
+                side_effect=lambda _p, _c, scenario: calls.append(("scenario", scenario)) or 7,
+            ):
+                assert cli.main(["--profile", str(profile), "--repo", "xflow-web", "dev", "all"]) == 7
+            assert calls == [("preflight", False), ("scenario", "run")]
+
+            calls.clear()
+            with mock.patch.object(
+                cli,
+                "run_cockpit_preflight",
+                side_effect=lambda _p, _c, warn: calls.append(("preflight", warn)) or 0,
+            ), mock.patch.object(
+                cli,
+                "run_scenario",
+                side_effect=lambda _p, _c, scenario: calls.append(("scenario", scenario)) or 0,
+            ):
+                assert cli.main(["--profile", str(profile), "--repo", "xflow-web", "run"]) == 0
+            assert calls == [("scenario", "run")]
     finally:
         shutil.rmtree(root)
 
@@ -231,6 +439,11 @@ def test_existing_issue_list_route_is_preserved() -> None:
 
 def main() -> None:
     test_profile_repo_state_and_alias_routes()
+    test_legacy_command_without_globals_does_not_require_profile()
+    test_unknown_option_fails_closed_for_legacy_command()
+    test_target_project_env_is_loaded_after_repo_resolution()
+    test_discovered_profile_symlink_cannot_escape_cockpit_root()
+    test_cockpit_routes_and_all_preflight_order()
     test_repo_resolution_rejects_non_sibling_and_missing_repositories()
     test_repo_resolution_honors_literal_profile_siblings()
     test_unsupported_command_fails_before_profile_or_process_side_effect()

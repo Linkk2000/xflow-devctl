@@ -90,26 +90,51 @@ def profile_path_from_env(env: Mapping[str, str]) -> Optional[Path]:
     return None
 
 
-def env_file_candidates(env: Mapping[str, str]) -> list[tuple[Path, str]]:
+def env_file_candidates(
+    env: Mapping[str, str],
+    *,
+    project_root: Optional[Path] = None,
+    include_user: bool = True,
+    include_project: bool = True,
+    include_explicit: bool = True,
+) -> list[tuple[Path, str]]:
     home = home_from_env(env)
-    repo_root = repo_root_from_env(env)
-    candidates = [
-        (home / "gitee.env.local", "user"),
-        (home / ".xflow" / "env.local", "user"),
-        (repo_root / ".xflow" / "local" / "env.local", "project"),
-    ]
+    repo_root = repo_root_from_env(env) if project_root is None else canonical_path(project_root)
+    candidates: list[tuple[Path, str]] = []
+    if include_user:
+        candidates.extend(
+            [
+                (home / "gitee.env.local", "user"),
+                (home / ".xflow" / "env.local", "user"),
+            ]
+        )
+    if include_project:
+        candidates.append((repo_root / ".xflow" / "local" / "env.local", "project"))
     explicit = env.get("XFLOW_ENV_FILE", "").strip()
-    if explicit:
+    if include_explicit and explicit:
         candidates.append((canonical_path(Path(explicit)), "explicit"))
     return candidates
 
 
-def load_env_files(env: MutableMapping[str, str]) -> list[Path]:
+def load_env_files(
+    env: MutableMapping[str, str],
+    *,
+    project_root: Optional[Path] = None,
+    include_user: bool = True,
+    include_project: bool = True,
+    include_explicit: bool = True,
+) -> list[Path]:
     original_keys = {key for key, value in env.items() if value}
     merged: dict[str, str] = {}
     loaded: list[Path] = []
 
-    for path, scope in env_file_candidates(env):
+    for path, scope in env_file_candidates(
+        env,
+        project_root=project_root,
+        include_user=include_user,
+        include_project=include_project,
+        include_explicit=include_explicit,
+    ):
         expanded = canonical_path(path)
         if not expanded.is_file():
             continue
@@ -124,7 +149,48 @@ def load_env_files(env: MutableMapping[str, str]) -> list[Path]:
             env[key] = value
 
     if loaded:
-        env["XFLOW_LOADED_ENV_FILES"] = os.pathsep.join(str(path) for path in loaded)
+        previous = [value for value in env.get("XFLOW_LOADED_ENV_FILES", "").split(os.pathsep) if value]
+        env["XFLOW_LOADED_ENV_FILES"] = os.pathsep.join(previous + [str(path) for path in loaded])
+    return loaded
+
+
+def load_target_env_files(
+    env: MutableMapping[str, str],
+    repo_root: Path,
+    *,
+    preserve_keys: set[str] | frozenset[str] = frozenset(),
+) -> list[Path]:
+    """Load target-project context after a canonical repository is selected.
+
+    User environment is intentionally loaded by ``load_env_files`` first.  A
+    target project then overrides those values, while explicitly supplied host
+    variables (and values from an explicitly selected env file) remain
+    authoritative.
+    """
+
+    candidates = env_file_candidates(
+        env,
+        project_root=repo_root,
+        include_user=False,
+        include_project=True,
+        include_explicit=True,
+    )
+    merged: dict[str, str] = {}
+    loaded: list[Path] = []
+    for path, _scope in candidates:
+        expanded = canonical_path(path)
+        if not expanded.is_file():
+            continue
+        merged.update(parse_env_file(expanded))
+        loaded.append(expanded)
+
+    preserved = set(preserve_keys)
+    for key, value in merged.items():
+        if key not in preserved:
+            env[key] = value
+    if loaded:
+        previous = [value for value in env.get("XFLOW_LOADED_ENV_FILES", "").split(os.pathsep) if value]
+        env["XFLOW_LOADED_ENV_FILES"] = os.pathsep.join(previous + [str(path) for path in loaded])
     return loaded
 
 

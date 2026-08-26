@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 OPS_ROOT = Path(__file__).resolve().parents[1]
+FIXTURES = OPS_ROOT / "tests" / "fixtures"
 sys.path.insert(0, str(OPS_ROOT))
 
 from tests.support import write_text_lf
@@ -210,6 +211,83 @@ def assert_posix_launcher_routes_core() -> None:
     assert "dependencies" in result.stdout
 
 
+def assert_posix_launcher_preserves_global_args_and_skips_provider() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        fake_python = root / "fake-python"
+        write(
+            fake_python,
+            "#!/bin/sh\n"
+            "if [ \"${1:-}\" = \"-c\" ]; then exit 0; fi\n"
+            "printf 'skip=%s\\n' \"${DEVCTL_SKIP_PROVIDER_LOAD:-}\"\n"
+            "printf 'args=%s\\n' \"$*\"\n",
+        )
+        fake_python.chmod(0o755)
+        env = test_env()
+        env.pop("DEVCTL_SKIP_PROVIDER_LOAD", None)
+        env["DEVCTL_PYTHON"] = str(fake_python)
+        env["DEVCTL_REPO_ROOT"] = str(root)
+        root_args = (
+            "--profile=/tmp/profile.yaml",
+            "--cockpit-root",
+            str(root),
+            "--repo",
+            "demo",
+            "git",
+            "status",
+        )
+        result = subprocess.run(
+            [str(OPS_ROOT / "devctl"), *root_args],
+            cwd=root,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "skip=1" in result.stdout
+        assert "args=-m xflow " + " ".join(root_args) in result.stdout
+
+        tool_root = root / ".xflow" / "ops" / "devctl"
+        (tool_root / "xflow").mkdir(parents=True)
+        wrapper = root / "devctl-wrapper"
+        write(wrapper, wrapper_files()["devctl"])
+        wrapper.chmod(0o755)
+        wrapper_args = (
+            "--profile",
+            "/tmp/profile.yaml",
+            "--cockpit-root=" + str(root),
+            "--repo=demo",
+            "issue",
+            "list",
+        )
+        wrapper_result = subprocess.run(
+            [str(wrapper), *wrapper_args],
+            cwd=root,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert wrapper_result.returncode == 0, wrapper_result.stderr
+        assert "skip=1" in wrapper_result.stdout
+        assert "args=-m xflow " + " ".join(wrapper_args) in wrapper_result.stdout
+
+        default_result = subprocess.run(
+            [str(OPS_ROOT / "devctl")],
+            cwd=root,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert default_result.returncode == 0, default_result.stderr
+        assert "skip=1" in default_result.stdout
+
+
 def assert_check_commands_are_discoverable() -> None:
     env = test_env()
     commands = (
@@ -374,6 +452,7 @@ def main() -> None:
     assert_no_legacy_run_command()
     assert_generated_wrapper_contract()
     assert_posix_launcher_routes_core()
+    assert_posix_launcher_preserves_global_args_and_skips_provider()
     assert_check_commands_are_discoverable()
     assert_unattended_commands_are_discoverable()
     assert_task_commands_are_discoverable()
@@ -389,6 +468,9 @@ def main() -> None:
         assert_commit_message_check_routing(root)
         repo = root / "work"
         repo.mkdir()
+        profile = repo / ".xflow" / "cockpit.yaml"
+        profile.parent.mkdir(parents=True)
+        write(profile, (FIXTURES / "cockpit-profile.yaml").read_text(encoding="utf-8"))
         origin = root / "origin.git"
         subprocess.run(["git", "init", "--bare", str(origin)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         git(repo, "init", "-q")
@@ -473,7 +555,20 @@ Closes #1
 
         git(repo, "config", "--local", "devctl.issue", "draft")
         write(current_task, current_task.read_text(encoding="utf-8").replace("Issue: 1", "Issue: draft"))
-        issue_result = run_posix_devctl(repo, "issue", "create", "Python routing", "--body-file", str(issue_file))
+        issue_result = run_posix_devctl(
+            repo,
+            "--profile",
+            str(profile),
+            "--cockpit-root",
+            str(repo),
+            "--repo",
+            repo.name,
+            "issue",
+            "create",
+            "Python routing",
+            "--body-file",
+            str(issue_file),
+        )
         assert "issue-create gate passed; provider skipped" in issue_result.stdout
         git(repo, "config", "--local", "devctl.issue", "1")
         write(current_task, current_task.read_text(encoding="utf-8").replace("Issue: draft", "Issue: 1"))
