@@ -543,6 +543,22 @@ available; exit 77 means a capability skip, not a pass. On Windows, do not run b
 compatibility checks may use `bash -n` only when an explicit POSIX shell is
 selected outside Windows.
 
+Run the deterministic full platform-runtime regression from the repository root:
+
+```text
+sh tests/run-platform-runtime.sh
+```
+
+It runs the declared Python 3.9 and current-Python lanes, including the POSIX
+launcher, legacy Git/Issue/approval core, and cockpit profile, command, service,
+and CLI suites. The optional PowerShell suite is run once with the current-Python
+lane and accepts exit 77 only when its executable capability is unavailable. Set
+`PYTHON39` and `PYTHON_CURRENT` to override the two interpreters, for example:
+
+```text
+PYTHON39=/path/to/python3.9 PYTHON_CURRENT=python3 sh tests/run-platform-runtime.sh
+```
+
 Search anchor: Normal Git, Issue, Attachment, Approval, Rules, and Migration commands route through Python core.
 Search anchor: Do not run bare bash/Git-Bash/WSL for normal XFlow validation on Windows.
 Search anchor: do not run bare `bash`, Git Bash, or WSL for normal XFlow validation.
