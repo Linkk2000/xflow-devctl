@@ -87,6 +87,28 @@ if mode == "tree-ignore-term":
         ]
     )
     Path(os.environ["CHILD_PID_FILE"]).write_text(str(child.pid), encoding="utf-8")
+if mode == "tree-term":
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    Path(os.environ["CHILD_PID_FILE"]).write_text(str(child.pid), encoding="utf-8")
+    name = "playground"
+    event("start:" + name)
+
+    def stop_tree(_signum: int, _frame: object) -> None:
+        event("stop:" + name)
+        try:
+            child.terminate()
+            child.wait(timeout=1)
+        except Exception:
+            try:
+                child.kill()
+            except Exception:
+                pass
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop_tree)
+    signal.signal(signal.SIGINT, stop_tree)
+    while True:
+        time.sleep(0.02)
 
 name = sys.argv[-1] if mode == "service" else "playground"
 event("start:" + name)
@@ -300,8 +322,10 @@ def test_playground_build_failure_does_not_start_process() -> None:
         assert not (context.run_dir / "flowable.pid").exists()
 
 
-def _run_sigterm_case(root: Path, mode: str) -> tuple[subprocess.Popen[str], Optional[int]]:
-    """Run one real parent CLI process so SIGTERM exercises the public wrapper."""
+def _run_signal_case(
+    root: Path, mode: str, signum: signal.Signals
+) -> tuple[subprocess.Popen[str], Optional[int], Optional[int]]:
+    """Run a parent process and synchronize the signal with its health probe."""
 
     runner = root / "signal-runner.py"
     write_text_lf(
@@ -314,17 +338,19 @@ def _run_sigterm_case(root: Path, mode: str) -> tuple[subprocess.Popen[str], Opt
         "from xflow.cockpit import CockpitContext, load_cockpit_profile\n"
         "from xflow.services import run_playground, run_scenario\n"
         f"root = __import__('pathlib').Path({str(root)!r})\n"
+        "probe_path = root / 'health-probe'\n"
         "profile = load_cockpit_profile(root / '.xflow' / 'supervisor.yaml')\n"
         "if sys.argv[1] == 'scenario':\n"
-        "    service = replace(profile.services['server'], command=replace(profile.services['server'].command, argv=(sys.executable, str(root / 'fixture-process.py'), 'tree-ignore-term')))\n"
+        "    service = replace(profile.services['server'], command=replace(profile.services['server'].command, argv=(sys.executable, str(root / 'fixture-process.py'), 'tree-term')))\n"
         "    profile = replace(profile, services={**profile.services, 'server': service}, scenarios={'run': replace(profile.scenarios['run'], services=('server',), open_url=None)})\n"
         "else:\n"
-        "    playground = replace(profile.playgrounds['flowable'], command=replace(profile.playgrounds['flowable'].command, argv=(sys.executable, str(root / 'fixture-process.py'), 'tree-ignore-term')), build=None)\n"
+        "    playground = replace(profile.playgrounds['flowable'], command=replace(profile.playgrounds['flowable'].command, argv=(sys.executable, str(root / 'fixture-process.py'), 'tree-term')), build=None)\n"
         "    profile = replace(profile, playgrounds={**profile.playgrounds, 'flowable': playground})\n"
         "env = dict(os.environ)\n"
         "env.update({'EVENT_FILE': str(root / 'events.log'), 'DEP_ATTEMPTS_FILE': str(root / 'dep-attempts'), 'FAIL_DEPENDENCY': '', 'CHILD_PID_FILE': str(root / 'child.pid'), 'PLAYGROUND_BUILD_FILE': str(root / 'build.marker')})\n"
         "context = CockpitContext(root, root.parent, root, __import__('pathlib').Path(sys.executable), root / '.xflow' / 'run', env)\n"
         "def blocked(_url: str, timeout: object = None) -> object:\n"
+        "    probe_path.write_text('entered', encoding='ascii')\n"
         "    while True:\n"
         "        time.sleep(10)\n"
         "services.urlopen = blocked\n"
@@ -337,6 +363,9 @@ def _run_sigterm_case(root: Path, mode: str) -> tuple[subprocess.Popen[str], Opt
         "if signal.getsignal(signal.SIGINT) is not old_int or signal.getsignal(signal.SIGTERM) is not old_term:\n"
         "    print('handlers-not-restored', file=sys.stderr)\n"
         "    raise SystemExit(91)\n"
+        "log_name = 'server.log' if sys.argv[1] == 'scenario' else 'flowable.log'\n"
+        "with (context.run_dir / log_name).open('a', encoding='utf-8') as stream:\n"
+        "    stream.write('runner-reopened\\n')\n"
         "print('result=' + str(result), flush=True)\n"
         "raise SystemExit(result)\n",
     )
@@ -363,16 +392,60 @@ def _run_sigterm_case(root: Path, mode: str) -> tuple[subprocess.Popen[str], Opt
         stderr=subprocess.PIPE,
     )
     child_pid: Optional[int] = None
-    for _ in range(100):
+    leader_pid: Optional[int] = None
+    pid_name = "server.pid" if mode == "scenario" else "flowable.pid"
+    for _ in range(200):
         child_pid = _read_pid(root / "child.pid")
-        if child_pid is not None:
+        leader_pid = _read_pid(root / ".xflow" / "run" / pid_name)
+        if child_pid is not None and leader_pid is not None and (root / "health-probe").exists():
             break
         if process.poll() is not None:
             break
         time.sleep(0.02)
-    assert child_pid is not None, process.stderr.read() if process.stderr else ""
-    os.kill(process.pid, signal.SIGTERM)
-    return process, child_pid
+    if child_pid is None or leader_pid is None or not (root / "health-probe").exists():
+        if process.poll() is None:
+            process.kill()
+        stdout, stderr = process.communicate(timeout=2)
+        raise AssertionError((stdout, stderr))
+    os.kill(process.pid, signum)
+    return process, leader_pid, child_pid
+
+
+def _assert_signal_case(
+    root: Path, mode: str, signum: signal.Signals, expected: int
+) -> None:
+    process, leader_pid, child_pid = _run_signal_case(root, mode, signum)
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            stdout, stderr = process.communicate(timeout=2)
+            _kill_pid(leader_pid)
+            _kill_pid(child_pid)
+            raise AssertionError(("signal cleanup timed out", stdout, stderr)) from exc
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        _kill_pid(leader_pid)
+        _kill_pid(child_pid)
+    assert process.returncode == expected, (stdout, stderr)
+    assert f"result={expected}" in stdout
+    for _ in range(50):
+        if not _pid_alive(leader_pid) and not _pid_alive(child_pid):
+            break
+        time.sleep(0.02)
+    assert not _pid_alive(leader_pid)
+    assert not _pid_alive(child_pid)
+    pid_name = "server.pid" if mode == "scenario" else "flowable.pid"
+    log_name = "server.log" if mode == "scenario" else "flowable.log"
+    assert not (root / ".xflow" / "run" / pid_name).exists()
+    log_path = root / ".xflow" / "run" / log_name
+    assert "runner-reopened" in log_path.read_text(encoding="utf-8")
+    with log_path.open("a", encoding="utf-8") as stream:
+        stream.write("reopened\n")
+    assert "reopened" in log_path.read_text(encoding="utf-8")
 
 
 def test_run_scenario_sigterm_cleans_tree_and_restores_handlers() -> None:
@@ -381,12 +454,16 @@ def test_run_scenario_sigterm_cleans_tree_and_restores_handlers() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw).resolve()
         _profile(root)
-        process, child_pid = _run_sigterm_case(root, "scenario")
-        stdout, stderr = process.communicate(timeout=5)
-        assert process.returncode == 143, (stdout, stderr)
-        assert "result=143" in stdout
-        assert not _pid_alive(child_pid)
-        assert not (root / ".xflow" / "run" / "server.pid").exists()
+        _assert_signal_case(root, "scenario", signal.SIGTERM, 143)
+
+
+def test_run_scenario_sigint_cleans_tree_and_restores_handlers() -> None:
+    if os.name == "nt":
+        return
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        _profile(root)
+        _assert_signal_case(root, "scenario", signal.SIGINT, 130)
 
 
 def test_run_playground_sigterm_cleans_tree_and_restores_handlers() -> None:
@@ -395,12 +472,16 @@ def test_run_playground_sigterm_cleans_tree_and_restores_handlers() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw).resolve()
         _profile(root)
-        process, child_pid = _run_sigterm_case(root, "playground")
-        stdout, stderr = process.communicate(timeout=5)
-        assert process.returncode == 143, (stdout, stderr)
-        assert "result=143" in stdout
-        assert not _pid_alive(child_pid)
-        assert not (root / ".xflow" / "run" / "flowable.pid").exists()
+        _assert_signal_case(root, "playground", signal.SIGTERM, 143)
+
+
+def test_run_playground_sigint_cleans_tree_and_restores_handlers() -> None:
+    if os.name == "nt":
+        return
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        _profile(root)
+        _assert_signal_case(root, "playground", signal.SIGINT, 130)
 
 
 def test_dependency_up_timeout_uses_absolute_budget_and_controlled_error() -> None:
@@ -1653,7 +1734,9 @@ def main() -> None:
         test_playground_alias_builds_before_spawn_and_opens_after_ready,
         test_playground_build_failure_does_not_start_process,
         test_run_scenario_sigterm_cleans_tree_and_restores_handlers,
+        test_run_scenario_sigint_cleans_tree_and_restores_handlers,
         test_run_playground_sigterm_cleans_tree_and_restores_handlers,
+        test_run_playground_sigint_cleans_tree_and_restores_handlers,
         test_dependency_up_timeout_uses_absolute_budget_and_controlled_error,
         test_dependency_up_success_after_deadline_is_rejected,
         test_dependency_ready_execution_error_identifies_ready_stage,

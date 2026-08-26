@@ -57,7 +57,7 @@ class _TerminationFailure(ValueError):
     """Raised when a supervisor cannot prove that an owned tree stopped."""
 
 
-class _SupervisorSignal(Exception):
+class _SupervisorSignal(BaseException):
     """Internal signal interruption that carries the stable CLI exit code."""
 
     def __init__(self, exit_code: int) -> None:
