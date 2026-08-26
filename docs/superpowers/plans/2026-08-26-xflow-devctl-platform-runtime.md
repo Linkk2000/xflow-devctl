@@ -270,7 +270,7 @@ git commit -m "feat(entrypoint): 增加 POSIX Python 启动路径" -m "- 按固�
 - Produces: `DockerSpec(cli_check: CommandSpec, compose_check: CommandSpec, engine_probe: CommandSpec, image_probe: Optional[CommandSpec], startup_timeout_seconds: int)`
 - Produces: `ScenarioSpec(services: tuple[str, ...], open_url: Optional[str])`
 - Produces: `PlaygroundSpec(id: str, aliases: tuple[str, ...], command: CommandSpec, build: Optional[CommandSpec], url: str)`
-- Produces: `CockpitProfile(version: int, state_command: CommandSpec, checks: tuple[CheckSpec, ...], docker: DockerSpec, dependencies: Mapping[str, ComposeDependency], services: Mapping[str, ServiceSpec], scenarios: Mapping[str, ScenarioSpec], playgrounds: Mapping[str, PlaygroundSpec])`
+- Produces: `CockpitProfile(version: int, repositories: tuple[str, ...], default_playground: Optional[str], state_command: CommandSpec, checks: tuple[CheckSpec, ...], docker: DockerSpec, dependencies: Mapping[str, ComposeDependency], services: Mapping[str, ServiceSpec], scenarios: Mapping[str, ScenarioSpec], playgrounds: Mapping[str, PlaygroundSpec])`
 - Produces: `load_cockpit_profile(path: Path) -> CockpitProfile`
 - Produces: `expand_profile_path(value: str, cockpit_root: Path, workspace_root: Path, repo_root: Path) -> Path`
 

@@ -204,13 +204,13 @@ def build_parser() -> argparse.ArgumentParser:
     docker_sub.add_parser("status")
     dev_sub.add_parser("all", help="run the profile's default development scenario")
     dev_playground = dev_sub.add_parser("playground", help="run a configured playground")
-    dev_playground.add_argument("target", nargs="?", default="flowable")
+    dev_playground.add_argument("target", nargs="?", default=None)
     dev_playground.add_argument("--no-browser", dest="open_browser", action="store_false")
 
     sub.add_parser("run", help="run the profile's default development scenario")
     for alias in ("pg", "playground"):
         alias_parser = sub.add_parser(alias, help="run a configured playground")
-        alias_parser.add_argument("target", nargs="?", default="flowable")
+        alias_parser.add_argument("target", nargs="?", default=None)
         alias_parser.add_argument("--no-browser", dest="open_browser", action="store_false")
 
     check = sub.add_parser("check")
@@ -565,14 +565,21 @@ def _profile_candidates(args: argparse.Namespace) -> tuple[Path, ...]:
 def _profile_candidates_with_roots(
     args: argparse.Namespace,
 ) -> tuple[tuple[Path, Path], ...]:
-    candidates: list[tuple[Path, Path]] = []
     explicit = getattr(args, "profile", None)
     if explicit is not None:
         profile_path = _lexical_path(Path(explicit))
         # An explicit profile owns its inferred root.  In particular, an
         # ambient XFLOW_COCKPIT_ROOT must not rebind a nested profile to an
         # outer runtime after the profile has been validated.
-        candidates.append((profile_path, _profile_inferred_root(profile_path)))
+        return ((profile_path, _profile_inferred_root(profile_path)),)
+
+    explicit_root = getattr(args, "cockpit_root", None)
+    if explicit_root is not None:
+        root_path = _lexical_path(Path(explicit_root))
+        return (
+            (root_path / ".xflow" / "cockpit.yaml", root_path),
+            (root_path / "cockpit.yaml", root_path),
+        )
 
     configured = _profile_env_path(
         os.environ,
@@ -580,33 +587,24 @@ def _profile_candidates_with_roots(
     )
     if configured is not None:
         env_root = cockpit_root_from_env(os.environ)
-        candidates.append((configured, env_root or _profile_inferred_root(configured)))
+        return ((configured, env_root or _profile_inferred_root(configured)),)
 
-    root = getattr(args, "cockpit_root", None)
-    if root is None:
-        root = cockpit_root_from_env(os.environ)
-    if root is not None:
-        root_path = _lexical_path(Path(root))
-        candidates.extend(
-            (
-                (root_path / ".xflow" / "cockpit.yaml", root_path),
-                (root_path / "cockpit.yaml", root_path),
-            )
+    configured_root = cockpit_root_from_env(os.environ)
+    if configured_root is not None:
+        root_path = _lexical_path(configured_root)
+        return (
+            (root_path / ".xflow" / "cockpit.yaml", root_path),
+            (root_path / "cockpit.yaml", root_path),
         )
 
-    if (
-        _cockpit_command_requested(args)
-        or getattr(args, "profile", None) is not None
-        or getattr(args, "cockpit_root", None) is not None
-        or getattr(args, "repo", None) is not None
-    ):
+    if _cockpit_command_requested(args) or getattr(args, "repo", None) is not None:
         current = _lexical_path(Path.cwd())
-        candidates.extend(
-            (
-                (current / ".xflow" / "cockpit.yaml", current),
-                (current / "cockpit.yaml", current),
-            )
-        )
+        candidates = [
+            (current / ".xflow" / "cockpit.yaml", current),
+            (current / "cockpit.yaml", current),
+        ]
+    else:
+        candidates = []
 
     unique: list[tuple[Path, Path]] = []
     seen: set[Path] = set()
@@ -698,59 +696,6 @@ def _cockpit_root_for(args: argparse.Namespace, profile_path: Path) -> Path:
     return selection.cockpit_root
 
 
-def _profile_command_values(profile: CockpitProfile) -> tuple[str, ...]:
-    values: list[str] = []
-
-    def add(command: object) -> None:
-        if command is None:
-            return
-        values.extend(str(value) for value in getattr(command, "argv", ()))
-        cwd = getattr(command, "cwd", None)
-        if cwd is not None:
-            values.append(str(cwd))
-        values.extend(str(value) for value in getattr(command, "env", {}).values())
-
-    add(profile.state_command)
-    for check in profile.checks:
-        add(check.command)
-    for command in (
-        profile.docker.cli_check,
-        profile.docker.compose_check,
-        profile.docker.engine_probe,
-        profile.docker.image_probe,
-    ):
-        add(command)
-    for dependency in profile.dependencies.values():
-        add(dependency.up)
-        add(dependency.ready)
-        values.append(dependency.cwd)
-    for service in profile.services.values():
-        add(service.command)
-        values.append(service.log_file)
-    for playground in profile.playgrounds.values():
-        add(playground.command)
-        add(playground.build)
-    return tuple(values)
-
-
-def _declared_repo_names(profile: CockpitProfile) -> frozenset[str]:
-    """Infer literal sibling names from profile paths without adding product knowledge."""
-
-    names: set[str] = set()
-    marker = "{workspace}/"
-    for value in _profile_command_values(profile):
-        start = 0
-        while True:
-            index = value.find(marker, start)
-            if index < 0:
-                break
-            suffix = value[index + len(marker) :].split("/", 1)[0]
-            if suffix and "{" not in suffix and "}" not in suffix:
-                names.add(suffix)
-            start = index + len(marker)
-    return frozenset(names)
-
-
 def _resolve_repo_name(
     name: str,
     *,
@@ -760,14 +705,13 @@ def _resolve_repo_name(
 ) -> Path:
     if not name or name in {".", ".."} or "/" in name or "\\" in name:
         raise ValueError(f"repository must be a declared sibling name: {name}")
+    if name not in profile.repositories:
+        raise ValueError(f"repository is not declared by cockpit profile: {name}")
     candidate = canonical_path(workspace_root / name)
     if candidate.parent != canonical_path(workspace_root):
         raise ValueError(f"repository must stay under workspace root: {name}")
     if not candidate.is_dir():
         raise ValueError(f"repository sibling does not exist: {name}")
-    declared = _declared_repo_names(profile)
-    if declared and name not in declared and candidate != canonical_path(cockpit_root):
-        raise ValueError(f"repository is not declared by cockpit profile: {name}")
     return candidate
 
 
@@ -2426,6 +2370,16 @@ def _cockpit_runtime() -> tuple[CockpitProfile, CockpitContext]:
     return _ACTIVE_COCKPIT_PROFILE, _ACTIVE_COCKPIT_CONTEXT
 
 
+def _playground_target(profile: CockpitProfile, target: str | None) -> str:
+    if target is not None:
+        return target
+    if profile.default_playground is None:
+        raise ValueError(
+            "playground target is required when profile has no defaultPlayground"
+        )
+    return profile.default_playground
+
+
 def _run_cockpit(args: argparse.Namespace) -> int:
     profile, cockpit_context = _cockpit_runtime()
     if args.command == "state":
@@ -2441,11 +2395,21 @@ def _run_cockpit(args: argparse.Namespace) -> int:
                 return preflight_result
             return run_scenario(profile, cockpit_context, "run")
         if args.dev_command == "playground":
-            return run_playground(profile, cockpit_context, args.target, args.open_browser)
+            return run_playground(
+                profile,
+                cockpit_context,
+                _playground_target(profile, args.target),
+                args.open_browser,
+            )
     if args.command == "run":
         return run_scenario(profile, cockpit_context, "run")
     if args.command in {"pg", "playground"}:
-        return run_playground(profile, cockpit_context, args.target, args.open_browser)
+        return run_playground(
+            profile,
+            cockpit_context,
+            _playground_target(profile, args.target),
+            args.open_browser,
+        )
     supported = ", ".join(SUPPORTED_COCKPIT_COMMANDS)
     raise ValueError(f"unsupported cockpit command: {args.command}; supported: {supported}")
 
@@ -2494,6 +2458,31 @@ def _apply_parser_env_defaults(args: argparse.Namespace) -> None:
         )
 
 
+def _is_compat_help_invocation(argv: list[str]) -> bool:
+    """Recognize legacy ``devctl help`` without loading runtime state."""
+
+    if not argv:
+        return True
+    index = 0
+    found_help = False
+    while index < len(argv):
+        argument = str(argv[index])
+        if argument == "help":
+            found_help = True
+            index += 1
+            continue
+        if argument in _GLOBAL_OPTIONS:
+            if index + 1 >= len(argv):
+                return False
+            index += 2
+            continue
+        if any(argument.startswith(option + "=") for option in _GLOBAL_OPTIONS):
+            index += 1
+            continue
+        return False
+    return found_help
+
+
 def main(argv: list[str] | None = None) -> int:
     global _ACTIVE_REPO_ROOT, _ACTIVE_COCKPIT_PROFILE, _ACTIVE_COCKPIT_CONTEXT
     _ACTIVE_REPO_ROOT = None
@@ -2501,6 +2490,9 @@ def main(argv: list[str] | None = None) -> int:
     _ACTIVE_COCKPIT_CONTEXT = None
     parser = build_parser()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if _is_compat_help_invocation(raw_argv):
+        parser.print_help()
+        return 0
     args = parser.parse_args(_normalize_global_argv(raw_argv))
     host_env_keys = {key for key, value in os.environ.items() if value}
     runtime_requested = (

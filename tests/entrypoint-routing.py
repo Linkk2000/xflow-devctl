@@ -289,6 +289,111 @@ def assert_posix_launcher_preserves_global_args_and_skips_provider() -> None:
         assert "skip=1" in default_result.stdout
 
 
+def assert_help_is_available_without_profile_or_provider() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        env = test_env()
+        for key in (
+            "XFLOW_PROFILE",
+            "XFLOW_COCKPIT_PROFILE",
+            "DEVCTL_PROFILE",
+            "DEVCTL_COCKPIT_PROFILE",
+            "XFLOW_COCKPIT_ROOT",
+            "DEVCTL_COCKPIT_ROOT",
+            "XFLOW_COCKPIT",
+            "DEVCTL_REPO_ROOT",
+            "DEVCTL_SKIP_PROVIDER_LOAD",
+        ):
+            env.pop(key, None)
+        for args in (("help",), ()):
+            result = subprocess.run(
+                [str(OPS_ROOT / "devctl"), *args],
+                cwd=root,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert result.returncode == 0, (args, result.stderr)
+            assert "usage: devctl" in result.stdout
+            assert result.stderr == ""
+
+        generated_root = root / "generated"
+        (generated_root / ".xflow" / "ops").mkdir(parents=True)
+        (generated_root / ".xflow" / "ops" / "devctl").symlink_to(OPS_ROOT, target_is_directory=True)
+        generated = generated_root / "devctl"
+        write(generated, wrapper_files()["devctl"])
+        generated.chmod(0o755)
+        for args in (("help",), ()):
+            result = subprocess.run(
+                [str(generated), *args],
+                cwd=root,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert result.returncode == 0, (args, result.stderr)
+            assert "usage: devctl" in result.stdout
+            assert result.stderr == ""
+
+
+def assert_root_and_generated_wrapper_use_nested_git_top_level() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        repo = root / "workspace" / "repository"
+        nested = repo / "nested" / "directory"
+        nested.mkdir(parents=True)
+        git(repo, "init", "-q")
+        fake = root / "fake-python"
+        write(
+            fake,
+            "#!/bin/sh\n"
+            "if [ \"${1:-}\" = \"-c\" ]; then exit 0; fi\n"
+            "printf 'repo-root=%s\\n' \"${DEVCTL_REPO_ROOT:-}\"\n",
+        )
+        fake.chmod(0o755)
+        env = test_env()
+        env.pop("DEVCTL_REPO_ROOT", None)
+        env["DEVCTL_PYTHON"] = str(fake)
+        env.pop("DEVCTL_SKIP_PROVIDER_LOAD", None)
+
+        root_result = subprocess.run(
+            [str(OPS_ROOT / "devctl"), "git", "status"],
+            cwd=nested,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert root_result.returncode == 0, root_result.stderr
+        expected = subprocess.check_output(
+            ["git", "-C", str(nested), "rev-parse", "--show-toplevel"],
+            text=True,
+        ).strip()
+        assert "repo-root=" + expected in root_result.stdout
+
+        generated_root = root / "generated"
+        (generated_root / ".xflow" / "ops" / "devctl" / "xflow").mkdir(parents=True)
+        generated = generated_root / "devctl"
+        write(generated, wrapper_files()["devctl"])
+        generated.chmod(0o755)
+        wrapper_result = subprocess.run(
+            [str(generated), "git", "status"],
+            cwd=nested,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert wrapper_result.returncode == 0, wrapper_result.stderr
+        assert "repo-root=" + expected in wrapper_result.stdout
+
+
 def assert_invalid_explicit_override_falls_back_for_root_and_generated_wrapper() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
@@ -533,6 +638,8 @@ def main() -> None:
     assert_generated_wrapper_contract()
     assert_posix_launcher_routes_core()
     assert_posix_launcher_preserves_global_args_and_skips_provider()
+    assert_help_is_available_without_profile_or_provider()
+    assert_root_and_generated_wrapper_use_nested_git_top_level()
     assert_invalid_explicit_override_falls_back_for_root_and_generated_wrapper()
     assert_check_commands_are_discoverable()
     assert_unattended_commands_are_discoverable()
@@ -551,7 +658,9 @@ def main() -> None:
         repo.mkdir()
         profile = repo / ".xflow" / "cockpit.yaml"
         profile.parent.mkdir(parents=True)
-        write(profile, (FIXTURES / "cockpit-profile.yaml").read_text(encoding="utf-8"))
+        profile_text = (FIXTURES / "cockpit-profile.yaml").read_text(encoding="utf-8")
+        profile_text = profile_text.replace("  - xflow-devctl\n", "  - work\n")
+        write(profile, profile_text)
         origin = root / "origin.git"
         subprocess.run(["git", "init", "--bare", str(origin)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         git(repo, "init", "-q")

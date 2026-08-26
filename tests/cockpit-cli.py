@@ -166,6 +166,26 @@ def test_profile_repo_state_and_alias_routes() -> None:
         shutil.rmtree(root)
 
 
+def test_omitted_playground_target_uses_profile_default() -> None:
+    root, _workspace, cockpit, profile = _fixture()
+    try:
+        profile_text = profile.read_text(encoding="utf-8").replace(
+            "defaultPlayground: flowable", "defaultPlayground: warmflow"
+        )
+        write_text_lf(profile, profile_text)
+        selected: list[tuple[str | None, bool]] = []
+        with mock.patch.object(
+            cli,
+            "run_playground",
+            side_effect=lambda _p, _c, target, opened: selected.append((target, opened)) or 0,
+        ):
+            assert cli.main(["--profile", str(profile), "--repo", "xflow-web", "pg", "--no-browser"]) == 0
+        assert selected == [("warmflow", False)]
+        assert cli._ACTIVE_COCKPIT_PROFILE is None
+    finally:
+        shutil.rmtree(root)
+
+
 def test_legacy_command_without_globals_does_not_require_profile() -> None:
     root = Path(tempfile.mkdtemp(prefix="xflow-legacy-cli-"))
     try:
@@ -284,6 +304,51 @@ def test_explicit_profile_root_wins_over_environment_root() -> None:
             env_updates={"XFLOW_COCKPIT_ROOT": str(cockpit)},
         )
         assert "nested-state:show" in result.stdout
+    finally:
+        shutil.rmtree(root)
+
+
+def test_explicit_empty_cockpit_root_does_not_fallback_to_cwd_profile() -> None:
+    root, _workspace, cockpit, _profile = _fixture()
+    try:
+        empty = root / "empty-cockpit"
+        empty.mkdir()
+        result = _run(
+            cockpit,
+            "--cockpit-root",
+            str(empty),
+            "state",
+            expect=1,
+            env_updates={
+                "XFLOW_PROFILE": None,
+                "XFLOW_COCKPIT_ROOT": None,
+                "DEVCTL_COCKPIT_ROOT": None,
+                "XFLOW_COCKPIT": None,
+            },
+        )
+        assert "profile" in result.stderr.lower()
+        assert "fixture-state:" not in result.stdout
+    finally:
+        shutil.rmtree(root)
+
+
+def test_explicit_missing_profile_does_not_fallback_to_cwd_profile() -> None:
+    root, _workspace, cockpit, _profile = _fixture()
+    try:
+        missing = root / "missing-profile.yaml"
+        result = _run(
+            cockpit,
+            "state",
+            expect=1,
+            env_updates={
+                "XFLOW_PROFILE": str(missing),
+                "XFLOW_COCKPIT_ROOT": None,
+                "DEVCTL_COCKPIT_ROOT": None,
+                "XFLOW_COCKPIT": None,
+            },
+        )
+        assert "profile not found" in result.stderr
+        assert "fixture-state:" not in result.stdout
     finally:
         shutil.rmtree(root)
 
@@ -564,11 +629,14 @@ def test_existing_issue_list_route_is_preserved() -> None:
 
 def main() -> None:
     test_profile_repo_state_and_alias_routes()
+    test_omitted_playground_target_uses_profile_default()
     test_legacy_command_without_globals_does_not_require_profile()
     test_unknown_option_fails_closed_for_legacy_command()
     test_target_project_env_is_loaded_after_repo_resolution()
     test_discovered_profile_symlink_cannot_escape_cockpit_root()
     test_explicit_profile_root_wins_over_environment_root()
+    test_explicit_empty_cockpit_root_does_not_fallback_to_cwd_profile()
+    test_explicit_missing_profile_does_not_fallback_to_cwd_profile()
     test_parser_project_env_defaults_are_resolved_after_loading()
     test_cockpit_routes_and_all_preflight_order()
     test_repo_resolution_rejects_non_sibling_and_missing_repositories()

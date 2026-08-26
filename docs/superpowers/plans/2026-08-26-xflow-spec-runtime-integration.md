@@ -355,48 +355,136 @@ Implement `summarize_state`, `render_state_text`, and `synchronize_state` by ext
 
 - [ ] **Step 4: Add the strict profile**
 
-The profile declares only repository topology and executable argument arrays. It uses these service IDs and existing commands:
+The profile declares only repository topology and executable argument arrays. The
+`command` value is a strict `CommandSpec` mapping with `argv`, `cwd`, and `env`;
+services use `dependencies`, scenarios and playgrounds are lists of records with
+an explicit `id`, and `defaultPlayground` names the profile default used when a
+playground target is omitted:
 
 ```yaml
 version: 1
+repositories:
+  - xflow-spec
+  - xflow-server
+  - xflow-web
+  - xflow-sdk
+  - xflow-demo-server
+  - xflow-demo-web
+defaultPlayground: flowable
+allowedEnvironment: []
 state:
   command:
     argv: ["{python}", "{cockpit}/_ops/portable/state.py"]
     cwd: "{cockpit}"
+    env: {}
 preflight:
   checks:
-    - {id: java, argv: [java, -version], expectRegex: 'version "21[.]'}
-    - {id: maven, argv: [mvn, -version]}
-    - {id: pnpm, argv: [pnpm, -v]}
-    - {id: docker-compose, argv: [docker, compose, version]}
-    - {id: docker-engine, argv: [docker, info]}
+    - id: java
+      command:
+        argv: [java, -version]
+        cwd: "{cockpit}"
+        env: {}
+      expectRegex: 'version "21[.]'
+    - id: maven
+      command:
+        argv: [mvn, -version]
+        cwd: "{cockpit}"
+        env: {}
+    - id: pnpm
+      command:
+        argv: [pnpm, -v]
+        cwd: "{cockpit}"
+        env: {}
+    - id: docker-compose
+      command:
+        argv: [docker, compose, version]
+        cwd: "{cockpit}"
+        env: {}
+    - id: docker-engine
+      command:
+        argv: [docker, info]
+        cwd: "{cockpit}"
+        env: {}
 docker:
-  cliCheck: {argv: [docker, --version]}
-  composeCheck: {argv: [docker, compose, version]}
-  engineProbe: {argv: [docker, info]}
-  imageProbe: {argv: [docker, image, inspect, "postgres:16-alpine"]}
+  cliCheck:
+    argv: [docker, --version]
+    cwd: "{cockpit}"
+    env: {}
+  composeCheck:
+    argv: [docker, compose, version]
+    cwd: "{cockpit}"
+    env: {}
+  engineProbe:
+    argv: [docker, info]
+    cwd: "{cockpit}"
+    env: {}
+  imageProbe:
+    argv: [docker, image, inspect, "postgres:16-alpine"]
+    cwd: "{cockpit}"
+    env: {}
   startupTimeoutSeconds: 60
 dependencies:
   - id: postgres
     cwd: "{workspace}/xflow-server"
     service: postgres
-    up: {argv: [docker, compose, up, -d, postgres]}
-    ready: {argv: [docker, compose, exec, -T, postgres, pg_isready, -U, xflow, -d, xflow]}
+    up:
+      argv: [docker, compose, up, -d, postgres]
+      cwd: "{workspace}/xflow-server"
+      env: {}
+    ready:
+      argv: [docker, compose, exec, -T, postgres, pg_isready, -U, xflow, -d, xflow]
+      cwd: "{workspace}/xflow-server"
+      env: {}
     timeoutSeconds: 120
 services:
   - id: server
-    cwd: "{workspace}/xflow-server"
-    argv: [mvn, -pl, xflow-app, -am, spring-boot:run]
-    dependsOn: [postgres]
+    command:
+      argv: [mvn, -pl, xflow-app, -am, spring-boot:run]
+      cwd: "{workspace}/xflow-server"
+      env: {}
+    dependencies: [postgres]
     healthUrls: ["http://127.0.0.1:8080/actuator/health"]
-    logFile: server.log
+    logFile: "{cockpit}/.xflow/run/server.log"
   - id: web
-    cwd: "{workspace}/xflow-web"
-    argv: [pnpm, dev, --host, "127.0.0.1", --port, "5173"]
+    command:
+      argv: [pnpm, dev, --host, "127.0.0.1", --port, "5173"]
+      cwd: "{workspace}/xflow-web"
+      env: {}
+    dependencies: []
     healthUrls: ["http://127.0.0.1:5173/"]
-    logFile: web.log
+    logFile: "{cockpit}/.xflow/run/web.log"
 scenarios:
-  run: {services: [server, web], openUrl: "http://127.0.0.1:5173/"}
+  - id: run
+    services: [server, web]
+    openUrl: "http://127.0.0.1:5173/"
+playgrounds:
+  - id: flowable
+    aliases: [f, bpmn]
+    command:
+      argv: [pnpm, --dir, "{workspace}/xflow-web", dev, --port, "8001"]
+      cwd: "{workspace}/xflow-web"
+      env: {}
+    build:
+      argv: [pnpm, --dir, "{workspace}/xflow-web", build]
+      cwd: "{workspace}/xflow-web"
+      env: {}
+    url: "http://127.0.0.1:8001/"
+  - id: warmflow
+    aliases: [w]
+    command:
+      argv: [pnpm, --dir, "{workspace}/xflow-web", dev, --port, "8002"]
+      cwd: "{workspace}/xflow-web"
+      env: {}
+    build: null
+    url: "http://127.0.0.1:8002/"
+  - id: viewer
+    aliases: [v]
+    command:
+      argv: [pnpm, --dir, "{workspace}/xflow-web", dev, --port, "8003"]
+      cwd: "{workspace}/xflow-web"
+      env: {}
+    build: null
+    url: "http://127.0.0.1:8003/"
 ```
 
 Add the existing demo services and all three playground definitions with their current ports, package filters, aliases, build prerequisite, and URLs. Do not put credentials or local installation paths in the profile.

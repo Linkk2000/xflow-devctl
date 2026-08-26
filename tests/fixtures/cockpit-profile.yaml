@@ -1,4 +1,9 @@
 version: 1
+repositories:
+  - xflow-web
+  - xflow-server
+  - xflow-devctl
+defaultPlayground: flowable
 allowedEnvironment:
   - PROFILE_MODE
 state:

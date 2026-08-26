@@ -1,4 +1,7 @@
 version: 1
+repositories:
+  - fixture-repo
+defaultPlayground: flowable
 allowedEnvironment:
   - EVENT_FILE
   - DEP_ATTEMPTS_FILE

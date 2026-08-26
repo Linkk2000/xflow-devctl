@@ -1531,7 +1531,15 @@ mark_provider_skip_for_command() {
   esac
 }
 mark_provider_skip_for_command "$@"
-export DEVCTL_REPO_ROOT="$ROOT"
+if [ -n "${DEVCTL_REPO_ROOT:-}" ]; then
+  REPO_ROOT=$DEVCTL_REPO_ROOT
+else
+  REPO_ROOT=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null) || REPO_ROOT=$PWD
+  if [ -d "$REPO_ROOT" ]; then
+    REPO_ROOT=$(CDPATH= cd -- "$REPO_ROOT" && pwd -P)
+  fi
+fi
+export DEVCTL_REPO_ROOT="$REPO_ROOT"
 export DEVCTL_TOOL_ROOT="$TOOL_ROOT" DEVCTL_OPS_ROOT="$TOOL_ROOT" PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="$TOOL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 exec "$PYTHON" -m xflow "$@"

@@ -132,6 +132,11 @@ class CockpitProfile:
     services: Mapping[str, ServiceSpec]
     scenarios: Mapping[str, ScenarioSpec]
     playgrounds: Mapping[str, PlaygroundSpec]
+    # These fields are appended with defaults to keep the direct construction
+    # contract used by command-level callers source compatible.  Profiles
+    # loaded from YAML validate both values strictly below.
+    repositories: tuple[str, ...] = ()
+    default_playground: Optional[str] = None
 
 
 T = TypeVar("T")
@@ -183,6 +188,8 @@ def load_cockpit_profile(path: Path) -> CockpitProfile:
         root,
         {
             "version",
+            "repositories",
+            "defaultPlayground",
             "allowedEnvironment",
             "state",
             "preflight",
@@ -198,6 +205,9 @@ def load_cockpit_profile(path: Path) -> CockpitProfile:
     version = _int(root, "version", "profile", minimum=1)
     if version != 1:
         raise ValueError(f"unsupported cockpit profile version: {version}")
+    repositories = _repository_names(
+        _required(root, "repositories", "profile"), "profile.repositories"
+    )
     allowed_environment = _environment_names(root.get("allowedEnvironment", []), "allowedEnvironment")
     roots = _profile_roots(profile_path)
 
@@ -260,6 +270,9 @@ def load_cockpit_profile(path: Path) -> CockpitProfile:
 
     _validate_references(dependencies, services, scenarios)
     _validate_aliases(playgrounds)
+    _validate_scenario_urls(scenarios)
+    _validate_playground_urls(playgrounds)
+    default_playground = _default_playground(root, playgrounds)
 
     return CockpitProfile(
         version=version,
@@ -270,6 +283,8 @@ def load_cockpit_profile(path: Path) -> CockpitProfile:
         services=_mapping_proxy(services),
         scenarios=_mapping_proxy(scenarios),
         playgrounds=_mapping_proxy(playgrounds),
+        repositories=repositories,
+        default_playground=default_playground,
     )
 
 
@@ -349,6 +364,27 @@ def _environment_names(value: Any, label: str) -> frozenset[str]:
         if _ENVIRONMENT_NAME.fullmatch(name) is None:
             raise ValueError(f"{label} contains invalid environment name: {name}")
     return frozenset(names)
+
+
+def _repository_names(value: Any, label: str) -> tuple[str, ...]:
+    values = _sequence(value, label)
+    result = []
+    seen = set()
+    for index, item in enumerate(values):
+        item_label = f"{label}[{index}]"
+        name = _string(item, item_label)
+        if (
+            name in {".", ".."}
+            or "/" in name
+            or "\\" in name
+            or _ID.fullmatch(name) is None
+        ):
+            raise ValueError(f"{item_label} must be a legal sibling repository name")
+        if name in seen:
+            raise ValueError(f"{label} contains duplicate value: {name}")
+        seen.add(name)
+        result.append(name)
+    return tuple(result)
 
 
 def _template_tokens(value: str, label: str) -> tuple[str, ...]:
@@ -495,10 +531,14 @@ def _service(
 def _urls(value: Any, label: str) -> tuple[str, ...]:
     values = _sequence(value, label)
     result = []
+    seen = set()
     for index, item in enumerate(values):
         url = _string(item, f"{label}[{index}]")
         if not _is_http_url(url):
             raise ValueError(f"{label}[{index}] must be a valid HTTP URL")
+        if url in seen:
+            raise ValueError(f"{label} contains duplicate URL: {url}")
+        seen.add(url)
         result.append(url)
     return tuple(result)
 
@@ -577,7 +617,7 @@ def _playground(
     build = playground.get("build")
     return PlaygroundSpec(
         id=_id(_required(playground, "id", "playground"), "playground.id"),
-        aliases=_string_tuple(_required(playground, "aliases", "playground"), "playground.aliases"),
+        aliases=_aliases(_required(playground, "aliases", "playground"), "playground.aliases"),
         command=_command(
             playground.get("command"), "playground.command", roots, allowed_environment
         ),
@@ -630,6 +670,28 @@ def _validate_references(
                 raise ValueError(f"unknown service id in scenario {scenario_id}: {service_id}")
 
 
+def _validate_scenario_urls(scenarios: Mapping[str, ScenarioSpec]) -> None:
+    seen = set()
+    for scenario_id, scenario in scenarios.items():
+        if scenario.open_url is None:
+            continue
+        if scenario.open_url in seen:
+            raise ValueError(
+                f"scenarios contains duplicate open URL: {scenario.open_url}"
+            )
+        seen.add(scenario.open_url)
+
+
+def _validate_playground_urls(playgrounds: Mapping[str, PlaygroundSpec]) -> None:
+    seen = set()
+    for playground in playgrounds.values():
+        if playground.url in seen:
+            raise ValueError(
+                f"playgrounds contains duplicate URL: {playground.url}"
+            )
+        seen.add(playground.url)
+
+
 def _validate_aliases(playgrounds: Mapping[str, PlaygroundSpec]) -> None:
     aliases = set()
     for playground in playgrounds.values():
@@ -637,6 +699,41 @@ def _validate_aliases(playgrounds: Mapping[str, PlaygroundSpec]) -> None:
             if alias in playgrounds or alias in aliases:
                 raise ValueError(f"duplicate playground alias: {alias}")
             aliases.add(alias)
+
+
+def _aliases(value: Any, label: str) -> tuple[str, ...]:
+    values = _sequence(value, label)
+    result = []
+    seen = set()
+    for index, item in enumerate(values):
+        alias = _string(item, f"{label}[{index}]")
+        if not alias.strip():
+            raise ValueError(f"{label}[{index}] must not be blank")
+        if alias in seen:
+            raise ValueError(f"{label} contains duplicate value: {alias}")
+        seen.add(alias)
+        result.append(alias)
+    return tuple(result)
+
+
+def _default_playground(
+    root: Mapping[str, Any], playgrounds: Mapping[str, PlaygroundSpec]
+) -> Optional[str]:
+    value = root.get("defaultPlayground", _MISSING)
+    if value is _MISSING:
+        if playgrounds:
+            raise ValueError(
+                "profile.defaultPlayground is required when playgrounds are configured"
+            )
+        return None
+    default = _string(value, "profile.defaultPlayground")
+    if not default.strip():
+        raise ValueError("profile.defaultPlayground must not be blank")
+    if default not in playgrounds:
+        raise ValueError(
+            f"profile.defaultPlayground references unknown playground: {default}"
+        )
+    return default
 
 
 def _mapping_proxy(value: Mapping[str, T]) -> Mapping[str, T]:

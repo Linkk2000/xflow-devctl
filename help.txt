@@ -325,6 +325,8 @@ Runtime:
   explicitly selected outside Windows.
 
 Cockpit runtime commands (first phase):
+  devctl help
+  devctl
   devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] state [show [ARGS...]]
   devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] dev preflight [--warn-only]
   devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] dev docker setup|status
@@ -334,13 +336,33 @@ Cockpit runtime commands (first phase):
   devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] pg [TARGET] [--no-browser]
   devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] playground [TARGET] [--no-browser]
 
-Profile discovery order is explicit --profile, XFLOW_PROFILE/XFLOW_COCKPIT_PROFILE/
-DEVCTL_PROFILE/DEVCTL_COCKPIT_PROFILE, --cockpit-root (or XFLOW_COCKPIT_ROOT/
-DEVCTL_COCKPIT_ROOT/XFLOW_COCKPIT)
-with .xflow/cockpit.yaml then cockpit.yaml, and the current directory with those
-two names. Profile validation and sibling repository resolution happen before a
-child process starts. Unsupported commands fail closed; they do not fall back to
-another backend or partially execute.
+Profile discovery order is explicit --profile, --cockpit-root with
+.xflow/cockpit.yaml then cockpit.yaml, XFLOW_PROFILE/XFLOW_COCKPIT_PROFILE/
+DEVCTL_PROFILE/DEVCTL_COCKPIT_PROFILE, and the root environment equivalent
+(XFLOW_COCKPIT_ROOT/DEVCTL_COCKPIT_ROOT/XFLOW_COCKPIT) with those two names,
+and the current directory with those names only when no profile or root was
+explicitly supplied. An explicit missing profile/root fails immediately rather
+than falling back to the current directory. Profile validation and sibling
+repository resolution happen before a child process starts. --repo is accepted
+only when its exact sibling name is in the required profile repositories
+allowlist; names are never inferred from command strings. Unsupported commands
+fail closed; they do not fall back to another backend or partially execute.
+
+If a profile declares playgrounds, defaultPlayground must be a non-empty
+playground id and is used when TARGET is omitted from pg, playground, or dev
+playground. A profile with no playgrounds may omit that field. Health URL lists,
+scenario openUrl values, and playground URLs reject duplicates; playground
+aliases reject blank values, duplicates, and collisions with any playground id
+or alias.
+
+After a successful run/dev all or playground startup, owned process trees remain
+running by contract. Logs and PID metadata are under .xflow/run/. A later run
+must not adopt stale PID metadata; confirm the prior processes have exited before
+removing it. There is currently no standalone stop command. SIGINT/SIGTERM during
+startup or health cleanup terminates owned trees, closes logs, and removes PID
+metadata only after the tree is confirmed stopped (unverified metadata is
+retained), returning 130/143. devctl help and no arguments print this help
+without loading a profile or provider.
 
 Run the independent cockpit routing suite with:
   python tests/cockpit-cli.py

@@ -607,16 +607,37 @@ devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] pg [TARGET] [--no-br
 devctl [--profile PATH] [--cockpit-root PATH] [--repo NAME] playground [TARGET] [--no-browser]
 ```
 
-The profile is discovered in this order: explicit `--profile`, an explicit
-profile environment variable (`XFLOW_PROFILE`, `XFLOW_COCKPIT_PROFILE`,
-`DEVCTL_PROFILE`, or `DEVCTL_COCKPIT_PROFILE`), the selected `--cockpit-root` (or its environment equivalent)
-under `.xflow/cockpit.yaml` and then `cockpit.yaml`, and finally the current
-directory with the same two names. The profile is validated before any child
-process is started. `--repo` accepts only a direct sibling directory under the
-profile workspace; literal sibling names declared by profile command paths are
-also enforced. Invalid profiles, repository selections, and commands outside
-the first-phase list fail before process orchestration and do not silently fall
-back to a different command backend.
+The profile is discovered in this order: explicit `--profile`, explicit
+`--cockpit-root` under `.xflow/cockpit.yaml` and then `cockpit.yaml`, explicit
+profile environment variables (`XFLOW_PROFILE`, `XFLOW_COCKPIT_PROFILE`,
+`DEVCTL_PROFILE`, or `DEVCTL_COCKPIT_PROFILE`), the root environment equivalent
+under `.xflow/cockpit.yaml` and then `cockpit.yaml`, and finally the
+current directory only when no profile or root was explicitly supplied. An
+explicit but missing profile/root fails immediately; it never falls back to the
+current directory. The profile is validated before any child process is started.
+`--repo` accepts only a direct sibling directory whose exact name is present in
+the profile's required `repositories` allowlist; command strings are never used
+to infer repository names. Invalid profiles, repository selections, and
+commands outside the first-phase list fail before process orchestration and do
+not silently fall back to a different command backend.
+
+When `TARGET` is omitted from `pg`, `playground`, or `dev playground`, the
+profile's non-empty `defaultPlayground` is used. A profile with playgrounds must
+declare a matching default; a profile with no playgrounds may omit it. Health
+URL lists, scenario `openUrl` values, and playground URLs are validated for
+duplicates, and playground aliases must be non-blank and globally unique.
+
+Successful `run`/`dev all` and playground commands intentionally leave their
+owned service process trees running after health checks succeed. Their logs and
+PID metadata live under the profile's `.xflow/run/` directory. A second run
+does not adopt stale PID metadata: stop the prior owned processes and remove
+metadata only after confirming they have exited. The runtime currently has no
+standalone `stop` command; Ctrl-C/SIGINT or SIGTERM during startup/health
+cleanup returns 130/143 and closes owned logs, removing PID metadata only after
+the owned tree is confirmed stopped (unverified metadata is retained).
+
+`devctl help` and a no-argument invocation print this help without loading a
+profile or provider.
 
 Run the cockpit routing suite independently from the core and entrypoint suites:
 

@@ -67,6 +67,8 @@ def test_valid_profile() -> None:
     assert profile.playgrounds["flowable"].aliases == ("f", "bpmn")
     assert isinstance(profile.playgrounds["flowable"], PlaygroundSpec)
     assert profile.state_command.env["PROFILE_MODE"] == "{PROFILE_MODE}"
+    assert profile.repositories == ("xflow-web", "xflow-server", "xflow-devctl")
+    assert profile.default_playground == "flowable"
     assert "raw" not in profile.__dict__
 
 
@@ -85,6 +87,47 @@ def test_rejects_unknown_top_level_key() -> None:
         "unknown field",
         lambda: load_mutated_profile(lambda payload: payload.update({"unexpected": True})),
     )
+
+
+def test_rejects_missing_repository_allowlist() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        del payload["repositories"]
+
+    assert_value_error("requires field: repositories", lambda: load_mutated_profile(mutate))
+
+
+def test_rejects_duplicate_repository_allowlist_entry() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["repositories"] = ["xflow-web", "xflow-web"]
+
+    assert_value_error("duplicate value", lambda: load_mutated_profile(mutate))
+
+
+def test_rejects_invalid_repository_allowlist_entry() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["repositories"] = ["xflow-web", "../outside"]
+
+    assert_value_error("repository", lambda: load_mutated_profile(mutate))
+
+
+def test_rejects_unknown_or_blank_default_playground() -> None:
+    def missing(mutate_value: str) -> object:
+        return load_mutated_profile(
+            lambda payload: payload.update({"defaultPlayground": mutate_value})
+        )
+
+    assert_value_error("defaultPlayground", lambda: missing(""))
+    assert_value_error("defaultPlayground", lambda: missing("missing"))
+
+
+def test_empty_playgrounds_may_omit_default_playground() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["playgrounds"] = []
+        payload.pop("defaultPlayground", None)
+
+    profile = load_mutated_profile(mutate)
+    assert profile.playgrounds == {}
+    assert profile.default_playground is None
 
 
 def test_rejects_shell_string() -> None:
@@ -205,6 +248,32 @@ def test_rejects_non_http_health_url() -> None:
     assert_value_error("valid HTTP URL", lambda: load_mutated_profile(mutate))
 
 
+def test_rejects_duplicate_health_urls() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["services"][1]["healthUrls"] = [
+            "http://127.0.0.1:5173/",
+            "http://127.0.0.1:5173/",
+        ]
+
+    assert_value_error("duplicate", lambda: load_mutated_profile(mutate))
+
+
+def test_rejects_duplicate_scenario_open_urls() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["scenarios"].append(
+            {"id": "run-again", "services": ["server"], "openUrl": "http://127.0.0.1:5173/"}
+        )
+
+    assert_value_error("duplicate", lambda: load_mutated_profile(mutate))
+
+
+def test_rejects_duplicate_playground_urls() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["playgrounds"][1]["url"] = payload["playgrounds"][0]["url"]
+
+    assert_value_error("duplicate", lambda: load_mutated_profile(mutate))
+
+
 def test_rejects_health_url_with_whitespace_hostname() -> None:
     def mutate(payload: dict[str, object]) -> None:
         payload["services"][1]["healthUrls"] = ["http://bad host/health"]
@@ -231,6 +300,20 @@ def test_rejects_playground_url_with_empty_hostname() -> None:
         payload["playgrounds"][0]["url"] = "http://:8080/"
 
     assert_value_error("valid HTTP URL", lambda: load_mutated_profile(mutate))
+
+
+def test_rejects_blank_playground_alias() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["playgrounds"][0]["aliases"] = [" "]
+
+    assert_value_error("blank", lambda: load_mutated_profile(mutate))
+
+
+def test_rejects_duplicate_playground_aliases_globally() -> None:
+    def mutate(payload: dict[str, object]) -> None:
+        payload["playgrounds"][1]["aliases"] = ["f"]
+
+    assert_value_error("duplicate", lambda: load_mutated_profile(mutate))
 
 
 def test_rejects_unknown_command_field() -> None:
@@ -265,10 +348,31 @@ def test_expand_profile_path_confines_to_declared_roots() -> None:
         )
 
 
+def test_plan2_profile_example_loads_with_v1_loader() -> None:
+    plan = (OPS_ROOT / "docs/superpowers/plans/2026-08-26-xflow-spec-runtime-integration.md").read_text(
+        encoding="utf-8"
+    )
+    marker = "### Task 4: Add the minimal XFlow cockpit profile and state adapter"
+    start = plan.index("```yaml", plan.index(marker)) + len("```yaml\n")
+    end = plan.index("```", start)
+    with tempfile.TemporaryDirectory() as raw:
+        profile_path = Path(raw) / ".xflow" / "cockpit.yaml"
+        profile_path.parent.mkdir(parents=True)
+        profile_path.write_text(plan[start:end], encoding="utf-8")
+        profile = load_cockpit_profile(profile_path)
+    assert profile.repositories
+    assert profile.default_playground
+
+
 def main() -> None:
     test_valid_profile()
     test_frozen_dataclasses()
     test_rejects_unknown_top_level_key()
+    test_rejects_missing_repository_allowlist()
+    test_rejects_duplicate_repository_allowlist_entry()
+    test_rejects_invalid_repository_allowlist_entry()
+    test_rejects_unknown_or_blank_default_playground()
+    test_empty_playgrounds_may_omit_default_playground()
     test_rejects_shell_string()
     test_rejects_empty_argv()
     test_rejects_blank_first_argv()
@@ -285,14 +389,20 @@ def main() -> None:
     test_rejects_unknown_scenario_service_id()
     test_rejects_nonpositive_timeouts()
     test_rejects_non_http_health_url()
+    test_rejects_duplicate_health_urls()
+    test_rejects_duplicate_scenario_open_urls()
+    test_rejects_duplicate_playground_urls()
     test_rejects_health_url_with_whitespace_hostname()
     test_rejects_health_url_with_c1_control_character()
     test_rejects_scenario_url_with_out_of_range_port()
     test_rejects_playground_url_with_empty_hostname()
+    test_rejects_blank_playground_alias()
+    test_rejects_duplicate_playground_aliases_globally()
     test_rejects_unknown_command_field()
     test_rejects_duplicate_yaml_mapping_key()
     test_rejects_unknown_template_token()
     test_expand_profile_path_confines_to_declared_roots()
+    test_plan2_profile_example_loads_with_v1_loader()
     print("cockpit profile ok")
 
 

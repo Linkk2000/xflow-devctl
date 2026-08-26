@@ -8,12 +8,14 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import webbrowser
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .cockpit import (
     CockpitContext,
@@ -53,6 +55,48 @@ class _ProcessRecord:
 
 class _TerminationFailure(ValueError):
     """Raised when a supervisor cannot prove that an owned tree stopped."""
+
+
+class _SupervisorSignal(Exception):
+    """Internal signal interruption that carries the stable CLI exit code."""
+
+    def __init__(self, exit_code: int) -> None:
+        super().__init__(exit_code)
+        self.exit_code = exit_code
+
+
+@contextmanager
+def _temporary_signal_handlers() -> Iterator[None]:
+    """Install cleanup-aware handlers only where Python permits signal APIs."""
+
+    previous: List[Tuple[int, object]] = []
+
+    def handle(signum: int, _frame: object) -> None:
+        if signum == getattr(signal, "SIGINT", object()):
+            raise _SupervisorSignal(130)
+        raise _SupervisorSignal(143)
+
+    try:
+        if threading.current_thread() is not threading.main_thread():
+            yield
+            return
+        for name in ("SIGINT", "SIGTERM"):
+            signum = getattr(signal, name, None)
+            if signum is None:
+                continue
+            try:
+                old = signal.getsignal(signum)
+                signal.signal(signum, handle)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+            previous.append((int(signum), old))
+        yield
+    finally:
+        for signum, old in reversed(previous):
+            try:
+                signal.signal(signum, old)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                pass
 
 
 class _WindowsJob:
@@ -643,6 +687,7 @@ class ServiceSupervisor:
     ) -> Optional[BaseException]:
         if process is None:
             return None
+        stopped = False
         try:
             if windows_trampoline and record is not None and not record.business_released:
                 stopped = self._terminate(record)
@@ -660,6 +705,8 @@ class ServiceSupervisor:
                     raise _TerminationFailure(
                         f"service {service_id} cleanup was not confirmed"
                     )
+            if stopped:
+                self._remove_pid(record.handle if record is not None else ServiceHandle(service_id, process, log_path))
         except BaseException as exc:
             if record is not None:
                 retention_error = self._retain_failed_spawn(service_id, record, stream)
@@ -1144,7 +1191,16 @@ class ServiceSupervisor:
     def stop_all(self) -> None:
         """Terminate all owned process groups in reverse startup order."""
 
-        handles = list(reversed(self._handles))
+        owned_handles = list(self._handles)
+        registered = {handle.id for handle in owned_handles}
+        # A signal may interrupt the tiny window after _spawn records its
+        # process/PID and before the caller appends the returned handle.  The
+        # record is still authoritative ownership and must be cleaned too.
+        for record in self._process_records.values():
+            if record.handle.id not in registered:
+                owned_handles.append(record.handle)
+                registered.add(record.handle.id)
+        handles = list(reversed(owned_handles))
         errors: List[str] = []
         failed_ids = set()
         for handle in handles:
@@ -1173,7 +1229,7 @@ class ServiceSupervisor:
                     except Exception as exc:
                         errors.append(f"{handle.id} log close: {type(exc).__name__}")
 
-        for handle in list(self._handles):
+        for handle in owned_handles:
             if handle.id not in failed_ids:
                 self._handles_by_id.pop(handle.id, None)
                 self._process_records.pop(handle.id, None)
@@ -1213,7 +1269,13 @@ class ServiceSupervisor:
             return self.opener(url)
 
 
-def _playground_for(profile: CockpitProfile, target: str) -> PlaygroundSpec:
+def _playground_for(profile: CockpitProfile, target: Optional[str]) -> PlaygroundSpec:
+    if target is None:
+        target = profile.default_playground
+        if target is None:
+            raise ValueError(
+                "playground target is required when profile has no defaultPlayground"
+            )
     if target in profile.playgrounds:
         return profile.playgrounds[target]
     for playground in profile.playgrounds.values():
@@ -1242,52 +1304,60 @@ def run_scenario(
     if scenario is None:
         raise ValueError(f"unknown scenario id: {scenario_id}")
     supervisor = ServiceSupervisor(profile, context)
-    try:
-        supervisor.ensure_dependencies(scenario.services)
-        handles = supervisor.start(scenario.services)
-        supervisor.wait_healthy(handles)
-        supervisor._check_all_handles_alive()
-        if scenario.open_url:
-            supervisor.open_browser(scenario.open_url)
-        return 0
-    except KeyboardInterrupt:
-        _stop_after_failure(supervisor)
-        return 130
-    except Exception as exc:
-        _stop_after_failure(supervisor)
-        _report_failure(f"scenario {scenario_id}", exc)
-        return 1
+    with _temporary_signal_handlers():
+        try:
+            supervisor.ensure_dependencies(scenario.services)
+            handles = supervisor.start(scenario.services)
+            supervisor.wait_healthy(handles)
+            supervisor._check_all_handles_alive()
+            if scenario.open_url:
+                supervisor.open_browser(scenario.open_url)
+            return 0
+        except _SupervisorSignal as exc:
+            _stop_after_failure(supervisor)
+            return exc.exit_code
+        except KeyboardInterrupt:
+            _stop_after_failure(supervisor)
+            return 130
+        except Exception as exc:
+            _stop_after_failure(supervisor)
+            _report_failure(f"scenario {scenario_id}", exc)
+            return 1
 
 
 def run_playground(
     profile: CockpitProfile,
     context: CockpitContext,
-    target: str,
+    target: Optional[str],
     open_browser: bool,
 ) -> int:
     """Build and run a playground target or alias."""
 
     playground = _playground_for(profile, target)
     supervisor = ServiceSupervisor(profile, context)
-    try:
-        if playground.build is not None:
-            outcome = execute_command(playground.build, context, capture=True)
-            if outcome.returncode != 0:
-                _report_failure(
-                    f"playground {playground.id} build",
-                    ValueError(f"command exited with {int(outcome.returncode)}"),
-                )
-                return int(outcome.returncode) or 1
-        handle = supervisor._start_playground(playground)
-        supervisor._wait_playground(handle, playground.url)
-        supervisor._check_all_handles_alive()
-        if open_browser:
-            supervisor.open_browser(playground.url)
-        return 0
-    except KeyboardInterrupt:
-        _stop_after_failure(supervisor)
-        return 130
-    except Exception as exc:
-        _stop_after_failure(supervisor)
-        _report_failure(f"playground {playground.id}", exc)
-        return 1
+    with _temporary_signal_handlers():
+        try:
+            if playground.build is not None:
+                outcome = execute_command(playground.build, context, capture=True)
+                if outcome.returncode != 0:
+                    _report_failure(
+                        f"playground {playground.id} build",
+                        ValueError(f"command exited with {int(outcome.returncode)}"),
+                    )
+                    return int(outcome.returncode) or 1
+            handle = supervisor._start_playground(playground)
+            supervisor._wait_playground(handle, playground.url)
+            supervisor._check_all_handles_alive()
+            if open_browser:
+                supervisor.open_browser(playground.url)
+            return 0
+        except _SupervisorSignal as exc:
+            _stop_after_failure(supervisor)
+            return exc.exit_code
+        except KeyboardInterrupt:
+            _stop_after_failure(supervisor)
+            return 130
+        except Exception as exc:
+            _stop_after_failure(supervisor)
+            _report_failure(f"playground {playground.id}", exc)
+            return 1

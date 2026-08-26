@@ -300,6 +300,109 @@ def test_playground_build_failure_does_not_start_process() -> None:
         assert not (context.run_dir / "flowable.pid").exists()
 
 
+def _run_sigterm_case(root: Path, mode: str) -> tuple[subprocess.Popen[str], Optional[int]]:
+    """Run one real parent CLI process so SIGTERM exercises the public wrapper."""
+
+    runner = root / "signal-runner.py"
+    write_text_lf(
+        runner,
+        "from __future__ import annotations\n"
+        "import os, signal, sys, time\n"
+        "from dataclasses import replace\n"
+        f"sys.path.insert(0, {str(OPS_ROOT)!r})\n"
+        "import xflow.services as services\n"
+        "from xflow.cockpit import CockpitContext, load_cockpit_profile\n"
+        "from xflow.services import run_playground, run_scenario\n"
+        f"root = __import__('pathlib').Path({str(root)!r})\n"
+        "profile = load_cockpit_profile(root / '.xflow' / 'supervisor.yaml')\n"
+        "if sys.argv[1] == 'scenario':\n"
+        "    service = replace(profile.services['server'], command=replace(profile.services['server'].command, argv=(sys.executable, str(root / 'fixture-process.py'), 'tree-ignore-term')))\n"
+        "    profile = replace(profile, services={**profile.services, 'server': service}, scenarios={'run': replace(profile.scenarios['run'], services=('server',), open_url=None)})\n"
+        "else:\n"
+        "    playground = replace(profile.playgrounds['flowable'], command=replace(profile.playgrounds['flowable'].command, argv=(sys.executable, str(root / 'fixture-process.py'), 'tree-ignore-term')), build=None)\n"
+        "    profile = replace(profile, playgrounds={**profile.playgrounds, 'flowable': playground})\n"
+        "env = dict(os.environ)\n"
+        "env.update({'EVENT_FILE': str(root / 'events.log'), 'DEP_ATTEMPTS_FILE': str(root / 'dep-attempts'), 'FAIL_DEPENDENCY': '', 'CHILD_PID_FILE': str(root / 'child.pid'), 'PLAYGROUND_BUILD_FILE': str(root / 'build.marker')})\n"
+        "context = CockpitContext(root, root.parent, root, __import__('pathlib').Path(sys.executable), root / '.xflow' / 'run', env)\n"
+        "def blocked(_url: str, timeout: object = None) -> object:\n"
+        "    while True:\n"
+        "        time.sleep(10)\n"
+        "services.urlopen = blocked\n"
+        "old_int = signal.getsignal(signal.SIGINT)\n"
+        "old_term = signal.getsignal(signal.SIGTERM)\n"
+        "if sys.argv[1] == 'scenario':\n"
+        "    result = run_scenario(profile, context, 'run')\n"
+        "else:\n"
+        "    result = run_playground(profile, context, 'flowable', False)\n"
+        "if signal.getsignal(signal.SIGINT) is not old_int or signal.getsignal(signal.SIGTERM) is not old_term:\n"
+        "    print('handlers-not-restored', file=sys.stderr)\n"
+        "    raise SystemExit(91)\n"
+        "print('result=' + str(result), flush=True)\n"
+        "raise SystemExit(result)\n",
+    )
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PYTHONPATH": str(OPS_ROOT),
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONIOENCODING": "utf-8",
+            "EVENT_FILE": str(root / "events.log"),
+            "DEP_ATTEMPTS_FILE": str(root / "dep-attempts"),
+            "CHILD_PID_FILE": str(root / "child.pid"),
+            "PLAYGROUND_BUILD_FILE": str(root / "build.marker"),
+            "FAIL_DEPENDENCY": "",
+        }
+    )
+    process = subprocess.Popen(
+        [sys.executable, str(runner), mode],
+        cwd=root,
+        env=environment,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    child_pid: Optional[int] = None
+    for _ in range(100):
+        child_pid = _read_pid(root / "child.pid")
+        if child_pid is not None:
+            break
+        if process.poll() is not None:
+            break
+        time.sleep(0.02)
+    assert child_pid is not None, process.stderr.read() if process.stderr else ""
+    os.kill(process.pid, signal.SIGTERM)
+    return process, child_pid
+
+
+def test_run_scenario_sigterm_cleans_tree_and_restores_handlers() -> None:
+    if os.name == "nt":
+        return
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        _profile(root)
+        process, child_pid = _run_sigterm_case(root, "scenario")
+        stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode == 143, (stdout, stderr)
+        assert "result=143" in stdout
+        assert not _pid_alive(child_pid)
+        assert not (root / ".xflow" / "run" / "server.pid").exists()
+
+
+def test_run_playground_sigterm_cleans_tree_and_restores_handlers() -> None:
+    if os.name == "nt":
+        return
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        _profile(root)
+        process, child_pid = _run_sigterm_case(root, "playground")
+        stdout, stderr = process.communicate(timeout=5)
+        assert process.returncode == 143, (stdout, stderr)
+        assert "result=143" in stdout
+        assert not _pid_alive(child_pid)
+        assert not (root / ".xflow" / "run" / "flowable.pid").exists()
+
+
 def test_dependency_up_timeout_uses_absolute_budget_and_controlled_error() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw).resolve()
@@ -542,6 +645,25 @@ def test_tree_cleanup_forces_child_which_ignores_term() -> None:
             assert all(getattr(stream, "closed", False) for stream in streams)
         finally:
             _kill_pid(child_pid)
+
+
+def test_stop_all_cleans_process_record_before_handle_registration() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw).resolve()
+        profile = _profile(root)
+        context = _context(root)
+        supervisor = ServiceSupervisor(profile, context)
+        handle = supervisor._spawn(
+            "server", profile.services["server"].command, root / ".xflow" / "run" / "server.log"
+        )
+        # A signal can arrive after _spawn records ownership but before the
+        # caller appends the handle to its ordered list.
+        assert supervisor._handles == []
+        supervisor.stop_all()
+        assert handle.process.poll() is not None
+        assert not (context.run_dir / "server.pid").exists()
+        assert supervisor._process_records == {}
+        assert supervisor._log_streams == {}
 
 
 def test_stop_all_collects_pid_cleanup_errors_and_closes_every_stream() -> None:
@@ -1530,6 +1652,8 @@ def main() -> None:
         test_run_scenario_opens_browser_only_after_health,
         test_playground_alias_builds_before_spawn_and_opens_after_ready,
         test_playground_build_failure_does_not_start_process,
+        test_run_scenario_sigterm_cleans_tree_and_restores_handlers,
+        test_run_playground_sigterm_cleans_tree_and_restores_handlers,
         test_dependency_up_timeout_uses_absolute_budget_and_controlled_error,
         test_dependency_up_success_after_deadline_is_rejected,
         test_dependency_ready_execution_error_identifies_ready_stage,
@@ -1537,6 +1661,7 @@ def main() -> None:
         test_health_wait_requires_all_supervisor_handles_alive_before_return,
         test_leader_exit_still_cleans_owned_descendant_group,
         test_tree_cleanup_forces_child_which_ignores_term,
+        test_stop_all_cleans_process_record_before_handle_registration,
         test_stop_all_collects_pid_cleanup_errors_and_closes_every_stream,
         test_windows_tree_cleanup_uses_injectable_argv_capability,
         test_windows_taskkill_nonzero_is_not_success,
