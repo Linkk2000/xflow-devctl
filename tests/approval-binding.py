@@ -22,6 +22,7 @@ sys.path.insert(0, str(OPS_ROOT))
 from tests.support import write_text_lf
 
 from xflow import approval
+from xflow.io import canonical_path
 from xflow import cli, providers
 from xflow.bindings import git_path, resolve_bindings
 from xflow.paths import active_task_pointer_file
@@ -216,7 +217,7 @@ def test_consumed_record(repo_root: Path, approved_file: Path) -> None:
     record = approval.record_consumed_approval(repo_root, grant, "success")
     text = record.read_text(encoding="utf-8")
     payload = yaml.safe_load(text)
-    assert record.parent == repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history"
+    assert record.parent == canonical_path(repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history")
     assert payload["version"] == "0.1.0"
     assert payload["reusable"] is False
     assert payload["source"] == "local-review"
@@ -1296,7 +1297,7 @@ def test_confirmed_mr_claim_is_not_selected_while_an_unresolved_claim_exists(
     unresolved.update(
         {
             "approvalId": unresolved_id,
-            "remoteClaimFile": unresolved_path.relative_to(repo_root).as_posix(),
+            "remoteClaimFile": unresolved_path.relative_to(canonical_path(repo_root)).as_posix(),
             "state": "reserved",
             "targetIssue": "none",
             "providerReceipt": "none",
@@ -1439,7 +1440,7 @@ State: G1_APPROVE_ISSUE_CREATE
     )
     record = approval.record_consumed_approval(repo_root, create_grant, "success", target_issue="#42")
     payload = yaml.safe_load(record.read_text(encoding="utf-8"))
-    assert record.parent == repo_root / ".xflow" / "issues" / "issue-42" / "approvals" / "history"
+    assert record.parent == canonical_path(repo_root / ".xflow" / "issues" / "issue-42" / "approvals" / "history")
     assert payload["issue"] == "42"
     assert payload["approvalIssue"] == "draft"
     assert not (repo_root / ".xflow" / "issues" / "issue-draft" / "approvals" / "history").exists()

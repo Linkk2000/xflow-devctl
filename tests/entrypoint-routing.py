@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -288,6 +289,85 @@ def assert_posix_launcher_preserves_global_args_and_skips_provider() -> None:
         assert "skip=1" in default_result.stdout
 
 
+def assert_invalid_explicit_override_falls_back_for_root_and_generated_wrapper() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        fake_python3 = root / "python3"
+        python3_log = root / "python3.log"
+        fake_python = root / "python"
+        python_log = root / "python.log"
+        for executable, log in ((fake_python3, python3_log), (fake_python, python_log)):
+            write(
+                executable,
+                "#!/bin/sh\n"
+                f"printf '%s\\n' \"$@\" >> {shlex.quote(str(log))}\n"
+                f"printf '\\n' >> {shlex.quote(str(log))}\n"
+                "if [ \"${1:-}\" = '-c' ]; then exit 0; fi\n"
+                "exit 0\n",
+            )
+            executable.chmod(0o755)
+            log.write_text("", encoding="utf-8")
+
+        env = test_env()
+        env.pop("DEVCTL_SKIP_PROVIDER_LOAD", None)
+        env["DEVCTL_PYTHON"] = str(root / "missing interpreter")
+        env["DEVCTL_REPO_ROOT"] = str(root)
+        env["PATH"] = f"{root}{os.pathsep}{env['PATH']}"
+
+        root_args = ("issue", "show", "IK3RR6", "--format", "json")
+        root_result = subprocess.run(
+            [str(OPS_ROOT / "devctl"), *root_args],
+            cwd=root,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert root_result.returncode == 0, root_result.stderr
+        root_invocation = python3_log.read_text(encoding="utf-8").splitlines()
+        assert root_invocation == [
+            "-c",
+            "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)",
+            "",
+            "-m",
+            "xflow",
+            *root_args,
+            "",
+        ], root_invocation
+        assert python_log.read_text(encoding="utf-8") == ""
+
+        tool_root = root / ".xflow" / "ops" / "devctl"
+        (tool_root / "xflow").mkdir(parents=True)
+        wrapper = root / "generated wrapper"
+        write(wrapper, wrapper_files()["devctl"])
+        wrapper.chmod(0o755)
+
+        python3_log.write_text("", encoding="utf-8")
+        wrapper_args = ("check", "dependencies", "--issue", "IK3RR6")
+        wrapper_result = subprocess.run(
+            [str(wrapper), *wrapper_args],
+            cwd=root,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert wrapper_result.returncode == 0, wrapper_result.stderr
+        wrapper_invocation = python3_log.read_text(encoding="utf-8").splitlines()
+        assert wrapper_invocation == [
+            "-c",
+            "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)",
+            "",
+            "-m",
+            "xflow",
+            *wrapper_args,
+            "",
+        ], wrapper_invocation
+        assert python_log.read_text(encoding="utf-8") == ""
+
+
 def assert_check_commands_are_discoverable() -> None:
     env = test_env()
     commands = (
@@ -453,6 +533,7 @@ def main() -> None:
     assert_generated_wrapper_contract()
     assert_posix_launcher_routes_core()
     assert_posix_launcher_preserves_global_args_and_skips_provider()
+    assert_invalid_explicit_override_falls_back_for_root_and_generated_wrapper()
     assert_check_commands_are_discoverable()
     assert_unattended_commands_are_discoverable()
     assert_task_commands_are_discoverable()

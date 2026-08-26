@@ -94,6 +94,26 @@ def test_old_python3_is_rejected_before_falling_back_to_python(root: Path) -> No
     assert python_invocations and python_invocations[-1] == ("-m", "xflow", "issue", "show", "IK3RR6")
 
 
+def test_invalid_explicit_override_falls_back_to_python3(root: Path) -> None:
+    missing_override = root / "missing interpreter"
+    _, python3_log = write_fake_python(root, "python3", version_ok=True)
+    _, python_log = write_fake_python(root, "python", version_ok=True)
+    args = ("issue", "show", "IK3RR6", "--format", "json")
+    result = run_launcher(
+        {
+            "DEVCTL_PYTHON": str(missing_override),
+            "PATH": f"{root}{os.pathsep}{os.environ['PATH']}",
+        },
+        args,
+    )
+    assert result.returncode == 0, result.stderr
+    assert invocations(python3_log) == [
+        ("-c", "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)"),
+        ("-m", "xflow", *args),
+    ]
+    assert invocations(python_log) == []
+
+
 def test_rejects_candidates_below_python_39(root: Path) -> None:
     _, python3_log = write_fake_python(root, "python3", version_ok=False)
     _, python_log = write_fake_python(root, "python", version_ok=False)
@@ -113,6 +133,7 @@ def main() -> None:
         test_explicit_interpreter_override_wins(root)
         test_python3_precedes_python(root)
         test_old_python3_is_rejected_before_falling_back_to_python(root)
+        test_invalid_explicit_override_falls_back_to_python3(root)
         test_rejects_candidates_below_python_39(root)
     print("POSIX launcher ok")
 

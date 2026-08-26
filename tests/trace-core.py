@@ -26,6 +26,7 @@ from xflow.bindings import git_path, resolve_bindings
 from xflow.checks import check_resolution_report
 from xflow.collaboration import repository_lock
 from xflow.contracts import load_contract, validate_contract_acceptance
+from xflow.io import canonical_path
 from xflow.paths import active_task_pointer_file, legacy_active_task_pointer_file, task_authority_file
 from xflow.task_state import TaskState, activate_task, migrate_legacy_current_task, render_task_state
 from xflow.traceability import check_traceability, check_traceability_resolution
@@ -97,7 +98,7 @@ def init_repo(root: Path) -> Path:
 
 
 def matrix_path(repo: Path, issue: str = "101") -> Path:
-    return repo / ".xflow" / "issues" / f"issue-{issue}" / "traceability-matrix.yaml"
+    return canonical_path(repo / ".xflow" / "issues" / f"issue-{issue}" / "traceability-matrix.yaml")
 
 
 def prepare_valid_chain(repo: Path, issue: str = "101") -> Path:
@@ -995,7 +996,7 @@ def bind_gap_recognition(repo: Path, state_path: Path, gap_path: Path) -> None:
     )
     approve(review)
     history = approval.consume_gap_recognition(repo, state.issue, gap_path)
-    reference = history.relative_to(state_path.parent).as_posix()
+    reference = history.relative_to(canonical_path(state_path.parent)).as_posix()
     write(
         state_path,
         render_task_state(
@@ -1062,7 +1063,7 @@ def test_current_repository_acceptance_binding(repo: Path, root: Path) -> None:
         binding_mode="recorded",
         validate_acceptance=False,
     )
-    history_ref = history.relative_to(source_path.parent).as_posix()
+    history_ref = history.relative_to(canonical_path(source_path.parent)).as_posix()
     write(
         source_path.with_name("task-state.md"),
         render_task_state(
@@ -1142,7 +1143,7 @@ def test_snapshot_content_and_transitive_revalidation(repo: Path) -> None:
         binding_mode="recorded",
         validate_acceptance=False,
     )
-    history_ref = history.relative_to(path.parent).as_posix()
+    history_ref = history.relative_to(canonical_path(path.parent)).as_posix()
     write(
         state_path,
         render_task_state(
@@ -1213,7 +1214,7 @@ def _prepare_historical_contract_trace(repo: Path) -> tuple[Path, Path, Path]:
                 semantic_phase="accepted-design",
                 classification="capability-change",
                 contract_change_required=True,
-                human_approval_ref=history.relative_to(path.parent).as_posix(),
+                human_approval_ref=history.relative_to(canonical_path(path.parent)).as_posix(),
             )
         ),
     )

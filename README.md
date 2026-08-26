@@ -549,15 +549,29 @@ Run the deterministic full platform-runtime regression from the repository root:
 sh tests/run-platform-runtime.sh
 ```
 
+Each lane is preflighted as a real Python executable with the required `xflow`,
+PyYAML, jsonschema, and Pillow imports before tests run. `PYTHON39` must be
+Python 3.9.x; `PYTHON_CURRENT` must be Python 3.9+ with a different major and
+minor version. The defaults are `python3.9` and `python3`, respectively, so
+set both variables when the current interpreter is not the default PATH
+interpreter. The runner supports interpreter paths containing spaces and can be
+started from any current directory.
+
 It runs the declared Python 3.9 and current-Python lanes, including the POSIX
-launcher, legacy Git/Issue/approval core, and cockpit profile, command, service,
-and CLI suites. The optional PowerShell suite is run once with the current-Python
-lane and accepts exit 77 only when its executable capability is unavailable. Set
-`PYTHON39` and `PYTHON_CURRENT` to override the two interpreters, for example:
+launcher, legacy approval/project/classification/contract/task/trace gates, and
+cockpit profile, command, service, and CLI suites. It also runs the local
+`tests/review-gate.sh` shell gate. The optional PowerShell suite is run once with
+the current-Python lane and accepts exit 77 only when its executable capability
+is unavailable. Set `PYTHON39`, `PYTHON_CURRENT`, and optionally `BASE_REF` to
+override the interpreters and branch baseline, for example:
 
 ```text
-PYTHON39=/path/to/python3.9 PYTHON_CURRENT=python3 sh tests/run-platform-runtime.sh
+PYTHON39=/path/to/python3.9 PYTHON_CURRENT=/path/to/python3.12 BASE_REF=origin/main sh tests/run-platform-runtime.sh
 ```
+
+`BASE_REF` defaults to `origin/main` and must resolve to a commit. The runner
+checks the branch range (`BASE_REF...HEAD`), cached index, and worktree with
+`git diff --check` before reporting success.
 
 Search anchor: Normal Git, Issue, Attachment, Approval, Rules, and Migration commands route through Python core.
 Search anchor: Do not run bare bash/Git-Bash/WSL for normal XFlow validation on Windows.

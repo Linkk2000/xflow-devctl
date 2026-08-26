@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -12,6 +11,7 @@ from typing import Literal, Mapping, Sequence
 
 from . import approval
 from .classification import _decode_classification_bytes, _load_yaml
+from .io import canonical_path
 from .local_artifacts import MAX_TEXT_ARTIFACT_BYTES, StableFileSnapshot, capture_stable_file, revalidate_snapshots
 from .project_config import ProjectConfig, load_project_config, load_project_config_snapshot, require_safe_repo_path
 from .stable_ids import require_stable_id
@@ -201,16 +201,20 @@ def _contract_path(
     *,
     config: ProjectConfig | None = None,
 ) -> tuple[Path, Path]:
-    root = repo_root.resolve()
+    root = canonical_path(repo_root)
     config = config or load_project_config(root)
     contract_root = require_safe_repo_path(root, root / config.contract_root, "contracts.root")
     requested = file_path if file_path.is_absolute() else root / file_path
-    target = Path(os.path.abspath(requested))
     try:
-        target.relative_to(contract_root)
+        safe_target = require_safe_repo_path(root, requested, "contract file")
+    except ValueError as exc:
+        if " is outside repository:" in str(exc):
+            raise ValueError(f"contract file must stay under contracts.root: {contract_root}") from exc
+        raise
+    try:
+        safe_target.relative_to(contract_root)
     except ValueError as exc:
         raise ValueError(f"contract file must stay under contracts.root: {contract_root}") from exc
-    safe_target = require_safe_repo_path(root, target, "contract file")
     return contract_root, safe_target
 
 

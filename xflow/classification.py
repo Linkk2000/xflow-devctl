@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+from .io import canonical_path
 from .paths import normalized_issue
-from .project_config import _normalize_windows_final_path
+from .project_config import _normalize_windows_final_path, require_safe_repo_path
 from .task_state import CLASSIFICATIONS
 
 
@@ -78,6 +79,8 @@ def _decode_classification_bytes(content: bytes, path: Path) -> str:
 
 
 def _relative_classification_parts(repo_root: Path, path: Path) -> tuple[str, ...]:
+    repo_root = canonical_path(repo_root)
+    path = require_safe_repo_path(repo_root, path, "classification file")
     try:
         relative = path.relative_to(repo_root)
     except ValueError as exc:
@@ -157,6 +160,8 @@ def _read_stable_bytes_posix(
     *,
     max_bytes: int = MAX_CLASSIFICATION_BYTES,
 ) -> bytes:
+    repo_root = canonical_path(repo_root)
+    path = require_safe_repo_path(repo_root, path, "classification file")
     native = api if api is not None else _PosixApi()
     descriptors: list[int] = []
     parts = _relative_classification_parts(repo_root, path)
@@ -645,15 +650,11 @@ def _next_artifact(value: object) -> str:
 
 
 def _classification_file(repo_root: Path, issue: str, file_path: Path | None) -> Path:
-    root = repo_root.resolve()
+    root = canonical_path(repo_root)
     issue_directory = root / ".xflow" / "issues" / f"issue-{normalized_issue(issue)}"
     requested = file_path if file_path is not None else issue_directory / "classification.yaml"
     path = requested if requested.is_absolute() else root / requested
-    path = Path(os.path.abspath(path))
-    try:
-        path.relative_to(root)
-    except ValueError as exc:
-        raise ValueError(f"classification file is outside repository: {path}") from exc
+    path = require_safe_repo_path(root, path, "classification file")
     try:
         path.relative_to(issue_directory)
     except ValueError as exc:
@@ -667,8 +668,9 @@ def check_classification(
     file_path: Path | None = None,
 ) -> ClassificationCheckResult:
     path = _classification_file(repo_root, issue, file_path)
-    issue_directory = repo_root.resolve() / ".xflow" / "issues" / f"issue-{normalized_issue(issue)}"
-    raw = _load_yaml(_read_stable_text(repo_root.resolve(), path, issue_directory))
+    root = canonical_path(repo_root)
+    issue_directory = root / ".xflow" / "issues" / f"issue-{normalized_issue(issue)}"
+    raw = _load_yaml(_read_stable_text(root, path, issue_directory))
     return validate_classification_document(path, issue, raw)
 
 

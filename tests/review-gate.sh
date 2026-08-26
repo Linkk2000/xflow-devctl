@@ -53,10 +53,8 @@ review = approval.prepare(
     reviewer="user",
     force=True,
 )
-review.write_text(
-    review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"),
-    encoding="utf-8",
-    newline="\n",
+review.write_bytes(
+    review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes").encode("utf-8")
 )
 PY_REVIEW
 }
@@ -105,7 +103,10 @@ env -u DEVCTL_SKIP_PROVIDER_LOAD -u GITHUB_TOKEN -u GITHUB_ACCESS_TOKEN -u GITEE
   bash "$OPS_ROOT/devctl" check issue-draft --file "$tmpdir/.xflow/issues/issue-draft/issue-draft.md" >/dev/null
 
 cp "$tmpdir/.xflow/issues/issue-draft/issue-draft.md" "$tmpdir/.xflow/issues/issue-draft/issue-draft.valid.md"
-sed -i '1i# Issue Draft' "$tmpdir/.xflow/issues/issue-draft/issue-draft.md"
+sed -i.bak '1i\
+# Issue Draft
+' "$tmpdir/.xflow/issues/issue-draft/issue-draft.md"
+rm -f "$tmpdir/.xflow/issues/issue-draft/issue-draft.md.bak"
 expect_fail check issue-draft --file "$tmpdir/.xflow/issues/issue-draft/issue-draft.md"
 mv "$tmpdir/.xflow/issues/issue-draft/issue-draft.valid.md" "$tmpdir/.xflow/issues/issue-draft/issue-draft.md"
 
@@ -130,7 +131,10 @@ EOF_MR
 expect_pass check mr-draft --issue 1
 
 cp "$tmpdir/.xflow/issues/issue-1/mr-draft.md" "$tmpdir/.xflow/issues/issue-1/mr-draft.valid.md"
-sed -i '1i# MR Draft' "$tmpdir/.xflow/issues/issue-1/mr-draft.md"
+sed -i.bak '1i\
+# MR Draft
+' "$tmpdir/.xflow/issues/issue-1/mr-draft.md"
+rm -f "$tmpdir/.xflow/issues/issue-1/mr-draft.md.bak"
 expect_fail check mr-draft --issue 1
 mv "$tmpdir/.xflow/issues/issue-1/mr-draft.valid.md" "$tmpdir/.xflow/issues/issue-1/mr-draft.md"
 
@@ -140,7 +144,8 @@ expect_pass check local-review --issue draft --file "$tmpdir/.xflow/issues/issue
 
 printf '\nchanged\n' >>"$tmpdir/.xflow/issues/issue-draft/issue-draft.md"
 expect_fail check local-review --issue draft --file "$tmpdir/.xflow/issues/issue-draft/issue-draft.md" --action issue-create
-sed -i '$d' "$tmpdir/.xflow/issues/issue-draft/issue-draft.md"
+sed -i.bak '$d' "$tmpdir/.xflow/issues/issue-draft/issue-draft.md"
+rm -f "$tmpdir/.xflow/issues/issue-draft/issue-draft.md.bak"
 
 rm -f "$tmpdir/.xflow/issues/issue-draft/approvals/local-review.md"
 expect_fail issue create "Review gate" --body-file "$tmpdir/.xflow/issues/issue-draft/issue-draft.md"

@@ -16,6 +16,7 @@ sys.path.insert(0, str(OPS_ROOT))
 from tests.support import write_text_lf
 
 from xflow import migration
+from xflow.io import canonical_path
 from xflow.migration import apply_issue_workspace_migration, inspect_issue_workspace_migration
 from xflow.project_config import load_project_config, require_safe_repo_path
 
@@ -471,7 +472,7 @@ def test_final_commit_window_changes_are_preserved(root: Path) -> None:
     ) -> migration.FileSnapshot:
         nonlocal target_mutated
         current = real_snapshot(repo_root, expected, label)
-        if not target_mutated and label == "migration target" and expected.path == config_path:
+        if not target_mutated and label == "migration target" and expected.path == canonical_path(config_path):
             target_mutated = True
             write_json(config_path, {"projectOwned": "concurrent"})
         return current
@@ -493,7 +494,7 @@ def test_final_commit_window_changes_are_preserved(root: Path) -> None:
     ) -> migration.FileSnapshot:
         nonlocal ignore_mutated
         current = real_snapshot(repo_root, expected, label)
-        if not ignore_mutated and label == "migration target" and expected.path == ignore_path:
+        if not ignore_mutated and label == "migration target" and expected.path == canonical_path(ignore_path):
             ignore_mutated = True
             write(ignore_path, concurrent_ignore)
         return current
@@ -567,7 +568,7 @@ def test_final_commit_window_changes_are_preserved(root: Path) -> None:
     ) -> object:
         nonlocal success_mutated
         result = real_safe_replace(repo_root, source, target, label, *args, **kwargs)
-        if not success_mutated and label == "migration commit" and target == success_config:
+        if not success_mutated and label == "migration commit" and target == canonical_path(success_config):
             success_mutated = True
             write_json(success_config, {"projectOwned": "edited-before-success"})
         return result
@@ -624,7 +625,7 @@ def test_second_commit_failure_rolls_back_both_targets(root: Path) -> None:
         repo_root: Path, source: Path, target: Path, label: str, *args: object, **kwargs: object
     ) -> object:
         nonlocal failed
-        if not failed and target == config_path and label == "migration commit":
+        if not failed and target == canonical_path(config_path) and label == "migration commit":
             failed = True
             raise OSError("second replacement failed for test")
         return real_safe_replace(repo_root, source, target, label, *args, **kwargs)
@@ -650,7 +651,7 @@ def test_interrupted_transaction_recovers_without_residue(root: Path) -> None:
         repo_root: Path, source: Path, target: Path, label: str, *args: object, **kwargs: object
     ) -> object:
         nonlocal interrupted
-        if not interrupted and label == "migration commit" and target == config_path:
+        if not interrupted and label == "migration commit" and target == canonical_path(config_path):
             interrupted = True
             raise KeyboardInterrupt("simulated process interruption")
         return real_safe_replace(repo_root, source, target, label, *args, **kwargs)
@@ -691,7 +692,7 @@ def _leave_interrupted_transaction(repo: Path) -> Path:
         repo_root: Path, source: Path, target: Path, label: str, *args: object, **kwargs: object
     ) -> object:
         nonlocal interrupted
-        if not interrupted and label == "migration commit" and target == config_path:
+        if not interrupted and label == "migration commit" and target == canonical_path(config_path):
             interrupted = True
             raise KeyboardInterrupt("simulated process interruption")
         return real_safe_replace(repo_root, source, target, label, *args, **kwargs)

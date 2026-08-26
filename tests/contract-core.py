@@ -24,6 +24,7 @@ from tests.support import write_text_lf
 
 from xflow import approval
 from xflow import contracts as contracts_module
+from xflow.io import canonical_path
 from xflow import project_config
 from xflow.bindings import resolve_bindings
 from xflow.contracts import ContractDocument, load_contract, validate_contract_acceptance
@@ -481,7 +482,7 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
     assert contract.path.read_bytes() == FIXTURE.read_bytes()
     assert "Semantic Phase: classified" in state_path.read_text(encoding="utf-8")
 
-    reference = accepted.relative_to(state_path.parent).as_posix()
+    reference = accepted.relative_to(canonical_path(state_path.parent)).as_posix()
     write(state_path, render_task_state(task_state(issue, "feature/101-contract", reference)))
     assert parse_task_state(state_path).human_approval_ref == reference
     assert_value_error(
@@ -503,7 +504,7 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
     claim_path = issue_root / payload["approvalClaimFile"]
     original_claim = claim_path.read_bytes()
     claim_payload = yaml.safe_load(original_claim.decode("utf-8"))
-    history_reference = accepted.relative_to(issue_root).as_posix()
+    history_reference = accepted.relative_to(canonical_path(issue_root)).as_posix()
     assert claim_payload["historyFile"] == history_reference
     assert claim_payload["historySha256"] == hashlib.sha256(original_history).hexdigest()
     assert claim_payload["recordedAt"] == payload["recordedAt"]
@@ -571,7 +572,7 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
         str(payload["approvalId"]),
     )
     renamed_history.write_bytes(yaml.safe_dump(renamed_payload, sort_keys=False).encode("utf-8"))
-    renamed_ref = renamed_history.relative_to(issue_root).as_posix()
+    renamed_ref = renamed_history.relative_to(canonical_path(issue_root)).as_posix()
     write(state_path, render_task_state(task_state(issue, "feature/101-contract", renamed_ref)))
     assert_value_error("claim does not seal exact history", lambda: parse_task_state(state_path))
     renamed_history.unlink()
@@ -585,7 +586,7 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
     forged_payload["approvalClaimFile"] = "approvals/history/claims/" + "f" * 32 + ".yaml"
     forged = accepted.parent / ("20260731T010203000004Z-contract-acceptance-" + "f" * 32 + ".yaml")
     write(forged, yaml.safe_dump(forged_payload, sort_keys=False))
-    forged_ref = forged.relative_to(state_path.parent).as_posix()
+    forged_ref = forged.relative_to(canonical_path(state_path.parent)).as_posix()
     write(state_path, render_task_state(task_state(issue, "feature/101-contract", forged_ref)))
     assert_value_error("missing archived approved review", lambda: parse_task_state(state_path))
     forged.unlink()
@@ -717,7 +718,7 @@ def test_atomic_contract_acceptance_claim(repo: Path) -> None:
         archives = tuple((history_root / "consumed").glob("*.md"))
         histories = tuple(history_root.glob("*.yaml"))
         assert len(claims) == len(archives) == len(histories) == 1
-        assert approval.validate_contract_acceptance_history(repo, histories[0])["approvalId"] == approval_id
+        assert approval.validate_contract_acceptance_history(repo, canonical_path(histories[0]))["approvalId"] == approval_id
         assert_no_contract_acceptance_locks(repo)
 
 
@@ -787,9 +788,9 @@ def test_contract_acceptance_recovers_partial_publication(repo: Path) -> None:
         accepted = validate_contract_acceptance(repo, issue, contract, ACCEPTED_OBJECTS)
         assert len(tuple((history_root / "claims").glob("*.yaml"))) == 1
         assert len(tuple((history_root / "consumed").glob("*.md"))) == 1
-        assert tuple(history_root.glob("*.yaml")) == (accepted,)
+        assert tuple(canonical_path(path) for path in history_root.glob("*.yaml")) == (accepted,)
         state_path = repo / ".xflow" / "issues" / f"issue-{issue}" / "task-state.md"
-        reference = accepted.relative_to(state_path.parent).as_posix()
+        reference = accepted.relative_to(canonical_path(state_path.parent)).as_posix()
         recovered_state = dataclass_replace(
             task_state(issue, "feature/101-contract", reference),
             contract_file=f"contracts/recover-{issue}.yaml",
@@ -841,7 +842,8 @@ def test_contract_acceptance_history_names_include_approval_id(repo: Path) -> No
             records.append(validate_contract_acceptance(repo, issue, contract, ACCEPTED_OBJECTS))
 
     assert records[0] != records[1]
-    for record, approval_id in zip(records, approval_ids, strict=True):
+    assert len(records) == len(approval_ids)
+    for record, approval_id in zip(records, approval_ids):
         assert record.name == f"20990102T030405000006Z-contract-acceptance-{approval_id}.yaml"
         payload = approval.validate_contract_acceptance_history(repo, record)
         assert payload["approvalId"] == approval_id
@@ -882,7 +884,7 @@ def test_historical_task_uses_sealed_contract_bytes(repo: Path) -> None:
     assert payload["contractSnapshotSha256"] == contract.sha256
 
     state_path = repo / ".xflow" / "issues" / f"issue-{issue}" / "task-state.md"
-    reference = accepted.relative_to(state_path.parent).as_posix()
+    reference = accepted.relative_to(canonical_path(state_path.parent)).as_posix()
     historical_state = dataclass_replace(
         task_state(issue, "feature/101-contract", reference),
         contract_file="contracts/historical-upgrade.yaml",

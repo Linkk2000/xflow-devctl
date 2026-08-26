@@ -29,6 +29,7 @@ from xflow.bindings import resolve_bindings
 from xflow.checks import check_current_task
 from xflow.cli import current_task_issue
 from xflow.bindings import git_path
+from xflow.io import canonical_path
 from xflow.collaboration import (
     git_child_environment,
     inherited_lease_command,
@@ -270,7 +271,7 @@ def test_git_hook_requires_retained_contract_acceptance(root: Path) -> None:
     write(review, review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"))
     history = validate_contract_acceptance(repo, issue, contract, accepted_objects)
     issue_root = repo / ".xflow" / "issues" / f"issue-{issue}"
-    history_reference = history.relative_to(issue_root).as_posix()
+    history_reference = history.relative_to(canonical_path(issue_root)).as_posix()
     write_state(
         repo,
         dataclass_replace(
@@ -513,7 +514,7 @@ decisionSource: ai-proposed
     acceptance = validate_contract_acceptance(repo, issue, contract, accepted_objects)
     acceptance_record = approval.parse_contract_acceptance_history(repo, acceptance)
     assert acceptance_record["branch"] == final_branch
-    acceptance_ref = acceptance.relative_to(state_path.parent).as_posix()
+    acceptance_ref = acceptance.relative_to(canonical_path(state_path.parent)).as_posix()
     accepted = dataclass_replace(
         candidate,
         execution_state="S4_TDD_AND_IMPLEMENTATION",
@@ -1772,7 +1773,7 @@ def test_implementation_gap_uses_immutable_gap_recognition(root: Path) -> None:
     assert recognized.returncode == 0, recognized.stderr
     records = tuple((gap_file.parent / "approvals" / "history").glob("*-gap-recognition-*.yaml"))
     assert len(records) == 1
-    recognition_ref = records[0].relative_to(gap_file.parent).as_posix()
+    recognition_ref = canonical_path(records[0]).relative_to(canonical_path(gap_file.parent)).as_posix()
     recognized_state = dataclass_replace(
         candidate,
         execution_state="S4_TDD_AND_IMPLEMENTATION",

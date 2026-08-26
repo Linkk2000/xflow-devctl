@@ -337,8 +337,18 @@ def test_safe_yaml_and_containment(repo_root: Path) -> None:
     except OSError:
         return
     assert_value_error(
-        "classification file must stay inside the issue directory",
+        "classification file must not traverse a symlink, junction, or reparse point",
         lambda: check_classification(repo_root, "draft", linked),
+    )
+
+    self_loop = issue_dir / "self-loop.yaml"
+    try:
+        os.symlink(self_loop, self_loop)
+    except OSError:
+        return
+    assert_value_error(
+        "classification file must not traverse a symlink, junction, or reparse point",
+        lambda: check_classification(repo_root, "draft", self_loop),
     )
 
 
