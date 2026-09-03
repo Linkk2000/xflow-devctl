@@ -1457,6 +1457,71 @@ def require_clean_worktree(repo_root: Path) -> None:
         raise ValueError("worktree has untracked files; add, ignore, or remove them first")
 
 
+def issue_process_residual_prefixes(issue: str) -> tuple[str, ...]:
+    issue_id = normalized_issue(issue)
+    return (
+        f".xflow/issues/issue-{issue_id}/",
+        f".xflow/publish/issues/issue-{issue_id}/",
+    )
+
+
+def path_is_issue_process_residual(path: str, issue: str) -> bool:
+    normalized = path.replace("\\", "/")
+    for prefix in issue_process_residual_prefixes(issue):
+        bare = prefix.rstrip("/")
+        if normalized == bare or normalized.startswith(prefix):
+            return True
+    return False
+
+
+def discard_issue_process_residuals(repo_root: Path, issue: str) -> list[str]:
+    """Discard dirty paths that belong only to the cleanup Issue workspace.
+
+    Returns the discarded path list. Raises if any dirty path is outside the
+    Issue process residual prefixes. Never stashes.
+    """
+    dirty = changed_paths(repo_root)
+    if not dirty:
+        return []
+    unrelated = [path for path in dirty if not path_is_issue_process_residual(path, issue)]
+    if unrelated:
+        raise ValueError(
+            "worktree has unrelated local changes that git done must not discard or stash: "
+            + ", ".join(unrelated)
+            + ". Finish or move those changes first; do not stash them to run git done. "
+            "When the only dirt is under .xflow/issues/issue-<id>/ or "
+            ".xflow/publish/issues/issue-<id>/, git done discards those residuals automatically."
+        )
+    tracked = [
+        path
+        for path in dirty
+        if git_succeeds(repo_root, ["ls-files", "--error-unmatch", path])
+    ]
+    if tracked:
+        git_run(
+            repo_root,
+            ["restore", "--source=HEAD", "--staged", "--worktree", "--", *tracked],
+        )
+    residual_roots = [
+        prefix.rstrip("/")
+        for prefix in issue_process_residual_prefixes(issue)
+        if (repo_root / prefix.rstrip("/")).exists()
+    ]
+    if residual_roots:
+        git_run(repo_root, ["clean", "-fd", "--", *residual_roots])
+    return dirty
+
+
+def prepare_worktree_for_git_done(repo_root: Path, issue: str) -> list[str]:
+    discarded = discard_issue_process_residuals(repo_root, issue)
+    if discarded:
+        print(
+            "[INFO] discarded issue process residuals: "
+            + ", ".join(discarded)
+        )
+    return discarded
+
+
 def branch_slugify(value: str) -> str:
     slug = []
     last_dash = False
@@ -1964,6 +2029,7 @@ def run_git_done(ctx: RuntimeContext, args: argparse.Namespace) -> int:
             raise ValueError(f"PR #{pr_number} is not merged or closed; use --force only with explicit approval")
     elif not args.force and not pr_number:
         print("[WARN] no PR number recorded; skipping merge-state check")
+    prepare_worktree_for_git_done(ctx.repo_root, issue)
     require_clean_worktree(ctx.repo_root)
     print(f"[INFO] checkout {base}")
     git_run(ctx.repo_root, ["checkout", base])

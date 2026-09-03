@@ -2185,6 +2185,112 @@ def test_git_done_requires_exact_human_cleanup_approval(parent: Path) -> None:
     assert require_active(work, "9").issue == "9"
 
 
+def test_git_done_discards_issue_process_residuals_only(parent: Path) -> None:
+    parent.mkdir(parents=True, exist_ok=True)
+    origin = parent / "origin.git"
+    work = parent / "work"
+    git(parent, "init", "--bare", str(origin))
+    work.mkdir()
+    git(work, "init", "-q")
+    git(work, "config", "user.email", "test@example.com")
+    git(work, "config", "user.name", "Test User")
+    git(work, "checkout", "-b", "main", "-q")
+    write(work / "README.md", "# Demo\n")
+    evidence = work / ".xflow" / "issues" / "issue-11" / "resolution-report.md"
+    write(evidence, "# Resolution Report\n\nCleanup reviewed by the human.\n")
+    git(work, "add", ".")
+    git(work, "commit", "-m", "init cleanup residual fixture", "-q")
+    git(work, "remote", "add", "origin", str(origin))
+    git(work, "push", "-u", "origin", "main", "-q")
+    write(
+        work / ".git" / "info" / "exclude",
+        ".xflow/local/\n.xflow/current-task.md\n.xflow/issues/**/approvals/\n",
+    )
+
+    run_devctl(work, "git", "start", "residual-cleanup", "--issue", "11", "--base", "main")
+    write(work / ".xflow" / "current-task.md", current_task_text("11"))
+    write(
+        work / ".xflow" / "issues" / "issue-11" / "walkthrough.md",
+        "# Walkthrough\n\nPost-push residual.\n",
+    )
+    write(
+        work / ".xflow" / "publish" / "issues" / "issue-11" / "issue.final.md",
+        "# Published\n",
+    )
+    write(
+        work / ".xflow" / "issues" / "issue-11" / "mr-draft.md",
+        "# MR Draft\n\nPost-merge residual.\n",
+    )
+    exact = approval_gate.prepare(work, "11", "git-cleanup", evidence, force=True)
+    write_text_lf(exact, exact.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"))
+    result = run_devctl(
+        work,
+        "git",
+        "done",
+        "--base",
+        "main",
+        "--issue",
+        "11",
+        "--file",
+        str(evidence),
+    )
+    assert "discarded issue process residuals" in result.stdout
+    assert git_text(work, "branch", "--show-current") == "main"
+    assert "feat/11-residual-cleanup" not in git_text(work, "branch", "--format=%(refname:short)")
+    assert not (work / ".xflow" / "issues" / "issue-11" / "walkthrough.md").exists()
+    assert not (work / ".xflow" / "issues" / "issue-11" / "mr-draft.md").exists()
+    assert not (work / ".xflow" / "publish" / "issues" / "issue-11" / "issue.final.md").exists()
+    assert not git_text(work, "status", "--porcelain")
+
+
+def test_git_done_preserves_unrelated_dirty_paths(parent: Path) -> None:
+    parent.mkdir(parents=True, exist_ok=True)
+    origin = parent / "origin.git"
+    work = parent / "work"
+    git(parent, "init", "--bare", str(origin))
+    work.mkdir()
+    git(work, "init", "-q")
+    git(work, "config", "user.email", "test@example.com")
+    git(work, "config", "user.name", "Test User")
+    git(work, "checkout", "-b", "main", "-q")
+    write(work / "README.md", "# Demo\n")
+    evidence = work / ".xflow" / "issues" / "issue-12" / "resolution-report.md"
+    write(evidence, "# Resolution Report\n\nCleanup reviewed by the human.\n")
+    git(work, "add", ".")
+    git(work, "commit", "-m", "init unrelated dirty fixture", "-q")
+    git(work, "remote", "add", "origin", str(origin))
+    git(work, "push", "-u", "origin", "main", "-q")
+    write(
+        work / ".git" / "info" / "exclude",
+        ".xflow/local/\n.xflow/current-task.md\n.xflow/issues/**/approvals/\n",
+    )
+
+    run_devctl(work, "git", "start", "unrelated-dirty", "--issue", "12", "--base", "main")
+    write(work / ".xflow" / "current-task.md", current_task_text("12"))
+    write(work / ".xflow" / "issues" / "issue-12" / "walkthrough.md", "# residual\n")
+    write(work / "keep-me.txt", "unrelated local work\n")
+    exact = approval_gate.prepare(work, "12", "git-cleanup", evidence, force=True)
+    write_text_lf(exact, exact.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"))
+    rejected = run_devctl(
+        work,
+        "git",
+        "done",
+        "--base",
+        "main",
+        "--issue",
+        "12",
+        "--file",
+        str(evidence),
+        expect=1,
+    )
+    assert "must not discard or stash" in rejected.stderr
+    assert "keep-me.txt" in rejected.stderr
+    assert "do not stash" in rejected.stderr
+    assert git_text(work, "branch", "--show-current") == "feat/12-unrelated-dirty"
+    assert (work / "keep-me.txt").read_text(encoding="utf-8") == "unrelated local work\n"
+    assert (work / ".xflow" / "issues" / "issue-12" / "walkthrough.md").exists()
+
+
 def test_git_task_metadata_is_scoped_to_each_worktree(parent: Path) -> None:
     parent.mkdir(parents=True, exist_ok=True)
     origin = parent / "origin.git"
@@ -2775,6 +2881,8 @@ def main() -> None:
         test_pr_backfill_replays_real_commit_and_push_windows(repo / "pr-backfill-replay")
         test_python_core_git_and_app_commands(repo / "core-routing")
         test_git_done_requires_exact_human_cleanup_approval(repo / "git-done-exact-approval")
+        test_git_done_discards_issue_process_residuals_only(repo / "git-done-discard-residuals")
+        test_git_done_preserves_unrelated_dirty_paths(repo / "git-done-preserve-unrelated")
         test_git_task_metadata_is_scoped_to_each_worktree(repo / "worktree-metadata")
         test_git_push_and_mr_are_separate_with_state_backfill(repo / "push-mr-state")
         test_ai_call_guidance_is_visible(repo)
