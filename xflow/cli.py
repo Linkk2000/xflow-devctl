@@ -912,6 +912,11 @@ def run_contract(args: argparse.Namespace) -> int:
         object_ids = tuple(args.objects.split(","))
         record = validate_contract_acceptance(ctx.repo_root, args.issue, contract, object_ids)
         print(f"[INFO] contract acceptance recorded: {record}")
+        print(
+            "[NEXT] Early XFlow artifact commit: stage and commit accepted contract "
+            "plus Issue workspace / approvals/history only before G2 or implementation. "
+            "Does not authorize push or MR."
+        )
         return 0
     raise ValueError(f"unknown contract subcommand: {args.contract_command}")
 
@@ -922,6 +927,11 @@ def run_gap(args: argparse.Namespace) -> int:
     ctx = context()
     record = approval.consume_gap_recognition(ctx.repo_root, args.issue, args.file)
     print(f"[INFO] gap recognition recorded: {record}")
+    print(
+        "[NEXT] Early XFlow artifact commit: stage and commit gap-analysis / "
+        "approvals/history only before G2 or implementation. Does not authorize "
+        "push or MR."
+    )
     return 0
 
 
@@ -1880,6 +1890,11 @@ def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
         branch_reservation = approval.mark_task_branch_activated(ctx.repo_root, branch_reservation)
         approval.complete_task_branch_start(ctx.repo_root, branch_reservation)
     print("[INFO] ready")
+    print(
+        "[NEXT] Early XFlow artifact commit: stage and commit trackable Issue "
+        "workspace / contract / approvals/history only before further gates or "
+        "implementation. Does not authorize push or MR."
+    )
     return 0
 
 
