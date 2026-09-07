@@ -62,6 +62,10 @@ def write(path: Path, text: str) -> None:
     write_text_lf(path, text)
 
 
+def receipt_history(repo_root: Path, issue: str = "202") -> Path:
+    return repo_root / ".xflow" / "local" / "issues" / f"issue-{issue}" / "approvals" / "history"
+
+
 def assert_value_error(expected: str, action: object) -> None:
     try:
         action()  # type: ignore[operator]
@@ -217,7 +221,7 @@ def test_consumed_record(repo_root: Path, approved_file: Path) -> None:
     record = approval.record_consumed_approval(repo_root, grant, "success")
     text = record.read_text(encoding="utf-8")
     payload = yaml.safe_load(text)
-    assert record.parent == canonical_path(repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history")
+    assert record.parent == canonical_path(receipt_history(repo_root))
     assert payload["version"] == "0.1.0"
     assert payload["reusable"] is False
     assert payload["source"] == "local-review"
@@ -360,6 +364,7 @@ def test_history_path_validation(repo_root: Path, approved_file: Path) -> None:
         )
     assert not (repo_root / ".xflow" / "escape").exists()
     assert not (repo_root / ".xflow" / "issues" / "issue-303" / "approvals" / "history").exists()
+    assert not receipt_history(repo_root, "303").exists()
 
 
 def test_credential_safety(repo_root: Path, approved_file: Path) -> None:
@@ -392,6 +397,23 @@ def test_credential_safety(repo_root: Path, approved_file: Path) -> None:
         )
 
 
+def test_prepare_replaces_unapproved_review(repo_root: Path, approved_file: Path) -> None:
+    first = approval.prepare(repo_root, "202", "git-push", approved_file)
+    first_text = first.read_text(encoding="utf-8")
+    assert "Approved: yes" in first_text
+    assert approval.field(first_text, "Approved") == "no"
+    assert approval.field(first_text, "Approved Action") == "git-push"
+    second = approval.prepare(repo_root, "202", "git-mr", approved_file)
+    second_text = second.read_text(encoding="utf-8")
+    assert approval.field(second_text, "Approved") == "no"
+    assert approval.field(second_text, "Approved Action") == "git-mr"
+    approve(second)
+    assert_value_error(
+        "refusing to overwrite approved local review",
+        lambda: approval.prepare(repo_root, "202", "git-push", approved_file),
+    )
+
+
 def test_skipped_git_push_has_no_history(repo_root: Path, approved_file: Path) -> None:
     git(repo_root, "config", "extensions.worktreeConfig", "true")
     git(repo_root, "config", "--worktree", "devctl.issue", "202")
@@ -409,7 +431,7 @@ def test_skipped_git_push_has_no_history(repo_root: Path, approved_file: Path) -
         str(approved_file),
     )
     assert "push skipped" in result.stdout
-    history = repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history"
+    history = receipt_history(repo_root)
     assert not tuple(history.glob("*.yaml"))
 
 
@@ -646,7 +668,7 @@ def test_issue_comment_provider_consumes_reserved_bytes(repo_root: Path, approve
         assert cli.main(["issue", "comment", "202", "--body-file", str(approved_file)]) == 0
 
     assert captured["202"].encode("utf-8") == original
-    history = repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history"
+    history = receipt_history(repo_root)
     record = next(history.glob("*-issue-comment-*.yaml"))
     payload = yaml.safe_load(record.read_text(encoding="utf-8"))
     assert (repo_root / payload["approvedSnapshotFile"]).read_bytes() == original
@@ -908,7 +930,7 @@ def test_mr_replay_after_provider_confirmation_finishes_local_effects(
         raise AssertionError("expected post-provider metadata failure")
 
     claim_path = next(
-        (repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history" / "claims").glob("*-remote.yaml")
+        (receipt_history(repo_root) / "claims").glob("*-remote.yaml")
     )
     claim = yaml.safe_load(claim_path.read_text(encoding="utf-8"))
     assert claim["approvalId"] == grant.approval_id
@@ -926,7 +948,7 @@ def test_mr_replay_after_provider_confirmation_finishes_local_effects(
     assert "State: S9_REMOTE_REVIEW_AND_CI" in current_task
     assert "PR: 42" in current_task
 
-    history = repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history"
+    history = receipt_history(repo_root)
     records = [yaml.safe_load(path.read_text(encoding="utf-8")) for path in history.glob("*.yaml")]
     assert len([record for record in records if record["action"] == "git-mr"]) == 1
     assert len([record for record in records if record["action"] == "git-state-backfill"]) == 1
@@ -954,7 +976,7 @@ def test_mr_replay_converges_after_partial_metadata(repo_root: Path, approved_fi
 
     assert run_replayable_mr(repo_root, provider_calls) == 0
     assert provider_calls == ["create"]
-    history = repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history"
+    history = receipt_history(repo_root)
     actions = [yaml.safe_load(path.read_text(encoding="utf-8"))["action"] for path in history.glob("*.yaml")]
     assert actions.count("git-mr") == 1
     assert actions.count("git-state-backfill") == 1
@@ -982,7 +1004,7 @@ def assert_real_mr_replay_completed(repo_root: Path, origin: Path, provider_call
         encoding="utf-8",
         stdout=subprocess.PIPE,
     ).stdout.strip()
-    history = repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history"
+    history = receipt_history(repo_root)
     actions = [yaml.safe_load(path.read_text(encoding="utf-8"))["action"] for path in history.glob("*.yaml")]
     assert actions.count("git-mr") == 1
     assert actions.count("git-state-backfill") == 1
@@ -1068,7 +1090,7 @@ def test_mr_replay_rejects_conflicting_pr_identity(repo_root: Path, approved_fil
     assert provider_calls == ["create"]
     assert cli.branch_meta(repo_root, "pr") == "99"
     claim_path = next(
-        (repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history" / "claims").glob("*-remote.yaml")
+        (receipt_history(repo_root) / "claims").glob("*-remote.yaml")
     )
     assert yaml.safe_load(claim_path.read_text(encoding="utf-8"))["state"] == "post-effects-pending"
 
@@ -1083,12 +1105,12 @@ def test_mr_without_successful_backfill_stays_nonterminal(
     assert run_replayable_mr(repo_root, provider_calls, backfill_result=result) == 1
     assert provider_calls == ["create"]
     claim_path = next(
-        (repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history" / "claims").glob(
+        (receipt_history(repo_root) / "claims").glob(
             "*-remote.yaml"
         )
     )
     assert yaml.safe_load(claim_path.read_text(encoding="utf-8"))["state"] == "post-effects-pending"
-    history = repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history"
+    history = receipt_history(repo_root)
     assert not tuple(history.glob("*.yaml"))
 
 
@@ -1403,7 +1425,7 @@ def test_skipped_backfill_has_no_effect(repo_root: Path, approved_file: Path) ->
     assert not push_result.success
     recorded = record_backfill_effect_if_confirmed(repo_root, grant, push_result)
     assert recorded is None
-    history = repo_root / ".xflow" / "issues" / "issue-202" / "approvals" / "history"
+    history = receipt_history(repo_root)
     payloads = [yaml.safe_load(path.read_text(encoding="utf-8")) for path in history.glob("*.yaml")]
     assert len(payloads) == 1
     assert payloads[0]["action"] == "git-mr"
@@ -1693,6 +1715,8 @@ def main() -> None:
         test_history_path_validation(path_repo, path_file)
         credential_repo, credential_file = init_active_repo(root, "credential-safety")
         test_credential_safety(credential_repo, credential_file)
+        prepare_repo, prepare_file = init_active_repo(root, "prepare-unapproved")
+        test_prepare_replaces_unapproved_review(prepare_repo, prepare_file)
         skipped_repo, skipped_file = init_active_repo(root, "skipped-push")
         test_skipped_git_push_has_no_history(skipped_repo, skipped_file)
         unattended_repo, unattended_file = init_active_repo(root, "unattended-grants")

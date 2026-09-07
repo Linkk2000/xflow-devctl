@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, replace
@@ -52,7 +53,7 @@ from .env import (
 from .io import canonical_path, write_text_lf
 from .dependencies import check_dependencies
 from .migration import apply_issue_workspace_migration, inspect, inspect_issue_workspace_migration, write_wrappers
-from .paths import default_issue_file, normalized_issue, task_state_file
+from .paths import default_issue_file, local_issue_dir, normalized_issue, task_state_file
 from .task_state import (
     TaskState,
     _capture_file,
@@ -1453,7 +1454,12 @@ def require_clean_worktree(repo_root: Path) -> None:
         raise ValueError("worktree has unstaged changes; commit or stash them first")
     if not git_succeeds(repo_root, ["diff", "--cached", "--quiet"]):
         raise ValueError("index has staged changes; commit or reset them first")
-    if git_output(repo_root, ["ls-files", "--others", "--exclude-standard"]):
+    untracked = [
+        path
+        for path in git_output(repo_root, ["ls-files", "--others", "--exclude-standard"]).splitlines()
+        if path and not path.replace("\\", "/").startswith(".xflow/local/")
+    ]
+    if untracked:
         raise ValueError("worktree has untracked files; add, ignore, or remove them first")
 
 
@@ -1462,6 +1468,7 @@ def issue_process_residual_prefixes(issue: str) -> tuple[str, ...]:
     return (
         f".xflow/issues/issue-{issue_id}/",
         f".xflow/publish/issues/issue-{issue_id}/",
+        f".xflow/local/issues/issue-{issue_id}/",
     )
 
 
@@ -1481,35 +1488,40 @@ def discard_issue_process_residuals(repo_root: Path, issue: str) -> list[str]:
     Issue process residual prefixes. Never stashes.
     """
     dirty = changed_paths(repo_root)
-    if not dirty:
-        return []
-    unrelated = [path for path in dirty if not path_is_issue_process_residual(path, issue)]
-    if unrelated:
-        raise ValueError(
-            "worktree has unrelated local changes that git done must not discard or stash: "
-            + ", ".join(unrelated)
-            + ". Finish or move those changes first; do not stash them to run git done. "
-            "When the only dirt is under .xflow/issues/issue-<id>/ or "
-            ".xflow/publish/issues/issue-<id>/, git done discards those residuals automatically."
-        )
-    tracked = [
-        path
-        for path in dirty
-        if git_succeeds(repo_root, ["ls-files", "--error-unmatch", path])
-    ]
-    if tracked:
-        git_run(
-            repo_root,
-            ["restore", "--source=HEAD", "--staged", "--worktree", "--", *tracked],
-        )
-    residual_roots = [
-        prefix.rstrip("/")
-        for prefix in issue_process_residual_prefixes(issue)
-        if (repo_root / prefix.rstrip("/")).exists()
-    ]
-    if residual_roots:
-        git_run(repo_root, ["clean", "-fd", "--", *residual_roots])
-    return dirty
+    if dirty:
+        unrelated = [path for path in dirty if not path_is_issue_process_residual(path, issue)]
+        if unrelated:
+            raise ValueError(
+                "worktree has unrelated local changes that git done must not discard or stash: "
+                + ", ".join(unrelated)
+                + ". Finish or move those changes first; do not stash them to run git done. "
+                "When the only dirt is under .xflow/issues/issue-<id>/, "
+                ".xflow/publish/issues/issue-<id>/, or .xflow/local/issues/issue-<id>/, "
+                "git done discards those residuals automatically."
+            )
+        tracked = [
+            path
+            for path in dirty
+            if git_succeeds(repo_root, ["ls-files", "--error-unmatch", path])
+        ]
+        if tracked:
+            git_run(
+                repo_root,
+                ["restore", "--source=HEAD", "--staged", "--worktree", "--", *tracked],
+            )
+        residual_roots = [
+            prefix.rstrip("/")
+            for prefix in issue_process_residual_prefixes(issue)
+            if (repo_root / prefix.rstrip("/")).exists()
+        ]
+        if residual_roots:
+            git_run(repo_root, ["clean", "-fd", "--", *residual_roots])
+    discarded = list(dirty)
+    local_receipts = local_issue_dir(repo_root, issue)
+    if local_receipts.exists():
+        shutil.rmtree(local_receipts)
+        discarded.append(local_receipts.relative_to(repo_root).as_posix())
+    return discarded
 
 
 def prepare_worktree_for_git_done(repo_root: Path, issue: str) -> list[str]:

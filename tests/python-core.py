@@ -462,7 +462,7 @@ def test_successful_issue_close_invalidates_unattended_state(parent: Path) -> No
         )
         assert f"Issue #{issue_id} closed" in closed.stdout
         assert [item["method"] for item in server.requests] == ["PATCH"]
-    history = repo / ".xflow" / "issues" / f"issue-{issue_id}" / "approvals" / "history"
+    history = repo / ".xflow" / "local" / "issues" / f"issue-{issue_id}" / "approvals" / "history"
     history_text = "\n".join(path.read_text(encoding="utf-8") for path in history.glob("*.yaml"))
     assert "source: unattended" in history_text
     assert "action: issue-close" in history_text
@@ -2221,6 +2221,10 @@ def test_git_done_discards_issue_process_residuals_only(parent: Path) -> None:
         work / ".xflow" / "issues" / "issue-11" / "mr-draft.md",
         "# MR Draft\n\nPost-merge residual.\n",
     )
+    write(
+        work / ".xflow" / "local" / "issues" / "issue-11" / "receipt.txt",
+        "git-push receipt placeholder\n",
+    )
     exact = approval_gate.prepare(work, "11", "git-cleanup", evidence, force=True)
     write_text_lf(exact, exact.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"))
     result = run_devctl(
@@ -2240,6 +2244,7 @@ def test_git_done_discards_issue_process_residuals_only(parent: Path) -> None:
     assert not (work / ".xflow" / "issues" / "issue-11" / "walkthrough.md").exists()
     assert not (work / ".xflow" / "issues" / "issue-11" / "mr-draft.md").exists()
     assert not (work / ".xflow" / "publish" / "issues" / "issue-11" / "issue.final.md").exists()
+    assert not (work / ".xflow" / "local" / "issues" / "issue-11").exists()
     assert not git_text(work, "status", "--porcelain")
 
 
@@ -2452,15 +2457,17 @@ Closes #8
     )
     assert "devctl git push" in mr_before_push.stderr, mr_before_push.stderr
     assert branch not in git_text(origin, "branch", "--format=%(refname:short)")
-    history = work / ".xflow" / "issues" / "issue-8" / "approvals" / "history"
-    assert not tuple(history.glob("*.yaml"))
+    tracked_history = work / ".xflow" / "issues" / "issue-8" / "approvals" / "history"
+    receipt_history = work / ".xflow" / "local" / "issues" / "issue-8" / "approvals" / "history"
+    assert not tuple(tracked_history.glob("*.yaml"))
 
     run_devctl(work, "approval", "prepare", "--issue", "8", "--action", "git-push", "--file", str(walkthrough), "--force")
     approval.write_text(approval.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"), encoding="utf-8")
     push_result = run_devctl(work, "git", "push", "--issue", "8", "--file", str(walkthrough))
     assert f"pushed {branch}" in push_result.stdout
     assert branch in git_text(origin, "branch", "--format=%(refname:short)")
-    assert any("action: git-push" in path.read_text(encoding="utf-8") for path in history.glob("*.yaml"))
+    assert any("action: git-push" in path.read_text(encoding="utf-8") for path in receipt_history.glob("*.yaml"))
+    assert not tuple(tracked_history.glob("*.yaml"))
 
     run_devctl(work, "approval", "prepare", "--issue", "8", "--action", "git-mr", "--file", str(mr_file), "--force")
     approval.write_text(approval.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"), encoding="utf-8")
@@ -2499,12 +2506,13 @@ Closes #8
     assert "PR URL: https://github.test/pulls/42" in remote_task
     remote_suggestion = git_text(origin, "show", f"refs/heads/{branch}:.xflow/issues/issue-8/state-update-suggestion.md")
     assert "PR: 42" in remote_suggestion
-    history_text = "\n".join(path.read_text(encoding="utf-8") for path in history.glob("*.yaml"))
+    history_text = "\n".join(path.read_text(encoding="utf-8") for path in receipt_history.glob("*.yaml"))
     assert "action: git-mr" in history_text
     assert "action: git-state-backfill" in history_text
     assert "source: effect" in history_text
     assert "parentAction: git-mr" in history_text
     assert "Approved: yes" not in history_text
+    assert not tuple(tracked_history.glob("*.yaml"))
 
 
 def test_ai_call_guidance_is_visible(repo: Path) -> None:
