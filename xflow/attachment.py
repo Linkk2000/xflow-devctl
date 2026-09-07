@@ -17,6 +17,9 @@ from .paths import normalized_issue
 PLACEHOLDER_RE = re.compile(r"xflow-attachment://([A-Za-z0-9._-]+)")
 DRIVE_PATH_RE = re.compile(r"(?i)(^|[\s\(\[\"'])[A-Z]:[\\/]")
 POSIX_LOCAL_RE = re.compile(r"(^|[\s\(\[\"'])(/tmp/|/mnt/|/home/)")
+# Machine-local runtime under .xflow/local only; tracked paths such as
+# .xflow/issues/ and .xflow/publish/ are allowed in remote bodies.
+XFLOW_LOCAL_PATH_RE = re.compile(r"(?i)\.xflow[/\\]+local(?=[/\\]|$)")
 ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
@@ -265,8 +268,8 @@ def reject_publication_body(text: str) -> None:
         raise ValueError("remote body contains Windows local path")
     if POSIX_LOCAL_RE.search(text):
         raise ValueError("remote body contains POSIX local path")
-    if ".xflow/" in text or ".xflow\\" in text:
-        raise ValueError("remote body contains .xflow local path")
+    if XFLOW_LOCAL_PATH_RE.search(text):
+        raise ValueError("remote body contains .xflow/local path")
 
 
 def check_body(repo_root: Path, manifest: dict[str, object], body_file: Path, final: bool = False) -> None:
