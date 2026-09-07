@@ -23,6 +23,7 @@ from .paths import (
     active_task_pointer_file,
     default_approval_file,
     issue_dir,
+    local_issue_dir,
     normalized_issue,
     task_authority_file,
     task_state_file,
@@ -39,6 +40,14 @@ UNATTENDED_ACTIONS = {
     "git-push",
     "git-mr",
     "git-pr-merge",
+}
+LOCAL_RECEIPT_ACTIONS = {
+    "issue-comment",
+    "issue-close",
+    "git-push",
+    "git-mr",
+    "git-pr-merge",
+    "git-state-backfill",
 }
 APPROVAL_ACTIONS = UNATTENDED_ACTIONS | {
     "contract-acceptance",
@@ -286,6 +295,13 @@ def field(text: str, name: str) -> str:
     raise ValueError(f"missing required text '{prefix}'")
 
 
+def decision_is_approved(text: str) -> bool:
+    try:
+        return field(text, "Approved").lower() == "yes"
+    except ValueError:
+        return False
+
+
 def reject_placeholder(text: str, name: str) -> None:
     value = field(text, name)
     upper = value.upper()
@@ -409,7 +425,7 @@ def prepare(
     review_file = default_approval_file(repo_root, issue)
     if review_file.exists() and not force:
         existing = read_text(review_file)
-        if "Approved: yes" in existing:
+        if decision_is_approved(existing):
             raise ValueError(f"refusing to overwrite approved local review: {review_file}")
 
     relative_file = display_path(repo_root, approved_path)
@@ -787,7 +803,7 @@ def _parse_history_snapshot(
                 if receipt != payload["providerReceipt"]:
                     raise ValueError("providerReceipt must be canonical JSON")
                 _canonical_utc_timestamp(payload["recordedAt"], "recordedAt", microseconds=True)
-        expected_path = _history_path(
+        expected_paths = _history_path_candidates(
             repo_root,
             str(payload["issue"]),
             str(payload["action"]),
@@ -797,7 +813,7 @@ def _parse_history_snapshot(
             or remote_snapshot_history
             else None,
         )
-        if path.resolve() != expected_path:
+        if path.resolve() not in expected_paths:
             raise ValueError("history path does not match record Issue, action, and timestamp")
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"approval history integrity error in {path}: {exc}") from exc
@@ -810,11 +826,8 @@ def _parse_history(repo_root: Path, path: Path) -> dict[str, object]:
 
 
 def _history_records(repo_root: Path) -> tuple[dict[str, object], ...]:
-    issues_root = repo_root.resolve() / ".xflow" / "issues"
-    if not issues_root.is_dir():
-        return ()
     located_records: list[tuple[Path, dict[str, object]]] = []
-    for path in sorted(issues_root.glob("issue-*/approvals/history/*.yaml")):
+    for path in _history_yaml_paths(repo_root):
         located_records.append((path, _parse_history(repo_root, path)))
 
     direct_by_id: dict[str, tuple[Path, dict[str, object]]] = {}
@@ -1225,26 +1238,19 @@ def _write_history_atomic(path: Path, content: str) -> None:
     )
 
 
-def _history_path(
-    repo_root: Path,
-    issue: str,
+def _history_workspace_root(repo_root: Path, issue: str, action: str) -> Path:
+    if action in LOCAL_RECEIPT_ACTIONS:
+        return local_issue_dir(repo_root, issue)
+    return issue_dir(repo_root, issue)
+
+
+def _history_file_in_workspace(
+    issue_root: Path,
     action: str,
     recorded_at: str,
-    approval_id: str | None = None,
+    approval_suffix: str,
 ) -> Path:
-    issue = normalized_issue(issue)
-    action = validate_action(action, history=True)
-    if action in {"contract-acceptance", "gap-recognition", "task-branch-start"} or (
-        action in UNATTENDED_ACTIONS and approval_id is not None
-    ):
-        if not isinstance(approval_id, str) or not APPROVAL_ID_RE.fullmatch(approval_id):
-            raise ValueError(f"{action} history requires a valid approval ID")
-        approval_suffix = f"-{approval_id}"
-    else:
-        if approval_id is not None:
-            raise ValueError("approval ID filename suffix is reserved for one-time decision history")
-        approval_suffix = ""
-    issue_root = issue_dir(repo_root.resolve(), issue).resolve()
+    issue_root = issue_root.resolve()
     history_root = (issue_root / "approvals" / "history").resolve()
     try:
         history_root.relative_to(issue_root)
@@ -1257,16 +1263,96 @@ def _history_path(
     return target
 
 
-def _contract_artifact_path(repo_root: Path, issue: str, category: str, name: str) -> Path:
-    issue_root = issue_dir(repo_root.resolve(), normalized_issue(issue))
-    history_root = issue_root / "approvals" / "history"
+def _history_suffix(action: str, approval_id: str | None) -> str:
+    if action in {"contract-acceptance", "gap-recognition", "task-branch-start"} or (
+        action in UNATTENDED_ACTIONS and approval_id is not None
+    ):
+        if not isinstance(approval_id, str) or not APPROVAL_ID_RE.fullmatch(approval_id):
+            raise ValueError(f"{action} history requires a valid approval ID")
+        return f"-{approval_id}"
+    if approval_id is not None:
+        raise ValueError("approval ID filename suffix is reserved for one-time decision history")
+    return ""
+
+
+def _history_path(
+    repo_root: Path,
+    issue: str,
+    action: str,
+    recorded_at: str,
+    approval_id: str | None = None,
+) -> Path:
+    issue = normalized_issue(issue)
+    action = validate_action(action, history=True)
+    suffix = _history_suffix(action, approval_id)
+    return _history_file_in_workspace(
+        _history_workspace_root(repo_root.resolve(), issue, action),
+        action,
+        recorded_at,
+        suffix,
+    )
+
+
+def _history_path_candidates(
+    repo_root: Path,
+    issue: str,
+    action: str,
+    recorded_at: str,
+    approval_id: str | None = None,
+) -> tuple[Path, ...]:
+    canonical = _history_path(repo_root, issue, action, recorded_at, approval_id)
+    if action not in LOCAL_RECEIPT_ACTIONS:
+        return (canonical,)
+    suffix = _history_suffix(action, approval_id)
+    legacy = _history_file_in_workspace(
+        issue_dir(repo_root.resolve(), issue),
+        action,
+        recorded_at,
+        suffix,
+    )
+    if legacy == canonical:
+        return (canonical,)
+    return (canonical, legacy)
+
+
+def _history_yaml_paths(repo_root: Path) -> list[Path]:
+    located: list[Path] = []
+    for root in (
+        repo_root.resolve() / ".xflow" / "issues",
+        repo_root.resolve() / ".xflow" / "local" / "issues",
+    ):
+        if not root.is_dir():
+            continue
+        located.extend(sorted(root.glob("issue-*/approvals/history/*.yaml")))
+    return located
+
+
+def _history_artifact_path(
+    repo_root: Path,
+    issue: str,
+    category: str,
+    name: str,
+    *,
+    action: str | None = None,
+    workspace_root: Path | None = None,
+) -> Path:
     if category not in {"claims", "consumed"}:
         raise ValueError(f"invalid contract acceptance artifact category: {category}")
+    if workspace_root is None:
+        if action is None:
+            workspace_root = issue_dir(repo_root.resolve(), normalized_issue(issue))
+        else:
+            workspace_root = _history_workspace_root(repo_root.resolve(), issue, action)
+    history_root = workspace_root / "approvals" / "history"
     target = require_safe_repo_path(repo_root, history_root / category / name, "contract acceptance artifact")
     expected_parent = history_root / category
     if target.parent != expected_parent:
         raise ValueError("contract acceptance artifact path escapes approval history")
     return target
+
+
+def _contract_artifact_path(repo_root: Path, issue: str, category: str, name: str) -> Path:
+    return _history_artifact_path(repo_root, issue, category, name)
 
 
 def _contract_claim_lock_path(repo_root: Path, approval_id: str) -> Path:
@@ -2424,25 +2510,55 @@ def _remote_action_lock(repo_root: Path, approval_id: str) -> Iterator[None]:
         yield
 
 
-def _remote_claim_path(repo_root: Path, issue: str, approval_id: str) -> Path:
-    return _contract_artifact_path(repo_root, issue, "claims", f"{approval_id}-remote.yaml")
+def _remote_claim_path(repo_root: Path, issue: str, approval_id: str, action: str | None = None) -> Path:
+    return _history_artifact_path(
+        repo_root,
+        issue,
+        "claims",
+        f"{approval_id}-remote.yaml",
+        action=action if action is not None else "git-push",
+    )
+
+
+def _find_remote_claim_path(repo_root: Path, issue: str, approval_id: str) -> Path:
+    name = f"{approval_id}-remote.yaml"
+    candidates = (
+        _history_artifact_path(repo_root, issue, "claims", name, action="git-push"),
+        _history_artifact_path(repo_root, issue, "claims", name, action="issue-create"),
+    )
+    existing = [path for path in candidates if path.is_file()]
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for path in existing:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(path)
+    if len(unique) > 1:
+        raise ValueError("duplicate remote approval claim")
+    if unique:
+        return unique[0]
+    raise ValueError("remote approval claim not found")
 
 
 def _remote_snapshot_path(repo_root: Path, issue: str, grant: ApprovalGrant) -> Path:
-    return _contract_artifact_path(
+    return _history_artifact_path(
         repo_root,
         issue,
         "consumed",
         f"{grant.approval_id}-{grant.action}-approved.snapshot",
+        action=grant.action,
     )
 
 
 def _remote_review_path(repo_root: Path, issue: str, grant: ApprovalGrant) -> Path:
-    return _contract_artifact_path(
+    return _history_artifact_path(
         repo_root,
         issue,
         "consumed",
         f"{grant.approval_id}-{grant.action}-local-review.md",
+        action=grant.action,
     )
 
 
@@ -2451,8 +2567,8 @@ def _remote_claim_bytes(payload: dict[str, object]) -> bytes:
 
 
 def _parse_remote_claim(repo_root: Path, path: Path, issue: str) -> dict[str, object]:
-    issue_root = issue_dir(repo_root, issue)
-    raw_bytes = _stable_approval_bytes(repo_root, path, issue_root, "remote approval claim")
+    owner = path.resolve().parents[3]
+    raw_bytes = _stable_approval_bytes(repo_root, path, owner, "remote approval claim")
     payload = _load_yaml(_decode_approval_bytes(raw_bytes, path, "remote approval claim"))
     if not isinstance(payload, dict) or set(payload) != REMOTE_CLAIM_FIELDS:
         raise ValueError("remote approval claim has unexpected or missing fields")
@@ -2560,26 +2676,38 @@ def _remote_claims_for_scope(
     action: str,
     bindings: GitBindings,
 ) -> list[tuple[Path, dict[str, object]]]:
-    claims_root = _contract_artifact_path(repo_root, issue, "claims", "placeholder").parent
-    if not claims_root.is_dir():
-        return []
+    claim_roots = {
+        _history_artifact_path(repo_root, issue, "claims", "placeholder", action=action).parent,
+        _history_artifact_path(repo_root, issue, "claims", "placeholder", action="issue-create").parent,
+    }
     scoped: list[tuple[Path, dict[str, object]]] = []
-    for claim_path in sorted(claims_root.glob("*-remote.yaml")):
-        claim = _parse_remote_claim(repo_root, claim_path, issue)
-        scope_matches = (
-            claim["repository"] == bindings.repository
-            and claim["worktree"] == bindings.worktree
-            and claim["branch"] == bindings.branch
-            and claim["approvalIssue"] == issue
-            and claim["action"] == action
-        )
-        if not scope_matches:
+    seen: set[Path] = set()
+    for claims_root in claim_roots:
+        if not claims_root.is_dir():
             continue
-        expected_path = _remote_claim_path(repo_root, issue, str(claim["approvalId"]))
-        expected_relative = claim_path.relative_to(repo_root).as_posix()
-        if claim_path.resolve() != expected_path or claim["remoteClaimFile"] != expected_relative:
-            raise ValueError("remote approval claim path identity mismatch")
-        scoped.append((claim_path, claim))
+        for claim_path in sorted(claims_root.glob("*-remote.yaml")):
+            resolved = claim_path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            claim = _parse_remote_claim(repo_root, claim_path, issue)
+            scope_matches = (
+                claim["repository"] == bindings.repository
+                and claim["worktree"] == bindings.worktree
+                and claim["branch"] == bindings.branch
+                and claim["approvalIssue"] == issue
+                and claim["action"] == action
+            )
+            if not scope_matches:
+                continue
+            expected_paths = {
+                _remote_claim_path(repo_root, issue, str(claim["approvalId"]), action),
+                _remote_claim_path(repo_root, issue, str(claim["approvalId"]), "issue-create"),
+            }
+            expected_relative = claim_path.relative_to(repo_root).as_posix()
+            if claim_path.resolve() not in {path.resolve() for path in expected_paths} or claim["remoteClaimFile"] != expected_relative:
+                raise ValueError("remote approval claim path identity mismatch")
+            scoped.append((claim_path, claim))
     return scoped
 
 
@@ -2654,7 +2782,7 @@ def reserve_remote_action(repo_root: Path, grant: ApprovalGrant) -> RemoteAction
     if grant.source != "local-review" or grant.action not in UNATTENDED_ACTIONS:
         raise ValueError("persistent remote reservation requires an ordinary local-review remote action")
     issue = normalized_issue(grant.approval_issue)
-    claim_path = _remote_claim_path(root, issue, grant.approval_id)
+    claim_path = _remote_claim_path(root, issue, grant.approval_id, grant.action)
     with _remote_action_lock(root, grant.approval_id):
         pending = _arbitrate_remote_claim_scope(
             root,
@@ -2684,6 +2812,7 @@ def reserve_remote_action(repo_root: Path, grant: ApprovalGrant) -> RemoteAction
             claim = None
 
         issue_root = issue_dir(root, issue)
+        receipt_root = _history_workspace_root(root, issue, grant.action)
         approved_path = resolve_path(root, Path(grant.approved_file))
         approved_snapshot = capture_stable_file(
             root,
@@ -2721,7 +2850,7 @@ def reserve_remote_action(repo_root: Path, grant: ApprovalGrant) -> RemoteAction
         archived_review = _remote_review_path(root, issue, grant)
         _publish_exact_artifact(
             root,
-            issue_root,
+            receipt_root,
             snapshot_path,
             approved_bytes,
             label="approved remote snapshot",
@@ -2729,7 +2858,7 @@ def reserve_remote_action(repo_root: Path, grant: ApprovalGrant) -> RemoteAction
         )
         _publish_exact_artifact(
             root,
-            issue_root,
+            receipt_root,
             archived_review,
             review_bytes,
             label="approved remote review",
@@ -2819,7 +2948,7 @@ def reconcile_remote_action(
             f"{REMOTE_RECONCILIATION_CONFIRMATION}"
         )
     root = repo_root.resolve()
-    claim_path = _remote_claim_path(root, grant.approval_issue, grant.approval_id)
+    claim_path = _find_remote_claim_path(root, grant.approval_issue, grant.approval_id)
     with _remote_action_lock(root, grant.approval_id):
         claim = _parse_remote_claim(root, claim_path, grant.approval_issue)
         _validate_remote_claim_grant(claim, grant)
@@ -2862,7 +2991,7 @@ def reconcile_remote_action_by_id(
     if not APPROVAL_ID_RE.fullmatch(approval_id):
         raise ValueError("remote reconciliation requires a valid approval ID")
     root = repo_root.resolve()
-    claim_path = _remote_claim_path(root, normalized, approval_id)
+    claim_path = _find_remote_claim_path(root, normalized, approval_id)
     with _remote_action_lock(root, approval_id):
         claim = _parse_remote_claim(root, claim_path, normalized)
         grant = _grant_from_remote_claim(claim)
@@ -2941,15 +3070,20 @@ def confirm_remote_action(
 
 def _publish_remote_action_history(root: Path, claim: dict[str, object]) -> Path:
     history_path = require_safe_repo_path(root, root / Path(str(claim["historyFile"])), "remote approval history")
-    target_root = issue_dir(root, str(claim["targetIssue"]))
-    if history_path.parent != target_root / "approvals" / "history":
+    action = str(claim["action"])
+    target = str(claim["targetIssue"])
+    expected_parents = {
+        _history_workspace_root(root, target, action).resolve() / "approvals" / "history",
+        issue_dir(root, target).resolve() / "approvals" / "history",
+    }
+    if history_path.parent not in expected_parents:
         raise ValueError("remote approval history path does not match target Issue")
     history_bytes = _yaml_bytes(_remote_history_payload(claim))
     if hashlib.sha256(history_bytes).hexdigest() != claim["historySha256"]:
         raise ValueError("remote approval claim does not seal exact history")
     _publish_exact_artifact(
         root,
-        target_root,
+        history_path.parents[2],
         history_path,
         history_bytes,
         label="remote approval history",
@@ -2985,7 +3119,12 @@ def mark_remote_post_effects_complete(
         if claim["state"] != "post-effects-pending":
             raise ValueError("remote approval post-effects are not pending")
         history_path = require_safe_repo_path(root, root / Path(str(claim["historyFile"])), "remote approval history")
-        history_bytes = _stable_approval_bytes(root, history_path, issue_dir(root, str(claim["targetIssue"])), "remote approval history")
+        history_bytes = _stable_approval_bytes(
+            root,
+            history_path,
+            history_path.parents[2],
+            "remote approval history",
+        )
         if hashlib.sha256(history_bytes).hexdigest() != claim["historySha256"]:
             raise ValueError("remote approval post-effects require exact published history")
         effects = [
@@ -3825,11 +3964,7 @@ def record_subordinate_effect(
     existing_effect = next(
         (
             path
-            for path in sorted(
-                (repo_root / ".xflow" / "issues" / f"issue-{parent_grant.approval_issue}" / "approvals" / "history").glob(
-                    "*.yaml"
-                )
-            )
+            for path in _history_yaml_paths(repo_root)
             if (record := _parse_history(repo_root, path))["source"] == "effect"
             and record["parentApprovalId"] == parent_grant.approval_id
             and record["action"] == action
