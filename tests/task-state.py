@@ -1769,6 +1769,7 @@ def test_implementation_gap_uses_immutable_gap_recognition(root: Path) -> None:
         force=True,
     )
     write(review, review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"))
+    leftover_review = review.read_text(encoding="utf-8")
     recognized = run_devctl_result(repo, "gap", "recognize", "--issue", issue, "--file", str(gap_file))
     assert recognized.returncode == 0, recognized.stderr
     records = tuple((gap_file.parent / "approvals" / "history").glob("*-gap-recognition-*.yaml"))
@@ -1783,6 +1784,7 @@ def test_implementation_gap_uses_immutable_gap_recognition(root: Path) -> None:
     write_state(repo, recognized_state)
     check_current_task(repo, issue)
 
+    write(review, leftover_review)
     replay = run_devctl_result(repo, "gap", "recognize", "--issue", issue, "--file", str(gap_file))
     assert replay.returncode == 1, replay.stdout
     assert "approval already consumed" in replay.stderr

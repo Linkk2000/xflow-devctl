@@ -212,6 +212,7 @@ def test_consumed_record(repo_root: Path, approved_file: Path) -> None:
     original_artifact = approved_file.read_text(encoding="utf-8")
     review = approval.prepare(repo_root, "202", "git-push", approved_file, reviewer="trusted local reviewer", force=True)
     approve(review)
+    leftover_review = review.read_text(encoding="utf-8")
     grant = approval.require_remote(repo_root, "git-push", approved_file, "202")
     assert grant.source == "local-review"
     assert grant.action == "git-push"
@@ -232,6 +233,8 @@ def test_consumed_record(repo_root: Path, approved_file: Path) -> None:
     assert payload["reviewerSummary"] == "trusted local reviewer"
     assert "Approved: yes" not in text
     assert "GITHUB_TOKEN" not in text
+    assert not review.is_file()
+    write_text_lf(review, leftover_review)
     write_text_lf(approved_file, original_artifact)
     assert_value_error(
         "approval already consumed",
@@ -305,6 +308,7 @@ def test_history_integrity(repo_root: Path, approved_file: Path) -> None:
 def test_effect_masquerade_fails_closed(repo_root: Path, approved_file: Path) -> None:
     review = approval.prepare(repo_root, "202", "git-push", approved_file, force=True)
     approve(review)
+    leftover_review = review.read_text(encoding="utf-8")
     grant = approval.require_remote(repo_root, "git-push", approved_file, "202")
     record = approval.record_consumed_approval(repo_root, grant, "success")
     payload = yaml.safe_load(record.read_text(encoding="utf-8"))
@@ -312,6 +316,7 @@ def test_effect_masquerade_fails_closed(repo_root: Path, approved_file: Path) ->
     payload["parentAction"] = "git-mr"
     payload["parentApprovalId"] = "a" * 32
     record.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    write_text_lf(review, leftover_review)
 
     assert_value_error(
         "approval history integrity error",
@@ -412,6 +417,22 @@ def test_prepare_replaces_unapproved_review(repo_root: Path, approved_file: Path
         "refusing to overwrite approved local review",
         lambda: approval.prepare(repo_root, "202", "git-push", approved_file),
     )
+
+
+def test_prepare_after_consumed_approval(repo_root: Path, approved_file: Path) -> None:
+    review = approval.prepare(repo_root, "202", "git-push", approved_file)
+    leftover = review.read_text(encoding="utf-8")
+    approve(review)
+    grant = approval.require_remote(repo_root, "git-push", approved_file, "202")
+    approval.record_consumed_approval(repo_root, grant, "success")
+    assert not review.is_file()
+    next_review = approval.prepare(repo_root, "202", "git-mr", approved_file)
+    assert approval.field(next_review.read_text(encoding="utf-8"), "Approved") == "no"
+    assert approval.field(next_review.read_text(encoding="utf-8"), "Approved Action") == "git-mr"
+    write_text_lf(review, leftover)
+    reused = approval.prepare(repo_root, "202", "git-mr", approved_file)
+    assert approval.field(reused.read_text(encoding="utf-8"), "Approved") == "no"
+    assert approval.field(reused.read_text(encoding="utf-8"), "Approved Action") == "git-mr"
 
 
 def test_skipped_git_push_has_no_history(repo_root: Path, approved_file: Path) -> None:
@@ -1484,12 +1505,14 @@ State: S9_REMOTE_REVIEW_AND_CI
     )
     review = approval.prepare(repo_root, "202", "git-mr", approved_file, force=True)
     approve(review)
+    leftover_mr_review = review.read_text(encoding="utf-8")
     mr_grant = approval.require_remote(repo_root, "git-mr", approved_file, "202")
     assert_value_error(
         "consumed git-mr parent approval",
         lambda: approval.record_subordinate_effect(repo_root, mr_grant, "git-state-backfill", "success"),
     )
     approval.record_consumed_approval(repo_root, mr_grant, "success")
+    write_text_lf(review, leftover_mr_review)
     effect = approval.record_subordinate_effect(repo_root, mr_grant, "git-state-backfill", "success")
     effect_payload = yaml.safe_load(effect.read_text(encoding="utf-8"))
     assert effect_payload["source"] == "effect"
@@ -1717,6 +1740,8 @@ def main() -> None:
         test_credential_safety(credential_repo, credential_file)
         prepare_repo, prepare_file = init_active_repo(root, "prepare-unapproved")
         test_prepare_replaces_unapproved_review(prepare_repo, prepare_file)
+        consumed_prepare_repo, consumed_prepare_file = init_active_repo(root, "prepare-consumed")
+        test_prepare_after_consumed_approval(consumed_prepare_repo, consumed_prepare_file)
         skipped_repo, skipped_file = init_active_repo(root, "skipped-push")
         test_skipped_git_push_has_no_history(skipped_repo, skipped_file)
         unattended_repo, unattended_file = init_active_repo(root, "unattended-grants")
