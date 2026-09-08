@@ -302,6 +302,40 @@ def decision_is_approved(text: str) -> bool:
         return False
 
 
+def approval_is_consumed(repo_root: Path, approval_id: str) -> bool:
+    try:
+        reject_consumed_approval(repo_root, approval_id)
+    except ValueError as exc:
+        if str(exc).startswith("approval already consumed:"):
+            return True
+        raise
+    return False
+
+
+def live_review_blocks_prepare(repo_root: Path, review_file: Path) -> bool:
+    existing = read_text(review_file)
+    if not decision_is_approved(existing):
+        return False
+    try:
+        approval_id = field(existing, "Approval ID")
+    except ValueError:
+        return True
+    return not approval_is_consumed(repo_root, approval_id)
+
+
+def retire_live_review(repo_root: Path, issue: str, approval_id: str) -> None:
+    review_file = default_approval_file(repo_root, issue)
+    if not review_file.is_file():
+        return
+    try:
+        live_id = field(read_text(review_file), "Approval ID")
+    except ValueError:
+        return
+    if live_id != approval_id:
+        return
+    review_file.unlink()
+
+
 def reject_placeholder(text: str, name: str) -> None:
     value = field(text, name)
     upper = value.upper()
@@ -424,8 +458,7 @@ def prepare(
         raise ValueError(f"missing approved artifact: {approved_path}")
     review_file = default_approval_file(repo_root, issue)
     if review_file.exists() and not force:
-        existing = read_text(review_file)
-        if decision_is_approved(existing):
+        if live_review_blocks_prepare(repo_root, review_file):
             raise ValueError(f"refusing to overwrite approved local review: {review_file}")
 
     relative_file = display_path(repo_root, approved_path)
@@ -1491,6 +1524,7 @@ def record_consumed_approval(
     content = yaml.safe_dump(payload, sort_keys=False, allow_unicode=False)
     reject_credentials(content)
     _write_history_atomic(history_file, content)
+    retire_live_review(repo_root, grant.approval_issue, grant.approval_id)
     return history_file
 
 
@@ -2496,6 +2530,7 @@ def complete_task_branch_start(repo_root: Path, reservation: TaskBranchStartRese
         if claim["state"] != "completed":
             claim.update({"state": "completed", "updatedAt": _canonical_utc_now()})
             _replace_bytes(reservation.claim_path, _task_branch_claim_bytes(claim))
+        retire_live_review(root, str(claim["approvalIssue"]), str(claim["approvalId"]))
         return history_path
 
 
@@ -3149,6 +3184,7 @@ def complete_remote_action(repo_root: Path, reservation: RemoteActionReservation
         claim = _parse_remote_claim(root, reservation.claim_path, grant.approval_issue)
         _validate_remote_claim_grant(claim, grant)
         if claim["state"] == "completed":
+            retire_live_review(root, grant.approval_issue, grant.approval_id)
             raise ValueError(f"approval already consumed: {grant.approval_id}")
         if claim["state"] == "post-effects-pending":
             raise ValueError("remote approval post-effects are not complete")
@@ -3157,6 +3193,7 @@ def complete_remote_action(repo_root: Path, reservation: RemoteActionReservation
         history_path = _publish_remote_action_history(root, claim)
         claim.update({"state": "completed", "updatedAt": _canonical_utc_now()})
         _replace_bytes(reservation.claim_path, _remote_claim_bytes(claim))
+        retire_live_review(root, grant.approval_issue, grant.approval_id)
         return history_path
 
 
@@ -3366,17 +3403,24 @@ def consume_contract_acceptance(
     )
     claim_path = _contract_artifact_path(repo_root, issue, "claims", f"{grant.approval_id}.yaml")
     with _contract_claim_lock(repo_root, grant.approval_id):
-        return _finalize_contract_acceptance(
-            repo_root,
-            issue,
-            grant,
-            review_bytes,
-            contract_bytes,
-            contract_id=contract_id,
-            contract_version=contract_version,
-            contract_sha256=contract_sha256,
-            normalized_objects=normalized_objects,
-        )
+        try:
+            history = _finalize_contract_acceptance(
+                repo_root,
+                issue,
+                grant,
+                review_bytes,
+                contract_bytes,
+                contract_id=contract_id,
+                contract_version=contract_version,
+                contract_sha256=contract_sha256,
+                normalized_objects=normalized_objects,
+            )
+        except ValueError as exc:
+            if str(exc).startswith("approval already consumed:"):
+                retire_live_review(repo_root, issue, grant.approval_id)
+            raise
+        retire_live_review(repo_root, issue, grant.approval_id)
+        return history
 
 
 @contextmanager
@@ -3546,6 +3590,7 @@ def consume_gap_recognition(repo_root: Path, issue: str, gap_file: Path) -> Path
             label="gap recognition history",
             collision_message="gap recognition history collision",
         )
+        retire_live_review(root, issue, grant.approval_id)
         return history_file
 
 

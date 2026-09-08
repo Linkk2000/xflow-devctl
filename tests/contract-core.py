@@ -442,6 +442,7 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
     for identifier in ACCEPTED_OBJECTS:
         assert identifier in review_text
     approve(review)
+    leftover_review = review.read_text(encoding="utf-8")
     grant = approval.require_exact_remote(repo, "contract-acceptance", contract.path, issue)
     assert grant.accepted_objects == ACCEPTED_OBJECTS
     assert_value_error(
@@ -469,6 +470,7 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
         contract,
         ACCEPTED_OBJECTS,
     )
+    assert not review.is_file()
     assert accepted.parent.name == "history"
     record = accepted.read_text(encoding="utf-8")
     assert "action: contract-acceptance" in record
@@ -485,6 +487,7 @@ def test_exact_local_acceptance_and_task_state(repo: Path, contract: ContractDoc
     reference = accepted.relative_to(canonical_path(state_path.parent)).as_posix()
     write(state_path, render_task_state(task_state(issue, "feature/101-contract", reference)))
     assert parse_task_state(state_path).human_approval_ref == reference
+    write(review, leftover_review)
     assert_value_error(
         "approval already consumed",
         lambda: validate_contract_acceptance(repo, issue, contract, ACCEPTED_OBJECTS),
@@ -740,6 +743,7 @@ def test_contract_acceptance_recovers_partial_publication(repo: Path) -> None:
             accepted_objects=ACCEPTED_OBJECTS,
         )
         approve(review)
+        leftover_review = review.read_text(encoding="utf-8")
         original_writer = approval._write_immutable_bytes
         injected = False
 
@@ -786,6 +790,7 @@ def test_contract_acceptance_recovers_partial_publication(repo: Path) -> None:
             archive_file.write_bytes(original_archive)
 
         accepted = validate_contract_acceptance(repo, issue, contract, ACCEPTED_OBJECTS)
+        write(review, leftover_review)
         assert len(tuple((history_root / "claims").glob("*.yaml"))) == 1
         assert len(tuple((history_root / "consumed").glob("*.md"))) == 1
         assert tuple(canonical_path(path) for path in history_root.glob("*.yaml")) == (accepted,)
@@ -806,10 +811,12 @@ def test_contract_acceptance_recovers_partial_publication(repo: Path) -> None:
             lambda: validate_contract_acceptance(repo, issue, contract, ACCEPTED_OBJECTS),
         )
         accepted.write_bytes(original_history)
+        write(review, leftover_review)
         assert_value_error(
             "approval already consumed",
             lambda: validate_contract_acceptance(repo, issue, contract, ACCEPTED_OBJECTS),
         )
+        write(review, leftover_review)
         assert_value_error(
             "accepted object set mismatch",
             lambda: validate_contract_acceptance(repo, issue, contract, (ACCEPTED_OBJECTS[0],)),
