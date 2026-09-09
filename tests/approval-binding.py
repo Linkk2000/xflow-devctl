@@ -1622,7 +1622,13 @@ State: G5_APPROVE_MR_CREATE
 - Push unreviewed changes.
 """,
     )
+    historical_task_state = repo_root / ".xflow" / "issues" / "issue-1" / "task-state.md"
+    write(
+        historical_task_state,
+        "# Historical merged task-state retained on main.\n",
+    )
     approval.require_remote(repo_root, "issue-create", draft_file, "draft")
+    historical_task_state.unlink()
 
     write(
         repo_root / ".xflow" / "current-task.md",

@@ -950,13 +950,26 @@ def task_binding_evidence_exists(repo_root: Path) -> bool:
 def check_reviewed_task_binding(repo_root: Path, issue: str | None, action: str) -> None:
     # This preserves legacy current-task.md workflows while using strict task bindings whenever present.
     from .checks import check_current_task
+    from .local_artifacts import revalidate_snapshots
     from .semantic_routes import require_route_semantics
     from .bindings import resolve_bindings
-    from .task_state import _pointer_snapshots, check_task_binding
+    from .task_state import _legacy_migration_source, _pointer_snapshots, check_task_binding
 
     is_draft_create = issue is not None and normalized_issue(issue) == "draft" and action == "issue-create"
     is_task_branch_start = action == "task-branch-start"
-    if not is_task_branch_start:
+    if is_draft_create:
+        bindings = resolve_bindings(repo_root)
+        pointer, legacy_pointer = _pointer_snapshots(repo_root, bindings)
+        if pointer.exists or legacy_pointer.exists:
+            check_current_task(repo_root, issue, check_stale_pr=False)
+        else:
+            source, legacy_state, _ = _legacy_migration_source(repo_root, bindings)
+            if legacy_state.issue != "draft":
+                raise ValueError(
+                    f"current task Issue mismatch: expected draft, found {legacy_state.issue or '<missing>'}"
+                )
+            revalidate_snapshots(repo_root, (source,), "current task state file")
+    elif not is_task_branch_start:
         check_current_task(repo_root, issue, check_stale_pr=not is_draft_create)
     bindings = resolve_bindings(repo_root)
     pointer, legacy_pointer = _pointer_snapshots(repo_root, bindings)
