@@ -18,6 +18,9 @@ PYTHON=$(select_python) || {
   exit 1
 }
 mark_provider_skip_for_command() {
+  if [ "${DEVCTL_SKIP_PROVIDER_LOAD:-}" = "0" ]; then
+    return
+  fi
   scan_command=help
   scan_value=
   scan_after_options=

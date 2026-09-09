@@ -758,6 +758,8 @@ def _validate_pointer_bindings(pointer: ActiveTaskPointer, bindings: GitBindings
 def _task_contract_binding(state: TaskState) -> tuple[str, str, str, str]:
     if state.contract == LEGACY_CONTRACT_REF and state.contract_file == LEGACY_CONTRACT_FILE:
         return "legacy", LEGACY_CONTRACT_ID, LEGACY_CONTRACT_VERSION, LEGACY_CONTRACT_FILE
+    if state.contract == "none" and state.contract_file == "none":
+        return "modern-contract", "none", "none", "none"
     contract_id, separator, contract_version = state.contract.rpartition("@")
     if not separator or not contract_id or not contract_version:
         raise ValueError("task-state Contract must bind a contract id and version")

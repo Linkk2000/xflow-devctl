@@ -127,6 +127,28 @@ def test_rejects_candidates_below_python_39(root: Path) -> None:
     assert invocations(python_log) == [("-c", "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)")]
 
 
+def test_explicit_provider_load_enable_is_preserved(root: Path) -> None:
+    executable = root / "provider-env-python"
+    status_log = root / "provider-env.log"
+    executable.write_text(
+        "#!/bin/sh\n"
+        "if [ \"${1:-}\" = '-c' ]; then exit 0; fi\n"
+        f"printf '%s' \"${{DEVCTL_SKIP_PROVIDER_LOAD-unset}}\" > {shlex.quote(str(status_log))}\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    result = run_launcher(
+        {
+            "DEVCTL_PYTHON": str(executable),
+            "DEVCTL_SKIP_PROVIDER_LOAD": "0",
+        },
+        ("issue", "show", "IK3RR6"),
+    )
+    assert result.returncode == 0, result.stderr
+    assert status_log.read_text(encoding="utf-8") == "0"
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
@@ -135,6 +157,7 @@ def main() -> None:
         test_old_python3_is_rejected_before_falling_back_to_python(root)
         test_invalid_explicit_override_falls_back_to_python3(root)
         test_rejects_candidates_below_python_39(root)
+        test_explicit_provider_load_enable_is_preserved(root)
     print("POSIX launcher ok")
 
 

@@ -955,10 +955,12 @@ def check_reviewed_task_binding(repo_root: Path, issue: str | None, action: str)
     from .task_state import _pointer_snapshots, check_task_binding
 
     is_draft_create = issue is not None and normalized_issue(issue) == "draft" and action == "issue-create"
-    check_current_task(repo_root, issue, check_stale_pr=not is_draft_create)
+    is_task_branch_start = action == "task-branch-start"
+    if not is_task_branch_start:
+        check_current_task(repo_root, issue, check_stale_pr=not is_draft_create)
     bindings = resolve_bindings(repo_root)
     pointer, legacy_pointer = _pointer_snapshots(repo_root, bindings)
-    if not is_draft_create and (pointer.exists or legacy_pointer.exists):
+    if not is_draft_create and not is_task_branch_start and (pointer.exists or legacy_pointer.exists):
         require_route_semantics(check_task_binding(repo_root, issue), action)
 
 
@@ -1030,8 +1032,8 @@ def require_task_branch_start(
         binding_mode="recorded",
         validate_acceptance=False,
     )
-    if state.issue != issue or state.classification != "capability-change":
-        raise ValueError("task branch identity approval is only valid for this capability-change Issue")
+    if state.issue != issue or state.classification == "ui-defect":
+        raise ValueError("task branch identity approval requires a matching non-UI-defect Issue")
     if state.execution_state != "S2_REMOTE_ISSUE_CREATED":
         raise ValueError("task branch identity approval requires S2_REMOTE_ISSUE_CREATED")
     if state.semantic_phase not in {"classified", "declaring"}:
@@ -1945,7 +1947,7 @@ def _validate_task_branch_sealed_content(
     )
     if (
         state.issue != issue
-        or state.classification != "capability-change"
+        or state.classification == "ui-defect"
         or state.execution_state != "S2_REMOTE_ISSUE_CREATED"
         or state.semantic_phase not in {"classified", "declaring"}
         or state.base != claim["baseBranch"]
@@ -2121,7 +2123,7 @@ def reserve_task_branch_start(repo_root: Path, grant: ApprovalGrant, base_branch
             state.issue != issue
             or state.branch != grant.target_branch
             or state.base != base_branch
-            or state.classification != "capability-change"
+            or state.classification == "ui-defect"
         ):
             raise ValueError("task branch reservation does not match exact task-state bindings")
         review_path = default_approval_file(root, issue)

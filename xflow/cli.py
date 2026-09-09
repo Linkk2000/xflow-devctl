@@ -1449,7 +1449,9 @@ def default_base(repo_root: Path) -> str:
     return "main"
 
 
-def require_clean_worktree(repo_root: Path) -> None:
+def require_clean_worktree(
+    repo_root: Path, allowed_untracked_prefixes: tuple[str, ...] = ()
+) -> None:
     if not git_succeeds(repo_root, ["diff", "--quiet"]):
         raise ValueError("worktree has unstaged changes; commit or stash them first")
     if not git_succeeds(repo_root, ["diff", "--cached", "--quiet"]):
@@ -1457,7 +1459,9 @@ def require_clean_worktree(repo_root: Path) -> None:
     untracked = [
         path
         for path in git_output(repo_root, ["ls-files", "--others", "--exclude-standard"]).splitlines()
-        if path and not path.replace("\\", "/").startswith(".xflow/local/")
+        if path
+        and not path.replace("\\", "/").startswith(".xflow/local/")
+        and not path.replace("\\", "/").startswith(allowed_untracked_prefixes)
     ]
     if untracked:
         raise ValueError("worktree has untracked files; add, ignore, or remove them first")
@@ -1868,36 +1872,36 @@ def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
         classification = check_classification(ctx.repo_root, issue)
         if state.classification != classification.classification:
             raise ValueError("task-state Classification does not match canonical classification")
-        if state.classification == "capability-change":
-            if args.file is None:
-                raise ValueError("first capability task branch requires --file with canonical task-state.md")
-            allowed_prefix = f".xflow/issues/issue-{issue}/"
-            unexpected = [path for path in changed_paths(ctx.repo_root) if not path.startswith(allowed_prefix)]
-            if unexpected:
-                raise ValueError(
-                    "task branch identity step may only change the matching Issue workspace; "
-                    f"found {unexpected}"
-                )
-            branch_reservation = approval.resume_task_branch_start(
-                ctx.repo_root, issue, args.file, branch, base
+        if args.file is None:
+            raise ValueError("first task branch requires --file with canonical task-state.md")
+        allowed_prefix = f".xflow/issues/issue-{issue}/"
+        unexpected = [path for path in changed_paths(ctx.repo_root) if not path.startswith(allowed_prefix)]
+        if unexpected:
+            raise ValueError(
+                "task branch identity step may only change the matching Issue workspace; "
+                f"found {unexpected}"
             )
-            if branch_reservation is None:
-                branch_grant = approval.require_task_branch_start(
-                    ctx.repo_root,
-                    issue,
-                    args.file,
-                    branch,
-                    base,
-                )
-                branch_reservation = approval.reserve_task_branch_start(
-                    ctx.repo_root,
-                    branch_grant,
-                    base,
-                )
-        else:
-            require_clean_worktree(ctx.repo_root)
+        branch_reservation = approval.resume_task_branch_start(
+            ctx.repo_root, issue, args.file, branch, base
+        )
+        if branch_reservation is None:
+            branch_grant = approval.require_task_branch_start(
+                ctx.repo_root,
+                issue,
+                args.file,
+                branch,
+                base,
+            )
+            branch_reservation = approval.reserve_task_branch_start(
+                ctx.repo_root,
+                branch_grant,
+                base,
+            )
     else:
-        require_clean_worktree(ctx.repo_root)
+        require_clean_worktree(
+            ctx.repo_root,
+            (f".xflow/issues/issue-{normalized_issue(issue)}/",),
+        )
     current = current_branch(ctx.repo_root)
     if branch_reservation is not None:
         if branch_reservation.base_commit == "pending":

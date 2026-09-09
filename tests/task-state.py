@@ -589,6 +589,84 @@ decisionSource: ai-proposed
     return repo, state_path, review, target, ctx, args
 
 
+def test_infrastructure_task_branch_start_is_approved_and_activated(root: Path) -> None:
+    name = "branch-infrastructure"
+    issue = "702"
+    slug = "shared-runtime"
+    origin = root / f"{name}-origin.git"
+    repo = root / name
+    git(root, "init", "--bare", "-q", str(origin))
+    git(root, "init", "-q", str(repo))
+    git(repo, "config", "user.email", "test@example.com")
+    git(repo, "config", "user.name", "Test User")
+    git(repo, "checkout", "-b", "main", "-q")
+    write(repo / "README.md", f"# {name}\n")
+    git(repo, "add", "README.md")
+    git(repo, "commit", "-m", f"test: initialize {name}", "-q")
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "push", "-u", "origin", "main", "-q")
+
+    target = f"feat/{issue}-{slug}"
+    infrastructure = dataclass_replace(
+        state(issue, target),
+        classification="infrastructure",
+        contract="none",
+        contract_file="none",
+        contract_change_required=False,
+        human_gate="final task branch identity approval required",
+    )
+    state_path = write_state(repo, infrastructure)
+    write(
+        state_path.with_name("classification.yaml"),
+        """version: 0.1.0
+request:
+  originalStatement: Upgrade one shared runtime dependency.
+contractSearch:
+  status: not-found
+  refs: []
+classification: infrastructure
+contractChangeRequired: false
+reason: The request changes shared runtime infrastructure without participant-visible semantics.
+nextArtifact: dependency-issue-proposal.md
+decisionSource: ai-proposed
+""",
+    )
+    write(state_path.with_name("dependency-issue-proposal.md"), "# Dependency Issue Proposal\n")
+    review = approval.prepare(
+        repo,
+        issue,
+        "task-branch-start",
+        state_path,
+        reviewer="human reviewer",
+        force=True,
+    )
+    write(review, review.read_text(encoding="utf-8").replace("Approved: no", "Approved: yes"))
+
+    started = run_devctl_result(
+        repo,
+        "git",
+        "start",
+        slug,
+        "--issue",
+        issue,
+        "--base",
+        "main",
+        "--file",
+        str(state_path),
+    )
+    assert started.returncode == 0, started.stderr
+    assert resolve_bindings(repo).branch == target
+    active = load_active_task(repo)
+    assert active.issue == issue
+    assert active.classification == "infrastructure"
+    assert active.contract == "none"
+    claim_path, claim = task_branch_claim(repo, issue)
+    assert claim["state"] == "completed"
+    assert claim_path.is_file()
+    assert not review.exists()
+    assert len(tuple((state_path.parent / "approvals" / "history").glob("*-task-branch-start-*.yaml"))) == 1
+
+
 def task_branch_claim(repo_root: Path, issue: str) -> tuple[Path, dict[str, object]]:
     claims = tuple(
         (repo_root / ".xflow" / "issues" / f"issue-{issue}" / "approvals" / "history" / "claims").glob(
@@ -2274,6 +2352,7 @@ def main() -> None:
 
         test_official_git_start_respects_closure_lock(root)
         test_first_capability_task_establishes_final_branch_before_acceptance(root)
+        test_infrastructure_task_branch_start_is_approved_and_activated(root)
         test_task_branch_start_revalidates_exact_task_state_after_pull(root)
         test_task_branch_start_revalidates_exact_local_review_after_pull(root)
         test_task_branch_start_replays_the_first_sealed_remote_tip(root)
