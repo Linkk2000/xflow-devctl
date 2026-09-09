@@ -2157,6 +2157,9 @@ def test_git_done_requires_exact_human_cleanup_approval(parent: Path) -> None:
     assert git_text(work, "branch", "--show-current") == "main"
     assert "feat/8-safe-cleanup" not in git_text(work, "branch", "--format=%(refname:short)")
     assert load(work) is None
+    cleanup_bindings = resolve_bindings(work)
+    assert not active_task_pointer_file(work, cleanup_bindings.worktree).exists()
+    assert not task_authority_file(work, cleanup_bindings.worktree, "8").exists()
 
     run_devctl(work, "git", "start", "unmerged-cleanup", "--issue", "9", "--base", "main")
     write(work / ".xflow" / "current-task.md", current_task_text("9"))

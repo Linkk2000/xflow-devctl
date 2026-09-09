@@ -53,7 +53,15 @@ from .env import (
 from .io import canonical_path, write_text_lf
 from .dependencies import check_dependencies
 from .migration import apply_issue_workspace_migration, inspect, inspect_issue_workspace_migration, write_wrappers
-from .paths import default_issue_file, local_issue_dir, normalized_issue, task_state_file
+from .paths import (
+    active_task_pointer_file,
+    default_issue_file,
+    legacy_active_task_pointer_file,
+    local_issue_dir,
+    normalized_issue,
+    task_authority_file,
+    task_state_file,
+)
 from .task_state import (
     TaskState,
     _capture_file,
@@ -2038,6 +2046,10 @@ def run_git_done(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     approved_file = args.file or default_issue_file(ctx.repo_root, issue, "resolution-report.md")
     action = "git-cleanup-force" if args.force else "git-cleanup"
     approval.require_exact_remote(ctx.repo_root, action, approved_file, issue)
+    cleanup_bindings = resolve_bindings(ctx.repo_root)
+    pointer_path = active_task_pointer_file(ctx.repo_root, cleanup_bindings.worktree)
+    legacy_pointer_path = legacy_active_task_pointer_file(ctx.repo_root, cleanup_bindings.worktree)
+    authority_path = task_authority_file(ctx.repo_root, cleanup_bindings.worktree, issue)
     pr_number = branch_meta(ctx.repo_root, "pr")
     if not args.force and pr_number and os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") != "1":
         item = providers.get_pull_request(ctx.repo_root, pr_number, os.environ)
@@ -2058,6 +2070,9 @@ def run_git_done(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     for key in ("slug", "issue", "base", "pr", "pr-url"):
         unset_branch_meta(ctx.repo_root, key)
     unattended.disable(ctx.repo_root)
+    pointer_path.unlink(missing_ok=True)
+    legacy_pointer_path.unlink(missing_ok=True)
+    authority_path.unlink(missing_ok=True)
     print("[INFO] done")
     return 0
 
