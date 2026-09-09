@@ -524,21 +524,36 @@ def _load_context(
         )
     if not classification_snapshot.exists:
         raise ValueError("contract-bearing Issue requires classification.yaml")
-    if not matrix_snapshot.exists:
-        raise ValueError(f"missing required traceability matrix: {matrix_path}")
-
     classification = validate_classification_document(
         classification_snapshot.path,
         issue,
         _parse_yaml_snapshot(classification_snapshot, "classification"),
     )
+    if classification.classification != state.classification:
+        raise ValueError("classification does not match task-state Classification")
+    if state.contract == "none" and state.contract_file == "none":
+        if state.contract_change_required:
+            raise ValueError("non-contract task-state requires Contract Change Required: no")
+        return _ClosureContext(
+            root,
+            issue_directory,
+            bindings,
+            head,
+            False,
+            state,
+            None,
+            None,
+            None,
+            tuple(tracked),
+        )
+    if not matrix_snapshot.exists:
+        raise ValueError(f"missing required traceability matrix: {matrix_path}")
+
     contract_search = classification.raw["contractSearch"]
     assert isinstance(contract_search, dict)
     raw_refs = contract_search["refs"]
     assert isinstance(raw_refs, list)
     refs = tuple(str(item) for item in raw_refs)
-    if classification.classification != state.classification:
-        raise ValueError("classification does not match task-state Classification")
     if state.contract_file not in refs:
         raise ValueError("classification contractSearch.refs must contain the task-state Contract File")
 

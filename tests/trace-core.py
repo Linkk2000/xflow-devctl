@@ -274,6 +274,93 @@ def write_resolution_report(repo: Path, conclusion: str = "resolved") -> Path:
     return report
 
 
+def test_non_contract_resolution_does_not_require_matrix(root: Path) -> None:
+    case_root = root / "non-contract-resolution"
+    case_root.mkdir()
+    repo = init_repo(case_root)
+    issue = "202"
+    issue_directory = repo / ".xflow" / "issues" / f"issue-{issue}"
+    state = TaskState(
+        issue=issue,
+        execution_state="S5_LOCAL_VERIFICATION",
+        semantic_phase="classified",
+        classification="infrastructure",
+        contract="none",
+        contract_file="none",
+        contract_change_required=False,
+        branch="main",
+        base="main",
+        allowed_actions=("review evidence",),
+        forbidden_actions=("push",),
+        human_gate="G3_APPROVE_RESULT",
+        human_approval_ref="none",
+    )
+    write(issue_directory / "task-state.md", render_task_state(state))
+    write(
+        issue_directory / "classification.yaml",
+        """version: 0.1.0
+request:
+  originalStatement: Upgrade a shared runtime dependency.
+contractSearch:
+  status: not-found
+  refs: []
+classification: infrastructure
+contractChangeRequired: false
+reason: The dependency update does not change participant-visible semantics.
+nextArtifact: dependency-issue-proposal.md
+decisionSource: ai-proposed
+""",
+    )
+    evidence = issue_directory / "evidence" / "verification" / "dependency.txt"
+    write(evidence, "The fixed dependency version is resolved.\n")
+    write(
+        issue_directory / "resolution-report.md",
+        """# Resolution Report
+
+## Source Problem Or Gap
+- dependency-issue-proposal.md
+
+## Actual Changes
+- Upgraded the shared dependency.
+
+## Evidence Index
+- [dependency](evidence/verification/dependency.txt)
+
+## Completion Verification
+
+### Criterion C-001: The fixed dependency version is resolved
+#### Verification Type
+automated
+#### Expected Result
+The fixed dependency version is selected.
+#### Evidence
+- [dependency](evidence/verification/dependency.txt)
+#### Actual Result
+The fixed dependency version is selected.
+#### Human Review
+- [ ] Confirm dependency resolution.
+
+## Closure Conclusion
+Conclusion: resolved
+Reason: The dependency evidence confirms the fixed version.
+
+## AI Self-Review Result
+- [x] Dependency evidence is fresh.
+
+## Remaining Risks
+- Remote rescanning follows merge.
+
+## Human Review Request
+- Review the dependency evidence.
+""",
+    )
+    activate_task(repo, issue)
+
+    assert not matrix_path(repo, issue).exists()
+    check_resolution_report(repo, issue)
+    check_traceability_resolution(repo, issue, "resolved", {evidence})
+
+
 def assert_error(expected: str, callback: object) -> None:
     try:
         callback()  # type: ignore[operator]
@@ -1868,6 +1955,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
         repo = init_repo(root)
+        test_non_contract_resolution_does_not_require_matrix(root)
         test_valid_chain_and_cli(repo)
         test_capability_closure_requires_semantic_exit(repo)
         test_schema_and_reference_rejections(repo)
