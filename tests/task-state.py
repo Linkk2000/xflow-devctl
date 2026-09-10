@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import runpy
 import io
 import os
 import subprocess
@@ -2379,6 +2380,7 @@ def main() -> None:
         test_legacy_fallback_is_stable_and_authority_aware(root)
         test_modern_unattended_ignores_preserved_legacy_task(root)
 
+    runpy.run_path(str(OPS_ROOT / "tests" / "issue-create-branch.py"), run_name="__main__")
     print("task state ok")
 
 

@@ -2660,6 +2660,63 @@ def _parse_remote_claim(repo_root: Path, path: Path, issue: str) -> dict[str, ob
     return payload
 
 
+def issue_create_history_paths(repo_root: Path, issue: str) -> set[str]:
+    """Allow only sealed draft evidence belonging to this Issue and worktree.
+
+    This validates provenance, not permission to start a branch. The separate
+    task-branch-start approval is still required. Never relocate sealed files.
+    """
+    root = repo_root.resolve()
+    issue = normalized_issue(issue)
+    bindings = resolve_bindings(root)
+    allowed: set[str] = set()
+    history_root = issue_dir(root, issue) / "approvals" / "history"
+    for path in sorted(history_root.glob("*-issue-create-*.yaml")):
+        record, content = _parse_history_snapshot(root, path)
+        if record["source"] != "local-review" or record["approvalIssue"] != "draft":
+            continue
+        if (record["issue"] != issue or record["action"] != "issue-create"
+                or record["repository"] != bindings.repository
+                or record["worktree"] != bindings.worktree):
+            raise ValueError("issue-create history binding mismatch")
+        approval_id = str(record["approvalId"])
+        claim_path = _remote_claim_path(root, "draft", approval_id, "issue-create")
+        if record.get("remoteClaimFile") != claim_path.relative_to(root).as_posix():
+            raise ValueError("issue-create history claim path mismatch")
+        claim = _parse_remote_claim(root, claim_path, "draft")
+        if (claim["state"] != "completed" or claim["targetIssue"] != issue
+                or claim["action"] != "issue-create" or claim["approvalIssue"] != "draft"
+                or claim["historyFile"] != path.relative_to(root).as_posix()
+                or claim["historySha256"] != hashlib.sha256(content).hexdigest()
+                or _remote_history_payload(claim) != record):
+            raise ValueError("issue-create history does not match completed claim")
+        receipt = json.loads(str(claim["providerReceipt"]))
+        if not isinstance(receipt, dict) or str(receipt.get("number")) != issue:
+            raise ValueError("issue-create history provider Issue mismatch")
+        grant = _grant_from_remote_claim(claim)
+        snapshot_path = _remote_snapshot_path(root, "draft", grant)
+        review_path = _remote_review_path(root, "draft", grant)
+        for key, expected in (("approvedSnapshotFile", snapshot_path),
+                              ("approvedReviewFile", review_path)):
+            if claim[key] != expected.relative_to(root).as_posix():
+                raise ValueError("issue-create history artifact path mismatch")
+        _remote_snapshot_from_claim(root, claim)
+        review_bytes = _stable_approval_bytes(root, review_path, issue_dir(root, "draft"), "issue-create review")
+        if hashlib.sha256(review_bytes).hexdigest() != claim["approvedReviewSha256"]:
+            raise ValueError("issue-create history review SHA256 mismatch")
+        text = _decode_approval_bytes(review_bytes, review_path, "issue-create review")
+        expected_fields = {
+            "Approval ID": approval_id, "Issue": "draft", "Approved": "yes",
+            "Approved Action": "issue-create", "Repository ID": bindings.repository,
+            "Worktree ID": bindings.worktree, "Branch": claim["branch"],
+            "Approved File": claim["approvedFile"], "Approved SHA256": claim["approvedSha256"],
+        }
+        if any(field(text, name) != value for name, value in expected_fields.items()):
+            raise ValueError("issue-create history review binding mismatch")
+        allowed.update(p.relative_to(root).as_posix() for p in (claim_path, snapshot_path, review_path))
+    return allowed
+
+
 def _grant_from_remote_claim(claim: dict[str, object]) -> ApprovalGrant:
     grant = ApprovalGrant(
         source="local-review",
