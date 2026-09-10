@@ -1883,7 +1883,9 @@ def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
         if args.file is None:
             raise ValueError("first task branch requires --file with canonical task-state.md")
         allowed_prefix = f".xflow/issues/issue-{issue}/"
-        unexpected = [path for path in changed_paths(ctx.repo_root) if not path.startswith(allowed_prefix)]
+        creation_history = approval.issue_create_history_paths(ctx.repo_root, issue)
+        unexpected = [path for path in changed_paths(ctx.repo_root)
+                      if not path.startswith(allowed_prefix) and path not in creation_history]
         if unexpected:
             raise ValueError(
                 "task branch identity step may only change the matching Issue workspace; "
@@ -1931,6 +1933,9 @@ def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
         if current == base:
             print(f"[INFO] synchronize {base} to {branch_reservation.base_commit}")
             synchronize_base_to_commit(ctx.repo_root, base, branch_reservation.base_commit)
+        # Synchronization may run hooks; recheck sealed draft evidence before
+        # creating/checking out the task branch, without granting new authority.
+        approval.issue_create_history_paths(ctx.repo_root, issue)
         if target_commit:
             if target_commit != branch_reservation.base_commit:
                 raise ValueError("task branch exact start point mismatch")
