@@ -2381,6 +2381,7 @@ def main() -> None:
         test_modern_unattended_ignores_preserved_legacy_task(root)
 
     runpy.run_path(str(OPS_ROOT / "tests" / "issue-create-branch.py"), run_name="__main__")
+    runpy.run_path(str(OPS_ROOT / "tests" / "contract-relocation.py"), run_name="__main__")
     print("task state ok")
 
 

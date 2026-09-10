@@ -1,5 +1,8 @@
 # XFlow devctl
 
+For older tasks bound to an Issue-local candidate, see
+[human-approved contract path recovery](docs/contract-path-recovery.md).
+
 `devctl` is the local workflow command layer for issue-driven development.
 The `main` branch is domain-neutral and focuses on software-development
 workflows. Domain profiles such as `academic` should add their own templates
