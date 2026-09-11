@@ -2352,6 +2352,13 @@ def run_approval(args: argparse.Namespace) -> int:
         accepted_objects,
     )
     print(f"[INFO] local review prepared: {path}")
+    print(f"[INFO] local review absolute: {path.resolve()}")
+    approved_abs = approval.resolve_path(ctx.repo_root, Path(args.file)).resolve()
+    print(f"[INFO] approved file absolute: {approved_abs}")
+    print(
+        "[NEXT] In chat, ask the human to open these absolute paths "
+        "(Local Review Absolute + Approved File Absolute)."
+    )
     return 0
 
 
