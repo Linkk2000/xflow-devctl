@@ -50,6 +50,7 @@ LOCAL_RECEIPT_ACTIONS = {
     "git-state-backfill",
 }
 APPROVAL_ACTIONS = UNATTENDED_ACTIONS | {
+    "task-contract-relocate",
     "contract-acceptance",
     "gap-recognition",
     "task-branch-start",
@@ -57,6 +58,7 @@ APPROVAL_ACTIONS = UNATTENDED_ACTIONS | {
     "git-cleanup-force",
 }
 HISTORY_ACTIONS = UNATTENDED_ACTIONS | {
+    "task-contract-relocate",
     "contract-acceptance",
     "gap-recognition",
     "task-branch-start",

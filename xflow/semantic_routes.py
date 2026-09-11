@@ -58,6 +58,7 @@ ACTION_POLICIES = {
     "contract-acceptance": "none",
     "gap-recognition": "none",
     "task-branch-start": "none",
+    "task-contract-relocate": "none",
     "development": "exit",
     "commit": "exit",
     "git-push": "exit",

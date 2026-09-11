@@ -267,6 +267,12 @@ def build_parser() -> argparse.ArgumentParser:
     task_sub.add_parser("status")
     task_sub.add_parser("list")
     task_sub.add_parser("migrate-current")
+    relocation_prepare = task_sub.add_parser("prepare-contract-relocation")
+    relocation_prepare.add_argument("--issue", required=True)
+    relocation_prepare.add_argument("--to", required=True, type=Path)
+    relocation = task_sub.add_parser("relocate-contract")
+    relocation.add_argument("--issue", required=True)
+    relocation.add_argument("--file", required=True, type=Path)
 
     hook = sub.add_parser("hook")
     hook_sub = hook.add_subparsers(dest="hook_command", required=True)
@@ -856,6 +862,15 @@ def run_check(args: argparse.Namespace) -> int:
 
 def run_task(args: argparse.Namespace) -> int:
     ctx = context()
+    if args.task_command in {"prepare-contract-relocation", "relocate-contract"}:
+        from . import contract_relocation
+        if args.task_command == "prepare-contract-relocation":
+            path = contract_relocation.prepare(ctx.repo_root, args.issue, args.to)
+            print(f"[INFO] review contract relocation request and approval: {path}")
+        else:
+            path = contract_relocation.relocate(ctx.repo_root, args.issue, args.file)
+            print(f"[INFO] contract location corrected; retained evidence: {path}")
+        return 0
     if args.task_command == "activate":
         state = activate_task(ctx.repo_root, args.issue)
         print(f"[INFO] active task: #{state.issue}")
@@ -1882,6 +1897,9 @@ def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
             raise ValueError("task-state Classification does not match canonical classification")
         if args.file is None:
             raise ValueError("first task branch requires --file with canonical task-state.md")
+        if state.contract != "none":
+            from .contracts import _contract_path
+            _contract_path(ctx.repo_root, Path(state.contract_file))
         allowed_prefix = f".xflow/issues/issue-{issue}/"
         creation_history = approval.issue_create_history_paths(ctx.repo_root, issue)
         unexpected = [path for path in changed_paths(ctx.repo_root)
