@@ -464,6 +464,8 @@ def prepare(
             raise ValueError(f"refusing to overwrite approved local review: {review_file}")
 
     relative_file = display_path(repo_root, approved_path)
+    absolute_file = approved_path.resolve().as_posix()
+    absolute_review = review_file.resolve().as_posix()
     digest = sha256_file(approved_path).lower()
     attachment_text = ""
     relative_manifest: str | None = None
@@ -476,6 +478,7 @@ def prepare(
         attachment_text = (
             f"Attachment Manifest: {relative_manifest}\n"
             f"Attachment Manifest SHA256: {manifest_digest}\n"
+            f"Attachment Manifest Absolute: {manifest_path.resolve().as_posix()}\n"
         )
     now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     approval_id = uuid.uuid4().hex
@@ -516,6 +519,8 @@ def prepare(
         f"Branch: {bindings.branch}\n"
         f"Approved Action: {action}\n"
         f"Approved File: {relative_file}\n"
+        f"Approved File Absolute: {absolute_file}\n"
+        f"Local Review Absolute: {absolute_review}\n"
         f"Approved SHA256: {digest}\n"
         f"{attachment_text}\n"
         "## Decision\n"
@@ -524,7 +529,10 @@ def prepare(
         "## Human Gate\n"
         "Prepared by AI or tooling does not mean approved.\n"
         "Only the human reviewer may change Approved: no to Approved: yes.\n"
-        "If this file was approved by the AI, the approval is invalid.\n\n"
+        "If this file was approved by the AI, the approval is invalid.\n"
+        "When asking the human to open this gate in chat, AI must paste the\n"
+        "Local Review Absolute and Approved File Absolute paths (not only\n"
+        "repository-relative paths).\n\n"
         "## Suggested Command\n"
         f"Suggested Command: {command}\n\n"
         "## Expected Effect\n"
