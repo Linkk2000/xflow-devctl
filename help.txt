@@ -103,7 +103,8 @@ Git:
   Require at least two non-empty Chinese-dominant body lines after a blank line.
   The positional summary is only the core summary; devctl generates the full message.
   -m/--message is a complete multi-line message and must pass validation unchanged.
-  Do not add AI-client trailers, local absolute paths, or provider-only metadata.
+  Do not add local absolute paths or provider-only metadata.
+  IDE/client Co-authored-by trailers are allowed; do not rewrite commits solely to strip them.
 
   Main feature:
     feat(canvas): 修复稳定端点定位[#IK152D]

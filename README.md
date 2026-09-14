@@ -521,8 +521,9 @@ devctl check resolution-report --issue IK152D
 ```
 
 Portable means plain Git text that travels across GitHub/Gitee. Do not add
-AI-client trailers, local absolute paths, machine-specific usernames, or
-provider-only metadata.
+local absolute paths, machine-specific usernames, or provider-only metadata.
+IDE/client may inject `Co-authored-by:` trailers; do not rewrite commits solely
+to strip them.
 
 PowerShell users should prefer the repository-local `devctl.ps1`, which invokes
 the Python core and sets `PYTHONDONTWRITEBYTECODE=1` to avoid `__pycache__`

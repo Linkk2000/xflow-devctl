@@ -36,8 +36,9 @@ POSIX_ABSOLUTE_PATH_RE = re.compile(
 )
 UNC_OR_DEVICE_PATH_RE = re.compile(r"\\\\(?:[.?]\\|[^\\\s]+\\)[^\s`'\"<>]+")
 AI_TRAILER_RE = re.compile(
-    r"(?im)(?:^Co-authored-by:\s*(?:Cursor|Claude|Gemini)\b|^Generated-by:|OpenAI-Codex)"
+    r"(?im)(?:^Generated-by:|OpenAI-Codex)"
 )
+CO_AUTHORED_BY_RE = re.compile(r"(?i)^Co-authored-by:\s+\S")
 PROVIDER_METADATA_RE = re.compile(r"(?im)^(?:GitHub|Gitee)-(?:Issue|PR|MR|Pull-Request)\s*:")
 
 
@@ -96,9 +97,11 @@ def check_commit_message(
     if len(lines) < 2 or lines[1].strip():
         raise ValueError("commit message requires a blank separator after the subject")
     body_lines = [line.strip() for line in lines[2:] if line.strip()]
-    if len(body_lines) < 2:
+    # IDE/client may inject Co-authored-by trailers; keep them out of Chinese checks.
+    content_lines = [line for line in body_lines if not CO_AUTHORED_BY_RE.match(line)]
+    if len(content_lines) < 2:
         raise ValueError("commit message body requires at least two non-empty Chinese-dominant lines")
-    for line in body_lines:
+    for line in content_lines:
         if not _is_chinese_dominant(line):
             raise ValueError(f"commit message body line must be Chinese-dominant: {line}")
     return issue_ids

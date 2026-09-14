@@ -1733,7 +1733,6 @@ def test_commit_message_validator() -> None:
         (gitee.replace("- 覆盖 C-004 并记录测试证据", "- verify C-004 with tests"), "Chinese-dominant"),
         (gitee.replace("[#IK152D]", "[#IK152D][#IK17AW]"), "only merge"),
         (merge.replace("[#IK152D][#IK17AW]", "[#IK152D][#IK17AW][#789]"), "one or two"),
-        (gitee + "Co-authored-by: Claude <bot@example.test>\n", "AI-client trailer"),
         (gitee + "Generated-by: tool\n", "AI-client trailer"),
         (gitee + "OpenAI-Codex\n", "AI-client trailer"),
         (gitee + "- 证据位于 C:\\temp\\evidence.txt\n", "absolute Windows path"),
@@ -1762,6 +1761,12 @@ def test_commit_message_validator() -> None:
         gitee + "- 远端仓库链接已经确认并可供人工复核：ssh://git@example.test/repository/project.git\n"
     )
     check_commit_message(gitee + "- 前端/后端均已完成中文验证并保留人工可见证据\n")
+    check_commit_message(
+        gitee + "Co-authored-by: Cursor <cursoragent@cursor.com>\n"
+    )
+    check_commit_message(
+        gitee + "Co-authored-by: Claude <bot@example.test>\n"
+    )
 
 
 def test_commit_message_cli(repo: Path) -> None:
