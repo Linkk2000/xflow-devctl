@@ -135,6 +135,7 @@ run_python_suite() {
     tests/contract-core.py \
     tests/contract-diff.py \
     tests/task-state.py \
+    tests/unattended-mr-only.py \
     tests/trace-core.py
   do
     printf '[runner] %s %s\n' "$label" "$test_file"

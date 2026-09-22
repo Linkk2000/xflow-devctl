@@ -1058,7 +1058,7 @@ def validate_task_contract_acceptance_snapshots(
         "contractVersion": contract_version,
         "contractSha256": digest,
         "semanticDecision": "accepted-design",
-        "source": "local-review",
+        "source": record["source"],
         "action": "contract-acceptance",
     }
     if binding_mode == "current":

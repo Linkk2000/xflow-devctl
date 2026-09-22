@@ -31,6 +31,7 @@ from .paths import (
 from .project_config import require_safe_repo_path
 from .stable_ids import is_stable_id
 from .unattended import require_active
+from . import unattended
 
 
 UNATTENDED_ACTIONS = {
@@ -570,6 +571,69 @@ def _contract_review_objects(text: str) -> tuple[str, ...]:
     return normalized
 
 
+
+def _review_source(text: str) -> str:
+    return "unattended" if text.startswith("# Delegated Task Authorization\n") else "local-review"
+
+
+def _delegated_review_path(repo_root: Path, issue: str) -> Path:
+    return issue_dir(repo_root, issue) / "approvals" / "delegated-decision.md"
+
+
+def _grant_review_path(repo_root: Path, grant: ApprovalGrant) -> Path:
+    return (_delegated_review_path(repo_root, grant.approval_issue)
+            if grant.source == "unattended" else default_approval_file(repo_root, grant.approval_issue))
+
+
+def _decision_file(repo_root: Path, issue: str, action: str, approved_file: Path,
+                   objects: tuple[str, ...] = ()) -> Path:
+    state = unattended.mr_only(repo_root, issue)
+    if state is None:
+        return default_approval_file(repo_root, issue)
+    if action not in unattended.SEMANTIC_ACTIONS:
+        raise ValueError("action is not eligible for delegated semantic decision")
+    bindings = resolve_bindings(repo_root)
+    path = _delegated_review_path(repo_root, issue)
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    text = (
+        "# Delegated Task Authorization\n\n"
+        "This is an agent decision under explicit task authorization, NOT human approval.\n"
+        f"Issue: {issue}\nReviewer: task-scoped-unattended\nApproved At: {now}\n"
+        f"Approval ID: {uuid.uuid4().hex}\n"
+        f"Repository ID: {bindings.repository}\nWorktree ID: {bindings.worktree}\n"
+        f"Branch: {bindings.branch}\nApproved Action: {action}\n"
+        f"Approved File: {display_path(repo_root, resolve_path(repo_root, approved_file))}\n"
+        f"Approved SHA256: {sha256_file(resolve_path(repo_root, approved_file))}\n"
+        "Approved: delegated\n"
+        f"Authorization State: {json.dumps(asdict(state), sort_keys=True)}\n"
+    )
+    if action == "contract-acceptance":
+        text += "\n" + CONTRACT_REVIEW_HEADING + "\n" + "```yaml\n"
+        text += yaml.safe_dump({"version": "0.1.0", "acceptedObjects": list(objects),
+                                "semanticDecision": "accepted-design"}, sort_keys=False)
+        text += "```\n"
+    require_safe_repo_path(repo_root, path, "delegated decision")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text_lf(path, text)
+    return path
+
+
+def _validate_delegated_text(text: str, bindings: GitBindings, issue: str) -> None:
+    state = unattended._parse(json.loads(field(text, "Authorization State")))
+    if state.approvalPolicy != unattended.MR_ONLY_POLICY:
+        raise ValueError("delegated decision requires MR-only policy provenance")
+    if (state.repository, state.worktree, state.branch, state.issue) != (
+            bindings.repository, bindings.worktree, bindings.branch, issue):
+        raise ValueError("delegated authorization binding mismatch")
+    if field(text, "Approved") != "delegated" or field(text, "Reviewer") != "task-scoped-unattended":
+        raise ValueError("delegated decision must not impersonate human approval")
+    if field(text, "Approved Action") not in unattended.SEMANTIC_ACTIONS:
+        raise ValueError("delegated semantic action mismatch")
+    _timestamp(field(text, "Approved At"), "Approved At")
+    if datetime.fromisoformat(state.enabledAt.replace("Z", "+00:00")) > datetime.fromisoformat(field(text, "Approved At").replace("Z", "+00:00")):
+        raise ValueError("delegated decision predates authorization")
+
+
 def _validate_review_text(
     repo_root: Path,
     issue: str,
@@ -579,7 +643,10 @@ def _validate_review_text(
     bindings: GitBindings,
     expected_sha256: str | None = None,
 ) -> tuple[Path, str]:
-    for needle in REQUIRED_TEXT:
+    delegated = _review_source(text) == "unattended"
+    if delegated:
+        _validate_delegated_text(text, bindings, issue)
+    for needle in (() if delegated else REQUIRED_TEXT):
         if needle not in text:
             raise ValueError(f"missing required text '{needle}'")
     for name in (
@@ -587,7 +654,7 @@ def _validate_review_text(
         "Approved File", "Approved SHA256", "Approved",
     ):
         reject_placeholder(text, name)
-    if field(text, "Approved").lower() != "yes":
+    if not delegated and field(text, "Approved").lower() != "yes":
         raise ValueError("local approval required: Approved: yes")
 
     expected_bindings = {
@@ -765,8 +832,8 @@ def _parse_history_snapshot(
             if source == "local-review" and payload["reviewerSummary"] == EFFECT_REVIEWER_SUMMARY:
                 raise ValueError("reserved local-review reviewerSummary")
             if payload["action"] == "contract-acceptance":
-                if source != "local-review":
-                    raise ValueError("contract acceptance must use local-review")
+                if source not in {"local-review", "unattended"}:
+                    raise ValueError("contract acceptance requires decision provenance")
                 for name in ("contractId", "contractVersion", "semanticDecision"):
                     if not isinstance(payload[name], str) or not payload[name]:
                         raise ValueError(f"invalid {name}")
@@ -799,7 +866,7 @@ def _parse_history_snapshot(
                 if payload["contractSnapshotSha256"] != payload["contractSha256"]:
                     raise ValueError("contract snapshot SHA256 must match accepted contract SHA256")
             elif payload["action"] == "gap-recognition":
-                if source != "local-review" or payload["semanticDecision"] != "gap-recognized":
+                if source not in {"local-review", "unattended"} or payload["semanticDecision"] != "gap-recognized":
                     raise ValueError("gap recognition must be a local human decision")
                 for name in ("approvedReviewFile", "gapSnapshotFile"):
                     if not isinstance(payload[name], str) or not payload[name]:
@@ -809,8 +876,8 @@ def _parse_history_snapshot(
                         raise ValueError(f"invalid {name}")
                 _canonical_utc_timestamp(payload["recordedAt"], "recordedAt", microseconds=True)
             elif payload["action"] == "task-branch-start":
-                if source != "local-review":
-                    raise ValueError("task branch identity approval must use local-review")
+                if source not in {"local-review", "unattended"}:
+                    raise ValueError("task branch identity requires decision provenance")
                 if (
                     not isinstance(payload["targetBranch"], str)
                     or not payload["targetBranch"]
@@ -1006,15 +1073,15 @@ def _validate_grant(grant: ApprovalGrant) -> None:
     }:
         raise ValueError("reserved local-review reviewer summary")
     if grant.action == "contract-acceptance":
-        if grant.source != "local-review":
-            raise ValueError("contract acceptance requires local-review")
+        if grant.source not in {"local-review", "unattended"}:
+            raise ValueError("contract acceptance requires decision provenance")
         if grant.accepted_objects != normalize_accepted_objects(grant.accepted_objects):
             raise ValueError("contract acceptance grant has invalid accepted object IDs")
     elif grant.accepted_objects:
         raise ValueError("accepted object IDs are only valid for contract-acceptance")
     if grant.action == "task-branch-start":
-        if grant.source != "local-review":
-            raise ValueError("task branch identity approval requires local-review")
+        if grant.source not in {"local-review", "unattended"}:
+            raise ValueError("task branch identity requires decision provenance")
         if not grant.target_branch or grant.target_branch == grant.branch:
             raise ValueError("task branch identity approval requires a distinct target branch")
     elif grant.target_branch:
@@ -1064,7 +1131,7 @@ def require_task_branch_start(
     if state.branch != target_branch or state.base != base_branch:
         raise ValueError("task branch identity does not match task-state Branch and Base")
 
-    review_file = default_approval_file(root, issue)
+    review_file = _decision_file(root, issue, "task-branch-start", approved_path)
     if not review_file.is_file():
         raise ValueError(f"local review approval required: {review_file}")
     review_bytes = _stable_approval_bytes(root, review_file, issue_root, "approval review")
@@ -1084,7 +1151,7 @@ def require_task_branch_start(
         hashlib.sha256(state_snapshot.content or b"").hexdigest(),
     )
     grant = ApprovalGrant(
-        source="local-review",
+        source=_review_source(review_text),
         approval_id=field(review_text, "Approval ID"),
         repository=bindings.repository,
         worktree=bindings.worktree,
@@ -1111,7 +1178,7 @@ def _contract_local_grant(
 ) -> tuple[ApprovalGrant, Path, bytes]:
     issue = normalized_issue(issue)
     issue_root = issue_dir(repo_root, issue)
-    review_file = default_approval_file(repo_root, issue)
+    review_file = _decision_file(repo_root, issue, "contract-acceptance", approved_file, expected_objects or ())
     if not review_file.is_file():
         raise ValueError(f"local review approval required: {review_file}")
     review_bytes = _stable_approval_bytes(repo_root, review_file, issue_root, "approval review")
@@ -1137,7 +1204,7 @@ def _contract_local_grant(
     )
     check_reviewed_task_binding(repo_root, issue, "contract-acceptance")
     grant = ApprovalGrant(
-        source="local-review",
+        source=_review_source(text),
         approval_id=field(text, "Approval ID"),
         repository=bindings.repository,
         worktree=bindings.worktree,
@@ -1170,6 +1237,8 @@ def _local_grant(
     if not review_file.is_file():
         raise ValueError(f"local review approval required: {review_file}")
     text = read_text(review_file)
+    if _review_source(text) != "local-review":
+        raise ValueError("human review required for this action")
     approved_action = field(text, "Approved Action")
     if approved_action != action:
         qualifier = "exact " if action == "contract-acceptance" else ""
@@ -1242,9 +1311,19 @@ def require_remote_or_unattended(
     try:
         state = require_active(repo_root, issue)
     except ValueError:
+        # A present versioned authorization must fail closed, not turn into
+        # another local-review prompt (or consume a stale human decision).
+        state_file = unattended.state_path(repo_root)
+        if state_file.is_file():
+            payload = json.loads(state_file.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and payload.get("version") == 2:
+                raise
         if request_unattended:
             raise ValueError("--no-local-review requires active task-scoped unattended mode") from None
         return require_remote(repo_root, action, approved_file, issue, attachment_manifest)
+
+    if state.approvalPolicy == unattended.MR_ONLY_POLICY and action == "git-pr-merge":
+        raise ValueError("MR-only review barrier: human must review and merge the published MR; unattended merge is not authorized")
 
     if normalized_issue(issue) != "draft" and task_binding_evidence_exists(repo_root):
         check_reviewed_task_binding(repo_root, issue, action)
@@ -1903,7 +1982,7 @@ def _parse_task_branch_claim(repo_root: Path, path: Path, issue: str) -> dict[st
 
 def _task_branch_grant(claim: dict[str, object]) -> ApprovalGrant:
     grant = ApprovalGrant(
-        source="local-review",
+        source="unattended" if claim["reviewerSummary"] == "task-scoped-unattended" else "local-review",
         approval_id=str(claim["approvalId"]),
         repository=str(claim["repository"]),
         worktree=str(claim["worktree"]),
@@ -2077,7 +2156,7 @@ def _revalidate_task_branch_current(repo_root: Path, reservation: TaskBranchStar
         "task branch identity state",
         max_bytes=MAX_TEXT_ARTIFACT_BYTES,
     )
-    review_path = default_approval_file(repo_root, issue)
+    review_path = _grant_review_path(repo_root, reservation.grant)
     review_snapshot = capture_stable_file(
         repo_root,
         review_path,
@@ -2098,7 +2177,7 @@ def reserve_task_branch_start(repo_root: Path, grant: ApprovalGrant, base_branch
 
     root = repo_root.resolve()
     _validate_grant(grant)
-    if grant.source != "local-review" or grant.action != "task-branch-start" or grant.branch != base_branch:
+    if grant.source not in {"local-review", "unattended"} or grant.action != "task-branch-start" or grant.branch != base_branch:
         raise ValueError("task branch reservation requires the exact local branch-start approval")
     issue = grant.approval_issue
     issue_root = issue_dir(root, issue)
@@ -2149,7 +2228,7 @@ def reserve_task_branch_start(repo_root: Path, grant: ApprovalGrant, base_branch
             or state.classification == "ui-defect"
         ):
             raise ValueError("task branch reservation does not match exact task-state bindings")
-        review_path = default_approval_file(root, issue)
+        review_path = _grant_review_path(root, grant)
         review_snapshot = capture_stable_file(
             root,
             review_path,
@@ -3560,7 +3639,7 @@ def _gap_local_grant(
     expected_sha256: str,
 ) -> tuple[ApprovalGrant, bytes]:
     issue_root = issue_dir(repo_root, issue)
-    review_file = default_approval_file(repo_root, issue)
+    review_file = _decision_file(repo_root, issue, "gap-recognition", gap_path)
     if not review_file.is_file():
         raise ValueError(f"local review approval required: {review_file}")
     review_bytes = _stable_approval_bytes(repo_root, review_file, issue_root, "approval review")
@@ -3581,7 +3660,7 @@ def _gap_local_grant(
     )
     check_reviewed_task_binding(repo_root, issue, "gap-recognition")
     grant = ApprovalGrant(
-        source="local-review",
+        source=_review_source(text),
         approval_id=field(text, "Approval ID"),
         repository=bindings.repository,
         worktree=bindings.worktree,
@@ -3688,7 +3767,7 @@ def validate_gap_recognition_history(
         path,
         history_snapshot.content if history_snapshot is not None else None,
     )
-    if record.get("action") != "gap-recognition" or record.get("source") != "local-review":
+    if record.get("action") != "gap-recognition" or record.get("source") not in {"local-review", "unattended"}:
         raise ValueError("record is not a local gap recognition")
     issue = normalized_issue(str(record["issue"]))
     issue_root = issue_dir(root, issue)
@@ -3711,6 +3790,8 @@ def validate_gap_recognition_history(
     if hashlib.sha256(review_bytes).hexdigest() != record["approvedReviewSha256"]:
         raise ValueError("archived gap review SHA256 mismatch")
     review_text = _decode_approval_bytes(review_bytes, review_path, "archived gap review")
+    if _review_source(review_text) != record["source"]:
+        raise ValueError("gap decision provenance mismatch")
     if field(review_text, "Approved Action") != "gap-recognition":
         raise ValueError("archived gap review action mismatch")
     if field(review_text, "Approval ID") != approval_id:
@@ -3815,7 +3896,7 @@ def validate_task_gap_recognition_snapshots(
         "issue": issue,
         "approvalIssue": issue,
         "action": "gap-recognition",
-        "source": "local-review",
+        "source": record["source"],
         "semanticDecision": "gap-recognized",
         "approvedFile": display_path(root, issue_root / "gap-analysis.md"),
         "approvedSha256": hashlib.sha256(current_gap.content or b"").hexdigest(),
@@ -3835,7 +3916,7 @@ def validate_task_gap_recognition_snapshots(
 
 def parse_contract_acceptance_history(repo_root: Path, path: Path) -> dict[str, object]:
     record = _parse_history(repo_root.resolve(), path)
-    if record.get("action") != "contract-acceptance" or record.get("source") != "local-review":
+    if record.get("action") != "contract-acceptance" or record.get("source") not in {"local-review", "unattended"}:
         raise ValueError("record is not a local contract acceptance")
     return record
 
@@ -3934,7 +4015,7 @@ def validate_contract_acceptance_history(
         path,
         history_snapshot.content if history_snapshot is not None else None,
     )
-    if record.get("action") != "contract-acceptance" or record.get("source") != "local-review":
+    if record.get("action") != "contract-acceptance" or record.get("source") not in {"local-review", "unattended"}:
         raise ValueError("record is not a local contract acceptance")
     issue = normalized_issue(str(record["issue"]))
     issue_root = issue_dir(repo_root, issue)
@@ -3958,6 +4039,8 @@ def validate_contract_acceptance_history(
     if review_sha256 != record["approvedReviewSha256"]:
         raise ValueError("archived approved review SHA256 mismatch")
     review_text = _decode_approval_bytes(review_bytes, review_path, "archived approved review")
+    if _review_source(review_text) != record["source"]:
+        raise ValueError("contract decision provenance mismatch")
     if field(review_text, "Approved Action") != "contract-acceptance":
         raise ValueError("archived approved review action mismatch")
     if field(review_text, "Approval ID") != approval_id:

@@ -315,6 +315,8 @@ def build_parser() -> argparse.ArgumentParser:
     unattended_enable = unattended_sub.add_parser("enable")
     unattended_enable.add_argument("--issue", required=True)
     unattended_enable.add_argument("--confirm", required=True)
+    unattended_enable.add_argument("--policy", choices=[unattended.MR_ONLY_POLICY, unattended.LEGACY_POLICY], default=unattended.MR_ONLY_POLICY)
+    unattended_sub.add_parser("capabilities")
     unattended_sub.add_parser("status")
     unattended_sub.add_parser("disable")
 
@@ -936,6 +938,9 @@ def run_contract(args: argparse.Namespace) -> int:
         object_ids = tuple(args.objects.split(","))
         record = validate_contract_acceptance(ctx.repo_root, args.issue, contract, object_ids)
         print(f"[INFO] contract acceptance recorded: {record}")
+        if unattended.mr_only(ctx.repo_root, args.issue) is not None:
+            print("[NEXT] Commit semantic evidence separately, bind the recorded decision, then proceed to development; human review occurs at the published MR.")
+            return 0
         print(
             "[NEXT] Early XFlow artifact commit: stage and commit accepted contract "
             "plus Issue workspace / approvals/history only before G2 or implementation. "
@@ -951,6 +956,9 @@ def run_gap(args: argparse.Namespace) -> int:
     ctx = context()
     record = approval.consume_gap_recognition(ctx.repo_root, args.issue, args.file)
     print(f"[INFO] gap recognition recorded: {record}")
+    if unattended.mr_only(ctx.repo_root, args.issue) is not None:
+        print("[NEXT] Commit gap evidence separately, bind the recorded decision, then proceed to development; human review occurs at the published MR.")
+        return 0
     print(
         "[NEXT] Early XFlow artifact commit: stage and commit gap-analysis / "
         "approvals/history only before G2 or implementation. Does not authorize "
@@ -1218,7 +1226,8 @@ def run_issue(args: argparse.Namespace) -> int:
             )
         else:
             result = recovered
-        unattended.disable(ctx.repo_root)
+        if unattended.mr_only(ctx.repo_root, issue_id) is None:
+            unattended.disable(ctx.repo_root)
         print(f"[INFO] Issue #{result.get('number', issue_id)} closed")
         return 0
     if args.issue_command != "create":
@@ -1890,6 +1899,7 @@ def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     branch_reservation: approval.TaskBranchStartReservation | None = None
     issue = normalized_issue(args.issue) if args.issue else None
     state_path = task_state_file(ctx.repo_root, issue) if issue else None
+    delegated_state = None
     if state_path is not None and state_path.is_file():
         state = parse_task_state(state_path, binding_mode="recorded")
         classification = check_classification(ctx.repo_root, issue)
@@ -1912,6 +1922,8 @@ def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
         branch_reservation = approval.resume_task_branch_start(
             ctx.repo_root, issue, args.file, branch, base
         )
+        if branch_reservation is not None and branch_reservation.grant.source == "unattended":
+            delegated_state = unattended.branch_reservation_state(ctx.repo_root, issue, base, branch)
         if branch_reservation is None:
             branch_grant = approval.require_task_branch_start(
                 ctx.repo_root,
@@ -1925,6 +1937,8 @@ def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
                 branch_grant,
                 base,
             )
+            if branch_grant.source == "unattended":
+                delegated_state = unattended.mr_only(ctx.repo_root, issue)
     else:
         require_clean_worktree(
             ctx.repo_root,
@@ -1994,12 +2008,15 @@ def run_git_start(ctx: RuntimeContext, args: argparse.Namespace) -> int:
     if args.issue:
         set_meta(ctx.repo_root, "issue", args.issue)
     set_meta(ctx.repo_root, "base", base)
-    unattended.disable(ctx.repo_root)
+    if delegated_state is None:
+        unattended.disable(ctx.repo_root)
     if branch_reservation is not None:
         assert state_path is not None
         assert issue is not None
         activate_task_from_snapshot(ctx.repo_root, issue, branch_reservation.task_state_bytes)
         branch_reservation = approval.mark_task_branch_activated(ctx.repo_root, branch_reservation)
+        if delegated_state is not None:
+            unattended.advance_branch(ctx.repo_root, delegated_state, branch)
         approval.complete_task_branch_start(ctx.repo_root, branch_reservation)
     print("[INFO] ready")
     print(
@@ -2068,7 +2085,26 @@ def run_git_done(ctx: RuntimeContext, args: argparse.Namespace) -> int:
         raise ValueError("devctl git done requires --issue or branch issue metadata")
     approved_file = args.file or default_issue_file(ctx.repo_root, issue, "resolution-report.md")
     action = "git-cleanup-force" if args.force else "git-cleanup"
-    approval.require_exact_remote(ctx.repo_root, action, approved_file, issue)
+    delegated_cleanup = unattended.mr_only(ctx.repo_root, issue)
+    if delegated_cleanup is not None:
+        if args.force:
+            raise ValueError("MR-only mode never authorizes forced cleanup")
+        require_clean_worktree(ctx.repo_root)
+        check_current_task(ctx.repo_root, issue)
+        pr = branch_meta(ctx.repo_root, "pr")
+        if not pr or os.environ.get("DEVCTL_SKIP_PROVIDER_LOAD") == "1":
+            raise ValueError("safe unattended cleanup requires verified merged PR")
+        remote = providers.get_pull_request(ctx.repo_root, pr, os.environ)
+        if not remote or not remote.get("merged"):
+            raise ValueError("safe unattended cleanup requires a merged PR")
+        identity = providers.normalize_pull_request_identity(remote)
+        if identity.head != branch or identity.base != base:
+            raise ValueError("safe unattended cleanup PR branch identity mismatch")
+        git_run(ctx.repo_root, ["fetch", "origin", base])
+        if not git_succeeds(ctx.repo_root, ["merge-base", "--is-ancestor", "HEAD", f"origin/{base}"]):
+            raise ValueError("safe unattended cleanup requires task commits reachable from base; retain branch")
+    else:
+        approval.require_exact_remote(ctx.repo_root, action, approved_file, issue)
     cleanup_bindings = resolve_bindings(ctx.repo_root)
     pointer_path = active_task_pointer_file(ctx.repo_root, cleanup_bindings.worktree)
     legacy_pointer_path = legacy_active_task_pointer_file(ctx.repo_root, cleanup_bindings.worktree)
@@ -2080,7 +2116,8 @@ def run_git_done(ctx: RuntimeContext, args: argparse.Namespace) -> int:
             raise ValueError(f"PR #{pr_number} is not merged or closed; use --force only with explicit approval")
     elif not args.force and not pr_number:
         print("[WARN] no PR number recorded; skipping merge-state check")
-    prepare_worktree_for_git_done(ctx.repo_root, issue)
+    if delegated_cleanup is None:
+        prepare_worktree_for_git_done(ctx.repo_root, issue)
     require_clean_worktree(ctx.repo_root)
     print(f"[INFO] checkout {base}")
     git_run(ctx.repo_root, ["checkout", base])
@@ -2366,8 +2403,11 @@ def run_unattended(args: argparse.Namespace) -> int:
     ctx = context()
     if args.unattended_command == "enable":
         issue = resolve_action_issue(ctx, args.issue)
-        state = unattended.enable(ctx.repo_root, issue, args.confirm)
+        state = unattended.enable(ctx.repo_root, issue, args.confirm, policy=args.policy)
         print(f"[INFO] task-scoped unattended mode enabled for current task {state.issue}")
+        return 0
+    if args.unattended_command == "capabilities":
+        print(json.dumps({"policies": [unattended.LEGACY_POLICY, unattended.MR_ONLY_POLICY], "semanticDecisions": "delegated", "mrBarrier": "human-provider-merge"}))
         return 0
     if args.unattended_command == "status":
         try:
@@ -2379,7 +2419,7 @@ def run_unattended(args: argparse.Namespace) -> int:
         if state is None:
             print("[INFO] task-scoped unattended mode inactive")
         else:
-            print(f"[INFO] task-scoped unattended mode active for current task {state.issue}")
+            print(f"[INFO] task-scoped unattended mode active for current task {state.issue}; policy={state.approvalPolicy}")
         return 0
     if args.unattended_command == "disable":
         removed = unattended.disable(ctx.repo_root)
