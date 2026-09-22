@@ -4,6 +4,7 @@ import json
 import os
 import re
 import tempfile
+import uuid
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,9 @@ from .paths import normalized_issue
 
 CONFIRMATION = "XFLOW_HUMAN_UNATTENDED_ALL"
 STATE_VERSION = 1
+MR_ONLY_POLICY = "mr-only-v1"
+LEGACY_POLICY = "legacy-remote-v1"
+SEMANTIC_ACTIONS = {"task-branch-start", "contract-acceptance", "gap-recognition"}
 STATE_MODE = "task-unattended"
 STATE_FIELDS = {"version", "mode", "repository", "worktree", "issue", "enabledAt"}
 CURRENT_TASK_FIELD_RE = re.compile(r"(?im)^\s*(Issue|State)\s*:\s*(.+?)\s*$")
@@ -27,6 +31,9 @@ class UnattendedState:
     worktree: str
     issue: str
     enabledAt: str
+    approvalPolicy: str = LEGACY_POLICY
+    authorizationId: str = ""
+    branch: str = ""
 
 
 def state_path(repo_root: Path) -> Path:
@@ -54,9 +61,10 @@ def _validate_timestamp(value: str) -> None:
 
 
 def _parse(payload: object) -> UnattendedState:
-    if not isinstance(payload, dict) or set(payload) != STATE_FIELDS:
+    expected = STATE_FIELDS | {"approvalPolicy", "authorizationId", "branch"} if isinstance(payload, dict) and payload.get("version") == 2 else STATE_FIELDS
+    if not isinstance(payload, dict) or set(payload) != expected:
         raise ValueError("invalid unattended state: unexpected JSON fields")
-    if type(payload["version"]) is not int or payload["version"] != STATE_VERSION:
+    if type(payload["version"]) is not int or payload["version"] not in {1, 2}:
         raise ValueError("invalid unattended state: unsupported version")
     for name in ("mode", "repository", "worktree", "issue", "enabledAt"):
         if not isinstance(payload[name], str) or not payload[name]:
@@ -74,6 +82,13 @@ def _parse(payload: object) -> UnattendedState:
     if issue != payload["issue"]:
         raise ValueError("invalid unattended state: Issue identifier is not normalized")
     _validate_timestamp(payload["enabledAt"])
+    if payload["version"] == 2:
+        if payload["approvalPolicy"] != MR_ONLY_POLICY:
+            raise ValueError("invalid unattended policy")
+        if not isinstance(payload["authorizationId"], str) or not re.fullmatch(r"[0-9a-f]{32}", payload["authorizationId"]):
+            raise ValueError("invalid unattended authorization identity")
+        if not isinstance(payload["branch"], str) or not payload["branch"]:
+            raise ValueError("invalid unattended branch")
     return UnattendedState(
         version=payload["version"],
         mode=payload["mode"],
@@ -81,6 +96,9 @@ def _parse(payload: object) -> UnattendedState:
         worktree=payload["worktree"],
         issue=issue,
         enabledAt=payload["enabledAt"],
+        approvalPolicy=payload.get("approvalPolicy", LEGACY_POLICY),
+        authorizationId=payload.get("authorizationId", ""),
+        branch=payload.get("branch", ""),
     )
 
 
@@ -95,7 +113,10 @@ def _write(repo_root: Path, state: UnattendedState) -> None:
     temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            json.dump(asdict(state), handle, ensure_ascii=True, indent=2)
+            payload = asdict(state)
+            if state.version == 1:
+                payload = {key: value for key, value in payload.items() if key in STATE_FIELDS}
+            json.dump(payload, handle, ensure_ascii=True, indent=2)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -105,17 +126,22 @@ def _write(repo_root: Path, state: UnattendedState) -> None:
             temporary.unlink()
 
 
-def enable(repo_root: Path, issue: str, confirmation: str) -> UnattendedState:
+def enable(repo_root: Path, issue: str, confirmation: str, *, policy: str = LEGACY_POLICY) -> UnattendedState:
     if confirmation != CONFIRMATION:
         raise ValueError("confirmation does not exactly match the required unattended value")
+    if policy not in {LEGACY_POLICY, MR_ONLY_POLICY}:
+        raise ValueError("unsupported unattended policy")
     bindings = resolve_bindings(repo_root)
     state = UnattendedState(
-        version=STATE_VERSION,
+        version=2 if policy == MR_ONLY_POLICY else STATE_VERSION,
         mode=STATE_MODE,
         repository=bindings.repository,
         worktree=bindings.worktree,
         issue=normalized_issue(issue),
         enabledAt=datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        approvalPolicy=policy,
+        authorizationId=uuid.uuid4().hex if policy == MR_ONLY_POLICY else "",
+        branch=bindings.branch if policy == MR_ONLY_POLICY else "",
     )
     _write(repo_root, state)
     return state
@@ -137,6 +163,8 @@ def load(repo_root: Path) -> UnattendedState | None:
         raise ValueError("unattended state repository mismatch")
     if state.worktree != bindings.worktree:
         raise ValueError("unattended state worktree mismatch")
+    if state.version == 2 and state.branch != bindings.branch:
+        raise ValueError("unattended state branch mismatch")
     from .task_state import load_active_task, modern_task_authority_exists
 
     try:
@@ -193,3 +221,41 @@ def migrate_issue(repo_root: Path, old_issue: str, new_issue: str) -> Unattended
     migrated = replace(state, issue=normalized_issue(new_issue))
     _write(repo_root, migrated)
     return migrated
+
+
+def mr_only(repo_root: Path, issue: str) -> UnattendedState | None:
+    """Do not silently fall back when a present MR-only state is invalid."""
+    state = load(repo_root)
+    if state is None or state.approvalPolicy != MR_ONLY_POLICY:
+        return None
+    if state.issue != normalized_issue(issue):
+        raise ValueError("unattended state Issue mismatch")
+    return state
+
+
+def advance_branch(repo_root: Path, prior: UnattendedState, target: str) -> None:
+    """Called only after exact branch-start reservation and task activation."""
+    if prior.approvalPolicy != MR_ONLY_POLICY:
+        raise ValueError("branch migration requires MR-only policy")
+    current = _parse(json.loads(state_path(repo_root).read_text(encoding="utf-8")))
+    if current != prior:
+        raise ValueError("unattended authorization changed during branch transition")
+    bindings = resolve_bindings(repo_root)
+    if (bindings.repository, bindings.worktree, bindings.branch) != (prior.repository, prior.worktree, target):
+        raise ValueError("unattended branch migration binding mismatch")
+    _write(repo_root, replace(prior, branch=target))
+
+
+def branch_reservation_state(repo_root: Path, issue: str, base: str, target: str) -> UnattendedState:
+    """Read only after the caller validates an exact sealed branch reservation.
+
+    A crash may leave Git on target while the token still names base. Normal
+    load remains strict; only this reserved transition can resume.
+    """
+    state = _parse(json.loads(state_path(repo_root).read_text(encoding="utf-8")))
+    bindings = resolve_bindings(repo_root)
+    if (state.approvalPolicy != MR_ONLY_POLICY or state.issue != normalized_issue(issue)
+            or state.repository != bindings.repository or state.worktree != bindings.worktree
+            or state.branch not in {base, target} or bindings.branch not in {base, target}):
+        raise ValueError("unattended branch reservation binding mismatch")
+    return state

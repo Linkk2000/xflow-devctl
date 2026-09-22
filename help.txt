@@ -390,3 +390,10 @@ Config:
   DEVCTL_COCKPIT_ROOT       cockpit root for profile discovery (compatibility alias)
   XFLOW_COCKPIT             cockpit root for profile discovery (compatibility alias)
   PYTHONDONTWRITEBYTECODE   set to 1 to avoid __pycache__
+MR-only policy:
+  New unattended enable commands default to mr-only-v1.
+  devctl unattended capabilities
+  devctl unattended enable --issue <id|draft> --confirm XFLOW_HUMAN_UNATTENDED_ALL --policy mr-only-v1
+  Existing legacy tokens are not silently upgraded.
+  Task steps and MR creation are automatic; human review/merge stays in the provider UI.
+  No local human approval file is generated for delegated semantic decisions.

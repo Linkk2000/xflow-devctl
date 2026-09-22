@@ -1,5 +1,37 @@
 # XFlow devctl
 
+## MR-only unattended policy
+
+New CLI enablements default to `mr-only-v1`. Use
+`devctl unattended capabilities` to inspect support and
+`devctl unattended status` to see the active policy. Enabling still requires
+the user's explicit task authorization; upgrading the tool does not upgrade
+an existing legacy token. `--policy legacy-remote-v1` explicitly retains
+the older behavior described below.
+
+MR-only mode covers Issue creation, final branch start, contract acceptance,
+gap recognition, development, ordinary commits/pushes and MR creation without
+local approval files. All identity, scope, integrity and evidence checks remain.
+Semantic decisions archive an explicit delegated receipt (`source: unattended`,
+`Approved: delegated`) with authorization lineage and exact hashes, never a
+forged human approval. The historical `Human Approval Ref` task-state field
+may reference this provenance-checked decision record.
+
+Draft-to-Issue and reserved final-branch transitions preserve authorization,
+including retries after interrupted branch creation. A different branch/task
+still fails closed. Human review and merge take place on the published MR in
+the provider UI: `git pr-merge` is deliberately blocked in MR-only mode, so
+initial task authorization cannot merge its own output.
+
+After provider-confirmed merge, safe clean-tree cleanup may proceed without a
+second approval. It requires matching PR branch/base, task commits reachable
+from the base and non-forced deletion. Squash merges or local modifications
+that cannot meet this conservative check retain the branch; no automatic
+discard, force deletion or secret/permission changes are authorized.
+
+Verification: `python tests/unattended-mr-only.py` exercises real local Git
+transitions and semantic records. It makes no remote provider mutations.
+
 For older tasks bound to an Issue-local candidate, see
 [human-approved contract path recovery](docs/contract-path-recovery.md).
 
