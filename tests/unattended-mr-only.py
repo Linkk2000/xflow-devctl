@@ -19,6 +19,7 @@ from xflow import cli, providers
 from xflow.contracts import load_contract, validate_contract_acceptance
 from xflow.checks import check_current_task
 from xflow.task_state import activate_task
+from xflow.traceability import check_traceability, check_traceability_resolution
 
 git, write, state, write_state = (h[x] for x in ("git", "write", "state", "write_state"))
 run = h["run_devctl_result"]
@@ -105,6 +106,59 @@ decisionSource: ai-proposed
         semantic_phase="accepted-design", human_gate="MR review only",
         human_approval_ref=history.relative_to(task.parent).as_posix()))
     check_current_task(repo, "901")
+    # A delegated acceptance must close through the ordinary trace path, while
+    # its sealed source remains "unattended" rather than forged local review.
+    write(task.with_name("classification.yaml"), """version: 0.1.0
+request:
+  originalStatement: A new test capability.
+contractSearch:
+  status: found
+  refs: [docs/requirements/example/contract.yaml]
+classification: capability-change
+contractChangeRequired: true
+reason: New capability accepted under MR-only task authorization.
+nextArtifact: contract-change-proposal.md
+decisionSource: ai-proposed
+""")
+    write(task.with_name("issue-draft.md"), """<!-- xflow: issue-draft -->
+
+## Background
+Trace a delegated contract.
+## Problem
+Accepted delegated evidence must close.
+## Goal
+Keep the sealed provenance.
+## Scope
+- Trace one capability.
+## Acceptance Criteria
+- [ ] C-001: Successful operation is verified.
+- [ ] C-002: Rejection preserves state.
+## Verification Plan
+- Check both traces.
+""")
+    matrix = yaml.safe_load((ROOT / "tests/fixtures/traceability/valid.yaml").read_text())
+    matrix["issue"] = "901"
+    matrix["contract"]["file"] = candidate.contract_file
+    first, second = matrix["entries"]
+    first["acceptanceCriterion"] = "criterion-001"
+    second["acceptanceCriterion"] = "criterion-002"
+    first.pop("ui")
+    first["evidence"]["after"] = ["evidence/api/operation-after.json"]
+    write(task.with_name("traceability-matrix.yaml"), yaml.safe_dump(matrix, sort_keys=False))
+    for relative in ("tests/test_operation.py", "tests/test_rejection.py",
+                     "evidence/api/operation-before.json", "evidence/api/rejection-before.json"):
+        write(task.parent / relative, f"before fixture: {relative}\n")
+    for relative in ("evidence/api/operation-after.json", "evidence/api/rejection-after.json"):
+        write(task.parent / relative, f"after fixture: {relative}\n")
+    assert len(check_traceability(repo, "901", None, task.with_name("traceability-matrix.yaml")).entries) == 2
+    check_traceability_resolution(
+        repo, "901", "resolved",
+        {task.parent / "evidence/api/operation-after.json",
+         task.parent / "evidence/api/rejection-after.json"},
+        report_criteria={
+            "001": ("Successful operation is verified", "automated"),
+            "002": ("Rejection preserves state", "automated"),
+        })
     # Even at active MR-only state, the user must review/merge through the provider.
     for action in ("git-push", "git-mr", "issue-comment"):
         grant = approval.require_remote_or_unattended(repo, action, path, "901")
@@ -114,6 +168,8 @@ decisionSource: ai-proposed
     original = receipt.read_bytes()
     write(receipt, receipt.read_text().replace("Approved: delegated", "Approved: yes"))
     fail("SHA256 mismatch", lambda: check_current_task(repo, "901"))
+    fail("SHA256 mismatch", lambda: check_traceability(
+        repo, "901", None, task.with_name("traceability-matrix.yaml")))
     receipt.write_bytes(original)
     check_current_task(repo, "901")
     # Same token cannot be carried to an unrelated branch.

@@ -605,9 +605,11 @@ def _load_context(
             "contractVersion": contract.raw["version"],
             "contractSha256": contract.sha256,
             "semanticDecision": "accepted-design",
-            "source": "local-review",
             "action": "contract-acceptance",
         }
+        # validate_contract_acceptance_history already validates the sealed
+        # review/claim/source chain for both local review and MR-only delegation.
+        # The binding check here must not redefine a valid delegated source.
         if (
             any(record.get(name) != expected for name, expected in expected_record.items())
         ):
